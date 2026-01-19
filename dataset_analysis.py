@@ -11,13 +11,13 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
     Visualize a sample from the training set.
     
     Args:
-        sample: Dictionary containing 'image' and 'labels'
+        sample: Dictionary containing data
         show_segmentation_mask: Whether to overlay segmentation masks
         show_classes: Whether to show class labels at mask centers
         debug: Print debug information about label structure
     """
-    img = sample['image']
-    labels = sample['labels']
+    img = sample['image'] # Get PIL image
+    labels = sample['labels'] # Get label and segmentation mask points
     
     # Convert PIL image to numpy array for matplotlib
     img_array = np.array(img)
@@ -143,8 +143,36 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
     plt.tight_layout()
     plt.show()
 
+def distribution_of_grades(samples):
+    """
+    Plot the distribution of grades in the dataset.
+    
+    Args:
+        samples: List of samples from the dataset
+    """
 
-
+    # Count grades for plotting
+    grade_counts = {}
+    
+    for sample in samples:
+        labels = sample['labels']
+        for label_data in labels:
+            class_id = int(label_data[0])
+            if class_id > 0:  # Exclude class 0 (punnet)
+                if class_id not in grade_counts:
+                    grade_counts[class_id] = 0
+                grade_counts[class_id] += 1
+    
+    # Prepare data for plotting
+    classes = sorted(grade_counts.keys())
+    counts = [grade_counts[c] for c in classes]
+    
+    # Plot pie chart
+    plt.figure(figsize=(8, 8))
+    plt.pie(counts, labels=classes, autopct='%1.1f%%', startangle=140, colors=plt.cm.Paired.colors)
+    plt.title('Distribution of Grades in Dataset')
+    plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+    plt.show()
     
 
 
@@ -153,8 +181,11 @@ def main():
     ds = load_dataset("FBK-TeV/RaspGrade")
 
     # Visualize a random sample from the training set
-    sample = ds['train'][5]
+    sample = ds['train'][1]
     visualize_sample(sample, show_segmentation_mask=True, show_classes=True, debug=True)
+
+    # Plot distribution of grades
+    #distribution_of_grades(list(ds['train']) + list(ds['valid']))
 
 
 if __name__ == "__main__":
