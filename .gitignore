@@ -1,2 +1,7 @@
 pretrained_models/sam_b.pt
 pretrained_models/sam3.pt
+dataset_single_objects/
+area_distribution.png
+output_colored_masks.jpg
+output_w_boxes.jpg
+sample_img.jpg
