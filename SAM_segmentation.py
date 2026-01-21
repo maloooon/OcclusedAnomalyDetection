@@ -11,6 +11,8 @@ import os
 
 
 
+
+
 def extract_bonnet_bounding_box(sample, visualize_bool = False):
     """
     When we run SAM on the raspberry images, we want to focus only on the bonnet area.
@@ -60,7 +62,7 @@ def extract_bonnet_bounding_box(sample, visualize_bool = False):
 
     return list(min_max_bbox)
 
-def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1):
+def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None)):
     """
     SAM3 segmentation model inference and mask saving.   
     
@@ -86,7 +88,7 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
 
 
     overrides = dict(
-        conf=0.70,
+        conf=0.75, # NOTE : try with different values and evaluate results on e.g. 15 samples only 
         task="segment",
         mode="predict",
         model="pretrained_models/sam3.pt",
@@ -111,41 +113,39 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         # Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
         
-        if len(boxes) > 0:
-            widths = boxes[:, 2] - boxes[:, 0]
-            heights = boxes[:, 3] - boxes[:, 1]
-            areas = widths * heights
-
-            # Save a plot of the distribution of areas
-            if save_imgs_bool:
-                plt.figure()
-                plt.hist(areas, bins=30, color='blue', alpha=0.7)
-                plt.axvline(np.median(areas), color='red', linestyle='dashed', linewidth=1)
-                plt.title('Distribution of Detected Object Areas')
-                plt.xlabel('Area (pixels)')
-                plt.ylabel('Frequency')
-                plt.savefig('area_distribution.png')
-                plt.close()
-            
-            # Calculate median and filter outliers
-            median_area = np.median(areas)
-            
-            # Keep objects within a range of the median
-            # Adjust multiplier as needed (2.0 = keep areas up to 2x median)
-            # NOTE : no lower multiplier, as we else might remove small raspberries (i.e. strongly occluded ones)
-            UPPER_MULTIPLIER = 4.0
-
-            valid_idx = (
-                (areas <= median_area * UPPER_MULTIPLIER)
+        if len(boxes) > 0 and filter_bboxes[0]:
+            valid_idx, median_area = _filter_bbox_sizes(
+                boxes, 
+                upper_multiplier= filter_bboxes[2],
+                lower_multiplier= filter_bboxes[1],
+                save_distribution=save_imgs_bool,
+                filename='area_distribution.png'
             )
-            
-            print(f"Median area: {median_area:.0f} pixels")
-            #   print(f"Filtering range: {median_area * LOWER_MULTIPLIER:.0f} - {median_area * UPPER_MULTIPLIER:.0f} pixels")
-            print(f"Filtered: {len(boxes)} -> {valid_idx.sum()} detections")
             
             results[0].boxes = results[0].boxes[valid_idx]
             if results[0].masks is not None:
                 results[0].masks = results[0].masks[valid_idx]
+
+                if filter_masks_shapes[0]:
+                    # Filter by mask shape (rectangularity)
+                    masks_np = results[0].masks.data.cpu().numpy()
+                    boxes_np = results[0].boxes.xyxy.cpu().numpy()
+                    shape_valid_idx = _filter_mask_shapes(masks_np, boxes_np, rectangularity_threshold=filter_masks_shapes[1])
+                    results[0].boxes = results[0].boxes[shape_valid_idx]
+                    results[0].masks = results[0].masks[shape_valid_idx]
+
+                if filter_masks_sizes[0]:
+                    # Filter by actual mask size
+                    masks_np = results[0].masks.data.cpu().numpy()
+                    size_valid_idx, median_mask_area = _filter_mask_sizes(
+                        masks_np,
+                        upper_multiplier= filter_masks_sizes[2], # No upper limit, as we have filtered out via large bboxes already
+                        lower_multiplier= filter_masks_sizes[1],  # Filter small masks
+                        save_distribution=save_imgs_bool,
+                        filename='mask_size_distribution.png'
+                    )
+                    results[0].boxes = results[0].boxes[size_valid_idx]
+                    results[0].masks = results[0].masks[size_valid_idx]
         
         plotted_img = results[0].plot(
             boxes=False,
@@ -171,7 +171,7 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         
         if save_imgs_bool:
             cv2.imwrite('output_colored_masks.jpg', cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
-            cv2.imwrite('output.jpg', plotted_img)
+         #   cv2.imwrite('output.jpg', plotted_img)
             cv2.imwrite('output_w_boxes.jpg', plotted_img_w_boxes)
             cv2.imwrite('sample_img.jpg', cv2.cvtColor(np.array(sample_img), cv2.COLOR_RGB2BGR))
 
@@ -183,7 +183,7 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
     if store_masks_bool:
         store_masks(masks_list, img_ids_list, filepath= 'saved_masks/SAM3')
 
-def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing_samples = 1):
+def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing_samples = 1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None)):
     """
     
     SAM segmentation model inference and mask saving.
@@ -193,7 +193,10 @@ def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing
         save_imgs_bool (bool): Whether to save output images with masks overlaid.
         store_masks_bool (bool): Whether to store the generated masks to disk.
         testing_samples (int): Number of samples to process (i.e. processing takes a long time, so for testing we can limit this).
-    
+        filter_bboxes (tuple): (bool, lower_multiplier, upper_multiplier) to filter bounding boxes based on area relative to median.
+        filter_masks_shapes (tuple): (bool, rectangularity_threshold) to filter masks based on shape.
+        filter_masks_sizes (tuple): (bool, lower_multiplier, upper_multiplier) to filter masks based on size.
+
     """
 
     if type(samples) is not list:
@@ -225,40 +228,39 @@ def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing
         # Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
         
-        if len(boxes) > 0:
-            widths = boxes[:, 2] - boxes[:, 0]
-            heights = boxes[:, 3] - boxes[:, 1]
-            areas = widths * heights
-
-            # Save a plot of the distribution of areas
-            if save_imgs_bool:
-                plt.figure()
-                plt.hist(areas, bins=30, color='blue', alpha=0.7)
-                plt.axvline(np.median(areas), color='red', linestyle='dashed', linewidth=1)
-                plt.title('Distribution of Detected Object Areas')
-                plt.xlabel('Area (pixels)')
-                plt.ylabel('Frequency')
-                plt.savefig('area_distribution.png')
-                plt.close()
-            
-            # Calculate median and filter outliers
-            median_area = np.median(areas)
-            
-            # Keep objects within a range of the median
-            # Adjust multiplier as needed (2.0 = keep areas up to 2x median)
-            UPPER_MULTIPLIER = 4.0
-
-            valid_idx = (
-                (areas <= median_area * UPPER_MULTIPLIER)
+        if len(boxes) > 0 and filter_bboxes[0]:
+            valid_idx, median_area = _filter_bbox_sizes(
+                boxes, 
+                upper_multiplier=filter_bboxes[2],
+                lower_multiplier=filter_bboxes[1],
+                save_distribution=save_imgs_bool,
+                filename='area_distribution.png'
             )
-            
-            print(f"Median area: {median_area:.0f} pixels")
-            #   print(f"Filtering range: {median_area * LOWER_MULTIPLIER:.0f} - {median_area * UPPER_MULTIPLIER:.0f} pixels")
-            print(f"Filtered: {len(boxes)} -> {valid_idx.sum()} detections")
             
             results[0].boxes = results[0].boxes[valid_idx]
             if results[0].masks is not None:
                 results[0].masks = results[0].masks[valid_idx]
+
+                if filter_masks_shapes[0]:
+                    # Filter by mask shape (rectangularity)
+                    masks_np = results[0].masks.data.cpu().numpy()
+                    boxes_np = results[0].boxes.xyxy.cpu().numpy()
+                    shape_valid_idx = _filter_mask_shapes(masks_np, boxes_np, rectangularity_threshold=filter_masks_shapes[1])
+                    results[0].boxes = results[0].boxes[shape_valid_idx]
+                    results[0].masks = results[0].masks[shape_valid_idx]
+
+                if filter_masks_sizes[0]:
+                    # Filter by actual mask size
+                    masks_np = results[0].masks.data.cpu().numpy()
+                    size_valid_idx, median_mask_area = _filter_mask_sizes(
+                        masks_np,
+                        upper_multiplier= filter_masks_sizes[2], # No upper limit, as we have filtered out via large bboxes already
+                        lower_multiplier= filter_masks_sizes[1],  # Filter small masks
+                        save_distribution=save_imgs_bool,
+                        filename='mask_size_distribution.png'
+                    )
+                    results[0].boxes = results[0].boxes[size_valid_idx]
+                    results[0].masks = results[0].masks[size_valid_idx]
         
         plotted_img = results[0].plot(
             boxes=False,
@@ -296,7 +298,7 @@ def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing
     if store_masks_bool:
         store_masks(masks_list, img_ids_list, filepath= 'saved_masks/SAM') 
 
-def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1):
+def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None)):
     """
     SAM segmentation model using Meta's implementation (not Ultralytics).
     Provides more flexibility in hyperparameters.
@@ -306,6 +308,9 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
         save_imgs_bool (bool): Whether to save output images with masks overlaid.
         store_masks_bool (bool): Whether to store the generated masks to disk.
         testing_samples (int): Number of samples to process.
+        filter_bboxes (tuple): (bool, lower_multiplier, upper_multiplier) to filter bounding boxes based on area relative to median.
+        filter_masks_shapes (tuple): (bool, rectangularity_threshold) to filter masks based on shape.
+        filter_masks_sizes (tuple): (bool, lower_multiplier, upper_multiplier) to filter masks based on size.
     """
     
     if type(samples) is not list:
@@ -341,33 +346,59 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
         if len(mask_dicts) > 0:
             # Extract bounding boxes and calculate areas
             bboxes = np.array([m['bbox'] for m in mask_dicts])  # [x, y, w, h]
-            areas = bboxes[:, 2] * bboxes[:, 3]  # width * height
+
+            # Convert to xyxy format for filtering
+            boxes_xyxy = np.column_stack([
+                bboxes[:, 0],
+                bboxes[:, 1],
+                bboxes[:, 0] + bboxes[:, 2],
+                bboxes[:, 1] + bboxes[:, 3]
+            ])
             
-            # Save area distribution plot
-            if save_imgs_bool:
-                plt.figure()
-                plt.hist(areas, bins=30, color='blue', alpha=0.7)
-                plt.axvline(np.median(areas), color='red', linestyle='dashed', linewidth=1)
-                plt.title('Distribution of Detected Object Areas')
-                plt.xlabel('Area (pixels)')
-                plt.ylabel('Frequency')
-                plt.savefig(f'area_distribution.png')
-                plt.close()
+            # Filter by bounding box size
+            if filter_bboxes[0]:
+                valid_idx, median_area = _filter_bbox_sizes(
+                    boxes_xyxy,
+                    upper_multiplier=filter_bboxes[2],
+                    lower_multiplier=filter_bboxes[1],
+                    save_distribution=save_imgs_bool,
+                    filename='area_distribution.png'
+                )
+                mask_dicts = [m for i, m in enumerate(mask_dicts) if valid_idx[i]]
             
-            # Calculate median and filter outliers
-            median_area = np.median(areas)
-            UPPER_MULTIPLIER = 4.0
+            # Filter by mask shape (rectangularity)
+            if filter_masks_shapes[0] and len(mask_dicts) > 0:
+                # Extract masks and boxes from remaining mask_dicts
+                binary_masks = np.array([m['segmentation'] for m in mask_dicts])
+                bboxes = np.array([m['bbox'] for m in mask_dicts])
+                boxes_xyxy = np.column_stack([
+                    bboxes[:, 0],
+                    bboxes[:, 1],
+                    bboxes[:, 0] + bboxes[:, 2],
+                    bboxes[:, 1] + bboxes[:, 3]
+                ])
+                
+                shape_valid_idx = _filter_mask_shapes(
+                    binary_masks, 
+                    boxes=boxes_xyxy, 
+                    rectangularity_threshold=filter_masks_shapes[1]
+                )
+                mask_dicts = [m for i, m in enumerate(mask_dicts) if shape_valid_idx[i]]
             
-            valid_idx = (areas <= median_area * UPPER_MULTIPLIER)
-            
-            print(f"Image {sample_idx} - Median area: {median_area:.0f} pixels")
-            print(f"Filtered: {len(mask_dicts)} -> {valid_idx.sum()} detections")
-            
-            # Filter mask_dicts
-            mask_dicts = [m for i, m in enumerate(mask_dicts) if valid_idx[i]]
+            # Filter by mask size
+            if filter_masks_sizes[0] and len(mask_dicts) > 0:
+                binary_masks = np.array([m['segmentation'] for m in mask_dicts])
+                size_valid_idx, median_mask_area = _filter_mask_sizes(
+                    binary_masks,
+                    upper_multiplier=filter_masks_sizes[2],
+                    lower_multiplier=filter_masks_sizes[1],
+                    save_distribution=save_imgs_bool,
+                    filename='mask_size_distribution.png'
+                )
+                mask_dicts = [m for i, m in enumerate(mask_dicts) if size_valid_idx[i]]
         
         # Extract binary masks from the filtered dictionaries
-        binary_masks = np.array([m['segmentation'] for m in mask_dicts])
+        binary_masks = np.array([m['segmentation'] for m in mask_dicts]) if len(mask_dicts) > 0 else np.array([])
         
         # Visualization with colored masks (similar to Ultralytics version)
         img_array = np.array(sample_img).copy()
@@ -407,10 +438,135 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
     if store_masks_bool:
         store_masks(masks_list, img_ids_list, filepath='saved_masks/SAM_manipulate')
     
+def _filter_bbox_sizes(boxes, upper_multiplier=4.0, lower_multiplier=None, save_distribution=False, filename='area_distribution.png'):
+    """
+    Filter bounding boxes based on area relative to median.
+    
+    Args:
+        boxes: numpy array of bounding boxes in xyxy format [x1, y1, x2, y2]
+        upper_multiplier: Maximum area as multiple of median (default 4.0)
+        lower_multiplier: Minimum area as multiple of median (default None = no lower bound)
+        save_distribution: Whether to save histogram of areas
+        filename: Filename for the distribution plot
+        
+    Returns:
+        valid_idx: Boolean array indicating which boxes to keep
+        median_area: The median area value
+    """
+    if len(boxes) == 0:
+        return np.array([], dtype=bool), 0
+    
+    widths = boxes[:, 2] - boxes[:, 0]
+    heights = boxes[:, 3] - boxes[:, 1]
+    areas = widths * heights
+    
+    if save_distribution:
+        plt.figure()
+        plt.hist(areas, bins=30, color='blue', alpha=0.7)
+        plt.axvline(np.median(areas), color='red', linestyle='dashed', linewidth=1)
+        plt.title('Distribution of Detected Object Areas')
+        plt.xlabel('Area (pixels)')
+        plt.ylabel('Frequency')
+        plt.savefig(filename)
+        plt.close()
+    
+    median_area = np.median(areas)
+    
+    # Build filter conditions
+    valid_idx = areas <= median_area * upper_multiplier
+    if lower_multiplier is not None:
+        valid_idx &= (areas >= median_area * lower_multiplier)
+    
+    print(f"Median area: {median_area:.0f} pixels")
+    print(f"Filtered: {len(boxes)} -> {valid_idx.sum()} detections")
+    
+    return valid_idx, median_area
 
+def _filter_mask_shapes(masks, boxes, rectangularity_threshold=0.85):
+    """
+    Filter out masks that are too rectangular (likely container edges, not raspberries).
+    
+    Args:
+        masks: numpy array of binary masks [N, H, W]
+        boxes: Optional numpy array of bounding boxes in xyxy format [N, 4].
+               If None, boxes will be computed from masks.
+        rectangularity_threshold: Ratio of mask area to bounding box area (default 0.85)
+                                 Higher = more rectangular. Raspberries typically < 0.8
+    
+    Returns:
+        valid_idx: Boolean array indicating which masks to keep
+    """
+    if len(masks) == 0:
+        return np.array([], dtype=bool)
+    
+    valid_idx = np.ones(len(masks), dtype=bool)
+    
+    for i, mask in enumerate(masks):
+        # Calculate mask area
+        mask_area = mask.sum()
+        
+        if mask_area == 0:
+            valid_idx[i] = False
+            continue
+        
+        # Get bounding box area
+        x1, y1, x2, y2 = boxes[i]
+        bbox_area = (x2 - x1) * (y2 - y1)
 
+        
+        # Calculate rectangularity
+        rectangularity = mask_area / bbox_area if bbox_area > 0 else 0
+        
+        # Filter if too rectangular
+        if rectangularity > rectangularity_threshold:
+            valid_idx[i] = False
+            print(f"Filtered mask {i}: rectangularity={rectangularity:.3f}")
+    
+    return valid_idx
 
+def _filter_mask_sizes(masks, upper_multiplier=None, lower_multiplier=0.3, save_distribution=False, filename='mask_area_distribution.png'):
+    """
+    Filter masks based on actual segmentation area (not bounding box).
+    Useful for filtering out small artifacts or container edges with large bboxes but small masks.
+    
+    Args:
+        masks: numpy array of binary masks [N, H, W]
+        upper_multiplier: Maximum area as multiple of median (default 4.0)
+        lower_multiplier: Minimum area as multiple of median (default None = no lower bound)
+        save_distribution: Whether to save histogram of areas
+        filename: Filename for the distribution plot
+        
+    Returns:
+        valid_idx: Boolean array indicating which masks to keep
+        median_area: The median mask area value
+    """
+    if len(masks) == 0:
+        return np.array([], dtype=bool), 0
+    
+    # Calculate actual mask areas (number of pixels in each mask)
+    areas = np.array([mask.sum() for mask in masks])
+    
+    if save_distribution:
+        plt.figure()
+        plt.hist(areas, bins=30, color='blue', alpha=0.7)
+        plt.axvline(np.median(areas), color='red', linestyle='dashed', linewidth=1)
+        plt.title('Distribution of Mask Areas')
+        plt.xlabel('Area (pixels)')
+        plt.ylabel('Frequency')
+        plt.savefig(filename)
+        plt.close()
+    
+    median_area = np.median(areas)
+    
+    # Build filter conditions
+    valid_idx = areas >= median_area * lower_multiplier
+    if upper_multiplier is not None:
+        valid_idx &= (areas <= median_area * upper_multiplier)
 
+    print(f"Median mask area: {median_area:.0f} pixels")
+    print(f"Filtered: {len(masks)} -> {valid_idx.sum()} detections")
+    
+    return valid_idx, median_area
 
 def store_masks(masks, image_ids, filepath):
  
@@ -434,16 +590,16 @@ def main():
     # Crop to bonnet area
   #  example_img = example_img.crop((bonnet_bbox[0], bonnet_bbox[1], bonnet_bbox[2], bonnet_bbox[3])) # left, upper, right, lower
 
-    MODE = "SAM_manipulate"
+    MODE = "SAM"
 
     if MODE == "SAM_manipulate":
-        model_SAM_manipulate(list(ds['train']), save_imgs_bool = True, store_masks_bool = True, testing_samples = 1)
+        model_SAM_manipulate(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 15)
         
     elif MODE == "SAM":
-        model_SAM(list(ds['train']), save_imgs_bool = True, store_masks_bool = True, testing_samples = 1)
+        model_SAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 15)
 
     elif MODE == "SAM3":
-        model_SAM3(list(ds['train']), save_imgs_bool = False, store_masks_bool = True)
+        model_SAM3(list(ds['train']), save_imgs_bool = False, store_masks_bool = False, testing_samples = 15, filter_masks_shapes = (None, 0.95)) 
 
 
 

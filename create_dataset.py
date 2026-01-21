@@ -11,6 +11,8 @@ from helper import overlay_raspberries
 def _center_object(masked_img):
     """
     Center the non-zero object in the image without changing image size.
+    This is in order to match the MVtec dataset format - even though they
+    do not specify centering the objects, it at least looks like it in the images.
     """
     # Find bounding box of non-zero pixels
     coords = np.argwhere(masked_img.any(axis=-1))
@@ -56,6 +58,34 @@ def _center_object(masked_img):
     
     return centered_img
 
+def _crop_image(masked_img):
+    """
+    Crop the image to a square based on the smaller dimension.
+    Removes equal amounts from both sides of the larger dimension.
+    In MVtec, images are between 700x700 and 1024x1024 dimensions,
+    so for the raspberry dataset, we will have 800x800 images.
+    
+    Notes :
+        1. Assumes the object is already centered in the image.
+    
+    
+    """
+    img_h, img_w = masked_img.shape[:2]
+    
+    # Determine the smaller dimension (this will be our square size)
+    crop_size = min(img_h, img_w)
+    
+    # Calculate center
+    center_y, center_x = img_h // 2, img_w // 2
+    
+    # Calculate crop coordinates (centered)
+    y1 = center_y - crop_size // 2
+    y2 = center_y + crop_size // 2
+    x1 = center_x - crop_size // 2
+    x2 = center_x + crop_size // 2
+    
+    return masked_img[y1:y2, x1:x2]
+
 def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = None, all_gt_grades = None):
     """
     Given a list of lists of masks (True/False values) for each image, 
@@ -94,7 +124,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
     dataset = []
     for idx, (img, img_masks) in enumerate(zip(images, masks)):
         curr_img_raw = []
-        curr_img_centered = []
+        curr_img_processed = []
         
         for mask in img_masks:
             # Create a new image for each mask
@@ -106,15 +136,17 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
             curr_img_raw.append(masked_img)
 
             # Center the object in the image
-            masked_img_centered = _center_object(masked_img)
-            curr_img_centered.append(masked_img_centered)
+            masked_img_processed = _center_object(masked_img)
+            # Crop to square
+            masked_img_processed = _crop_image(masked_img_processed)
+            curr_img_processed.append(masked_img_processed)
 
         if ids is not None and grades_matched:
-            dataset.append((curr_img_raw, curr_img_centered, ids[idx], grades_matched[idx]))
+            dataset.append((curr_img_raw, curr_img_processed, ids[idx], grades_matched[idx]))
         elif ids is not None:
-            dataset.append((curr_img_raw, curr_img_centered, ids[idx]))
+            dataset.append((curr_img_raw, curr_img_processed, ids[idx]))
         else:
-            dataset.extend(list(zip(curr_img_raw, curr_img_centered)))
+            dataset.extend(list(zip(curr_img_raw, curr_img_processed)))
 
     if save_path is not None:
         # Create raw and processed subdirectories
@@ -204,8 +236,8 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
     return dataset
 
 def main():
-    SAVE_PATH = 'dataset_single_objects/SAM3'
-    PRED_MASKS_FILE = 'saved_masks/SAM3/masks.npz'
+    SAVE_PATH = 'dataset_single_objects/SAM'
+    PRED_MASKS_FILE = 'saved_masks/SAM/masks.npz'
 
     ## Load original images and masks
     ds = load_dataset("FBK-TeV/RaspGrade")

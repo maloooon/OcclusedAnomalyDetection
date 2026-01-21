@@ -75,6 +75,11 @@ def overlay_raspberries(folder_path, output_path=None):
     draw = ImageDraw.Draw(canvas_rgb)
     
     for img_file in image_files:
+
+        # Skip image that has 'overlayed' string in its name
+        if 'overlayed' in img_file:
+            continue
+
         # Extract grade
         match = re.search(r'grade(\d+)', img_file)
         grade = match.group(1) if match else '?'
