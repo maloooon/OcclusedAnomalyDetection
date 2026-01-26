@@ -245,7 +245,7 @@ def main():
     all_gt_masks_ids  = _extract_masks(train_data)
 
     ## Load predicted masks
-    PRED_MASKS_FILE = 'saved_masks/SAM/masks.npz'
+    PRED_MASKS_FILE = 'saved_masks/SAM3/masks.npz'
     pred_data = np.load(PRED_MASKS_FILE)
     all_pred_masks_ids = [(pred_data[key], key) for key in pred_data.keys()]
 

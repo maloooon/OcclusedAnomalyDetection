@@ -8,6 +8,7 @@ from ultralytics.models.sam import SAM3SemanticPredictor
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 import cv2
 import os
+from time import time 
 
 
 
@@ -108,8 +109,11 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         sample_img = sample['image']
         sample_idx = sample['image_id']
         predictor.set_image(sample_img)
+        start_time = time()
         results = predictor(text=["raspberry"])
-        
+        end_time = time()
+        print(f"Inference time for sample {sample_idx}: {end_time - start_time:.2f} seconds")
+
         # Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
         
@@ -223,8 +227,11 @@ def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing
         sample_img = sample['image']
         sample_idx = sample['image_id']
         predictor.set_image(sample_img)
+        start_time = time()
         results = predictor()
-        
+        end_time = time()
+        print(f"Inference time for sample {sample_idx}: {end_time - start_time:.2f} seconds")
+
         # Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
         
@@ -248,6 +255,8 @@ def model_SAM(samples, save_imgs_bool = False, store_masks_bool = False, testing
                     shape_valid_idx = _filter_mask_shapes(masks_np, boxes_np, rectangularity_threshold=filter_masks_shapes[1])
                     results[0].boxes = results[0].boxes[shape_valid_idx]
                     results[0].masks = results[0].masks[shape_valid_idx]
+
+
 
                 if filter_masks_sizes[0]:
                     # Filter by actual mask size
@@ -323,8 +332,8 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
         sam,
         points_per_side=16,
         pred_iou_thresh=0.25,
-        stability_score_thresh=0.92,
-        box_nms_thresh=0.5,
+        stability_score_thresh=0.95,
+        box_nms_thresh=0.1,
         crop_nms_thresh=0.5,
         min_mask_region_area=100,
     )
@@ -340,8 +349,11 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
         sample_idx = sample['image_id']
         
         # Generate masks (Meta SAM returns list of dicts)
+        begin_time = time()
         mask_dicts = mask_generator.generate(np.array(sample_img))
-        
+        end_time = time()
+        print(f"Inference time for sample {sample_idx}: {end_time - begin_time:.2f} seconds")
+
         # Extract masks and bounding boxes for filtering
         if len(mask_dicts) > 0:
             # Extract bounding boxes and calculate areas
@@ -521,6 +533,9 @@ def _filter_mask_shapes(masks, boxes, rectangularity_threshold=0.85):
         if rectangularity > rectangularity_threshold:
             valid_idx[i] = False
             print(f"Filtered mask {i}: rectangularity={rectangularity:.3f}")
+
+
+    print("Filtered {} masks based on shape (rectangularity threshold={})".format(len(masks) - valid_idx.sum(), rectangularity_threshold))
     
     return valid_idx
 
@@ -590,16 +605,16 @@ def main():
     # Crop to bonnet area
   #  example_img = example_img.crop((bonnet_bbox[0], bonnet_bbox[1], bonnet_bbox[2], bonnet_bbox[3])) # left, upper, right, lower
 
-    MODE = "SAM"
+    MODE = "SAM3"
 
     if MODE == "SAM_manipulate":
-        model_SAM_manipulate(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 15)
+        model_SAM_manipulate(list(ds['train']), save_imgs_bool = True, store_masks_bool = False, testing_samples = 1, filter_bboxes = (False, 0.2, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None))
         
     elif MODE == "SAM":
-        model_SAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 15)
+        model_SAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
 
     elif MODE == "SAM3":
-        model_SAM3(list(ds['train']), save_imgs_bool = False, store_masks_bool = False, testing_samples = 15, filter_masks_shapes = (None, 0.95)) 
+        model_SAM3(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 15, filter_masks_shapes = (False, 0.95), filter_bboxes = (False, 0.2, 3.0), filter_masks_sizes = (False, 0.2, None))
 
 
 
