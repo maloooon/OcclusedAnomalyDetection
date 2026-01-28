@@ -224,6 +224,9 @@ def _extract_masks(data, extract_grades_bool = False):
                 masks_sample.append(mask)
                 # Also store grades, since we need to match them to the predicted masks for usage in anomaly detection later on
                 grades_sample.append(int(label_data[0]))  
+            
+    
+                
 
         all_gt_masks_ids.append((np.array(masks_sample), img_id))
         all_gt_grades_ids.append((np.array(grades_sample), img_id))

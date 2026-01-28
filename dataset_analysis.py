@@ -68,6 +68,8 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
             
             # Extract polygon coordinates (normalized values)
             coords = label_data[1:]
+
+            
             
             # Convert normalized coordinates to pixel coordinates
             polygon_points = []
@@ -84,6 +86,16 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
 
             if debug:
                 print(f"  Polygon points: {len(polygon_points)}")
+
+
+            # TO FIND BONNET SIZE FOR LATER SYNTHETIC OCCLUSION PURPOSES
+            if class_id == 0:
+                # Find min and max x and y coordinates
+                xs = [p[0] for p in polygon_points]
+                ys = [p[1] for p in polygon_points]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                print(f"  Bonnet bounding box: ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})")
             
             # Draw segmentation mask
             if show_segmentation_mask:
@@ -95,6 +107,9 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
                 except Exception as e:
                     print(f"  ERROR drawing polygon: {e}")
                     continue
+
+        
+
             
             # Draw class label at centroid
             if show_classes:

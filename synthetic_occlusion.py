@@ -2,45 +2,109 @@ import random
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 class SyntheticOcclusion:
-    def __init__(self, data_path):
+    def __init__(self, base_path, sample_folders=None):
         """
-        Args : 
-        data_path (str) : Path to the dataset of single raspberry images ; right now of a single sample (i.e. of one bonnet)
+        Args:
+            base_path: Path to dataset_single_objects/GT/processed/
+            sample_folders: List of folder names (e.g., ['img001', 'img002']) 
+                          If None, loads all folders
+        """
+        base_path = Path(base_path)
         
-        """
-        # Open the .npz file
-        data_dict = np.load(data_path, allow_pickle=True)
-        self.masks = data_dict["masks"] # Array of segmentation masks of single raspberries of the currently loaded sample
-        self.images = data_dict["images"] # Array of single raspberry images of the currently loaded sample
-
-
+        # Get all sample folders if not specified
+        if sample_folders is None:
+            sample_folders = sorted([d.name for d in base_path.iterdir() if d.is_dir()])
+        
+        all_masks = []
+        all_images = []
+        
+        for folder in sample_folders:
+            npz_path = base_path / folder / f"processed_{folder}_data.npz"
+            
+            if not npz_path.exists():
+                print(f"Warning: {npz_path} not found, skipping")
+                continue
+                
+            data = np.load(npz_path, allow_pickle=True)
+            all_masks.append(data['masks'])
+            all_images.append(data['images'])
+        
+        # Combine all samples
+        self.masks = np.concatenate(all_masks, axis=0)
+        self.images = np.concatenate(all_images, axis=0)
+        
+        print(f"Loaded {len(sample_folders)} samples")
+        print(f"Total masks shape: {self.masks.shape}")
+        print(f"Total images shape: {self.images.shape}")
 
     def k_raspberries_occlusion(self, k=5,
                             max_occlusions_per_raspberry=3,
                             min_remaining_size_factor=0.2,
-                            wanted_size_range_per_occlusion=(0.05, 0.3),
+                            wanted_size_range_per_occlusion=(0.7, 0.9),
                             randomize_scale_bool=(False, 0.8, 1.2),
                             randomize_rotation_bool=(True, -180, 180),
                             nudge = (10,3), 
-                            visualize_bool = False):
+                            visualize_bool = False,
+                            weighted_sampling_bool = True):
         """
-        Create occlusion patterns with k raspberries overlaying each other.
+        Occlusion of k single raspberries.
+        Based on the idea of Copy & Paste as in Ghiasi et al., 
+        "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
 
-        nudge : (trials, radius)
+        Args:
+            k (int) : Number of raspberries to occlude sequentially.
+            max_occlusions_per_raspberry (int) : Maximum number of times a raspberry can be occluded.
+            min_remaining_size_factor (float) : Minimum remaining size factor (0-1) of a raspberry after occlusions.
+            wanted_size_range_per_occlusion (tuple) : Desired size range (min, max) for each occlusion.
+            randomize_scale_bool (tuple) : (apply_randomization, min_scale, max_scale) for random scaling.
+            randomize_rotation_bool (tuple) : (apply_randomization, min_angle, max_angle) for random rotation.
+            nudge (tuple) : (trials, radius) for random nudging. This means that every 'trials' failed attempts,
+                            the source anchor points will be nudged outward by removing a circular region of 'radius' pixels
+                            around the center of the source mask, such that the new anchor points are more likely to be near 
+                            the edges, which leads to the wanted_size_range_per_occlusion being satisfied more often.
+            visualize_bool (bool) : Whether to visualize the occlusion process.
+            weighted_sampling_bool (bool) : Whether to use weighted sampling for raspberry selection. This means we prefer
+            selecting larger raspberries more often.    
+
+        Workflow:
+            1. Select k raspberries from dataset.
+            2. Sequentially paste each raspberry onto the composite image, applying random transformations (scaling, rotation) if wanted.
+            The pasting follows the Targeted Pasting idea, i.e. by selecting two anchor points : source anchor is a (x,y) 
+            coordinate within the source raspberry and target anchor is a (x,y) coordinate within the target raspberry. 
+            We then calculate the offset and paste the source raspberry onto the target image at the calculated location
+            3. For each placement, check occlusion constraints for all affected raspberries.
+                That is, check that the min_remaining_size_factor is fulfilled and any occlusion is in the
+                wanted_size_range_per_occlusion
+            4. If constraints are satisfied, update composite image and masks; otherwise, retry placement.
+
         """
         
         if k < 2:
             raise ValueError("k must be at least 2")
         
+        # Calculate mask sizes for all raspberries in dataset
+        mask_sizes = np.array([np.sum(mask) for mask in self.masks])
+
         # 1. Select k raspberries from dataset
-        chosen_indices = np.random.choice(len(self.images), size=k, replace=True)
+        if weighted_sampling_bool:
+
+            # Create weighted selection (prefer larger raspberries)
+            weights = np.sqrt(mask_sizes)
+            weights = weights / np.sum(weights)
+            
+            # Select k raspberries with weighted sampling
+            chosen_indices = np.random.choice(len(self.images), size=k, replace=True, p=weights)
+
+        else:
+            chosen_indices = np.random.choice(len(self.images), size=k, replace=True)
         
         # Initialize with first raspberry as base
         composite_img = self.images[chosen_indices[0]].copy()
         composite_mask = self.masks[chosen_indices[0]].copy()
-        
+
         # Track occlusion count for each raspberry
         occlusion_counts = np.zeros(k, dtype=int)
         original_mask_sizes = [np.sum(self.masks[idx]) for idx in chosen_indices]
@@ -154,7 +218,6 @@ class SyntheticOcclusion:
                 target_anchor_y, target_anchor_x = all_existing_coords[target_anchor_idx]
                 
                 # Select random source anchor
-                source_coords = np.argwhere(transformed_source_mask)
                 if len(source_coords) == 0:
                     print("Warning: Source mask is empty. Skipping.")
                     continue
@@ -185,6 +248,11 @@ class SyntheticOcclusion:
                 
                 if src_y_end <= src_y_start or src_x_end <= src_x_start:
                     print("Warning: No valid overlap. Skipping.")
+                    continue
+
+                # Also do a check whether the dst bbox is within the image bounds
+                if dst_y_end > h_target or dst_x_end > w_target:
+                    print("Warning: Destination out of bounds. Skipping.")
                     continue
                 
                 # Extract source region
@@ -265,19 +333,11 @@ class SyntheticOcclusion:
                 continue
 
 
-            
             # Paste source onto composite
             composite_img[dst_y_start:dst_y_end, dst_x_start:dst_x_end][source_region_mask] = \
                 source_region_img[source_region_mask]
             
 
-          #  if visualize_bool:
-          #      plt.figure(figsize=(8, 8))
-          #      plt.imshow(np.asarray(composite_img, dtype=np.uint8))
-          #      plt.title(f"After adding raspberry {i+1}")
-          #      plt.axis('off')
-          #      plt.show()
-            
             # Update ALL affected raspberry masks
             for aff in affected_raspberries:
                 j = aff['index']
@@ -332,7 +392,6 @@ class SyntheticOcclusion:
 
 
         if visualize_bool:
-            import matplotlib.pyplot as plt
             
             num_masks = min(len(all_raspberry_masks), k)
             total_plots = num_masks + 1  # +1 for composite
@@ -418,12 +477,14 @@ class SyntheticOcclusion:
             
             plt.tight_layout()
             plt.show()
- 
-    
-        
-        return composite_img, all_raspberry_masks
 
+        # Finally, we want to only have the raspberry masks that were occluded at least once
+        occluded_masks = []
+        for j in range(len(all_raspberry_masks)):
+            if occlusion_counts[j] > 0:
+                occluded_masks.append(all_raspberry_masks[j])
 
+        return composite_img, occluded_masks
 
     def single_raspberry_occlusion(self, abs_size_threshold=100, 
                                 wanted_size_range=None,
@@ -432,7 +493,7 @@ class SyntheticOcclusion:
                                 randomize_rotation_bool=(False, -30, 30),
                                 choose_idx = None):
         """
-        Occlusion of single raspberries (Idea 2 in presentation).
+        Occlusion of 2 single raspberries.
         Based on the idea of Copy & Paste as in Ghiasi et al., 
         "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
 
@@ -453,10 +514,18 @@ class SyntheticOcclusion:
                                     nearly non-occluded such that we can produce more realistic occlusions.
 
         Workflow : 
-            1. Select two random images of single raspberries from the dataset.
-            2. Paste the source raspberry region onto the target image at a random location within
-            the locality of the raspberry in the target image (Targeted Pasting).
-            3. Optionally apply blending to make the occlusion look more natural.
+            1. Select two random images of single raspberries from the dataset (source and target raspberry).
+            2. Apply random transformations (scaling, rotation) to the source raspberry, if wanted.
+            3. Paste the source raspberry region onto the target image at a random location within
+            the locality of the raspberry in the target image (Targeted Pasting); this is implemented
+            by selecting two anchor points : source anchor is a (x,y) coordinate within the source raspberry
+             and target anchor is a (x,y) coordinate within the target raspberry. We then calculate the offset
+             and paste the source raspberry onto the target image at the calculated location. 
+            4. Check occlusion constraints are satisfied (i.e. abs_size_threshold or wanted_size_range).
+
+        Notes :
+            Remove abs_size_threshold or adjust it (i.e. make it a factor, not absolute size)
+
         """
 
         if choose_idx is None:
@@ -488,6 +557,350 @@ class SyntheticOcclusion:
     #     new_target_img = self._apply_blending(new_target_img, source_img, new_target_mask)
 
         return new_target_img, new_target_mask
+
+    def create_artificial_bonnet(self, k=25, 
+                                field_size=(961, 644),
+                                show_field_boundary=True,
+                                randomize_rotation_bool=(True, -180, 180),
+                                wanted_size_range_per_occlusion=(0.7, 0.9),
+                                visualize_bool=False,
+                                weighted_sampling_bool = True):
+        """
+        Create an artificial bonnet by placing k raspberries randomly within a defined field.
+        
+        Args:
+            k (int): Number of raspberries to place in the field
+            field_size (tuple): (width, height) of the bonnet field in pixels
+            show_field_boundary (bool): If True, draw green rectangle showing field boundaries
+            randomize_rotation_bool (tuple): (bool, min_angle, max_angle) for random rotation
+            wanted_size_range_per_occlusion (tuple): (min_factor, max_factor) - when a raspberry
+                                                    gets occluded, its remaining size must be
+                                                    between min_factor and max_factor of original size
+            max_trials_per_raspberry (int): Maximum placement attempts per raspberry
+            visualize_bool (bool): Whether to show step-by-step visualization
+            weighted_sampling_bool (bool): Whether to use weighted sampling for raspberry selection. 
+            This means we prefer selecting larger raspberries more often.
+        
+        Returns:
+            composite_img: Final bonnet image with all raspberries
+            occluded_masks: List of raspberry masks that were occluded at least once
+            placement_metadata: Dict with placement information
+
+
+        Workflow : 
+            1. Create black canvas and define field area.
+            2. For each of the k raspberries:
+                a. Select a random raspberry from dataset (weighted by size; i.e. larger raspberry masks are picked more often).
+                b. Apply random rotation if wanted.
+                c. Attempt to place it randomly within the field, checking occlusion constraints
+                   for all affected raspberries. Occlusion constraints are :
+                          - The remaining size of any affected raspberry must be within wanted_size_range_per_occlusion.
+        """
+        
+        field_width, field_height = field_size
+        
+        # Create black canvas
+        canvas_size = 1500
+        composite_img = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+        
+        # Calculate offset to center the field
+        field_offset_x = (canvas_size - field_width) // 2
+        field_offset_y = (canvas_size - field_height) // 2
+        
+        # Draw field boundary if requested (centered)
+        if show_field_boundary:
+            cv2.rectangle(composite_img, 
+                        (field_offset_x, field_offset_y), 
+                        (field_offset_x + field_width - 1, field_offset_y + field_height - 1), 
+                        (0, 255, 0), thickness=3)
+        
+        # Calculate mask sizes for all raspberries in dataset
+        mask_sizes = np.array([np.sum(mask) for mask in self.masks])
+        
+        if weighted_sampling_bool:
+            # Create weighted selection (prefer larger raspberries)
+            weights = np.sqrt(mask_sizes)
+            weights = weights / np.sum(weights)
+            
+            # Select k raspberries with weighted sampling
+            chosen_indices = np.random.choice(len(self.images), size=k, replace=True, p=weights)
+
+        else:
+            chosen_indices = np.random.choice(len(self.images), size=k, replace=True)
+        
+        print(f"Creating artificial bonnet with {k} raspberries in {field_width}x{field_height} field")
+        print(f"Field centered at offset ({field_offset_x}, {field_offset_y})")
+        print(f"Occlusion range: {wanted_size_range_per_occlusion[0]*100:.0f}%-{wanted_size_range_per_occlusion[1]*100:.0f}% of original size must remain")
+        
+        # Track all raspberry masks and metadata
+        all_masks = []
+        all_original_sizes = []  # Store original sizes before any occlusion
+        all_original_masks = []  # Store original masks for visualization
+        all_raspberry_centers = []
+        placement_metadata = {
+            'raspberry_ids': chosen_indices.tolist(),
+            'field_offset': (field_offset_x, field_offset_y),
+            'positions': [],
+            'placements': [],
+            'occlusions': []
+        }
+        
+        # Place raspberries one by one
+        for i, idx in enumerate(chosen_indices):
+            source_img = np.asarray(self.images[idx].copy(), dtype=np.uint8)
+            source_mask = np.asarray(self.masks[idx].copy(), dtype=bool)
+            
+            print(f"\n--- Placing raspberry {i+1}/{k} (ID: {idx}, size: {np.sum(source_mask)} pixels) ---")
+            
+            # Store original mask before transformation
+            original_mask = source_mask.copy()
+            
+            # Apply rotation if requested
+            transformed_source_img = source_img.copy()
+            transformed_source_mask = source_mask.copy()
+            
+            if randomize_rotation_bool[0]:
+                angle = np.random.uniform(randomize_rotation_bool[1], randomize_rotation_bool[2])
+                h, w = source_mask.shape
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                
+                transformed_source_img = cv2.warpAffine(transformed_source_img, M, (w, h),
+                                                    flags=cv2.INTER_LINEAR,
+                                                    borderMode=cv2.BORDER_CONSTANT,
+                                                    borderValue=0)
+                transformed_source_mask = cv2.warpAffine(transformed_source_mask.astype(np.uint8), M, (w, h),
+                                                        flags=cv2.INTER_NEAREST,
+                                                        borderMode=cv2.BORDER_CONSTANT,
+                                                        borderValue=0).astype(bool)
+            
+            # Calculate bounding box of the raspberry
+            coords = np.argwhere(transformed_source_mask)
+            
+            if len(coords) == 0:
+                print(f"  Warning: Empty mask for raspberry {i+1}, skipping")
+                continue
+            
+            y_min, x_min = coords.min(axis=0)
+            y_max, x_max = coords.max(axis=0)
+            
+            bbox_height = y_max - y_min + 1
+            bbox_width = x_max - x_min + 1
+            
+            print(f"  Raspberry bounding box: {bbox_width}x{bbox_height} pixels")
+            
+            # Check if raspberry fits in field
+            if bbox_width > field_width or bbox_height > field_height:
+                print(f"  Warning: Raspberry {i+1} too large for field, skipping")
+                continue
+            
+            # Extract bounding box region (used in all trials)
+            bbox_img = transformed_source_img[y_min:y_max+1, x_min:x_max+1]
+            bbox_mask = transformed_source_mask[y_min:y_max+1, x_min:x_max+1]
+            original_raspberry_size = np.sum(bbox_mask)
+            
+            # Try multiple placements until occlusion constraints are satisfied
+            placement_found = False
+            trials = 200
+            
+            for trial in range(trials):
+                # Random position within field
+                field_x = np.random.randint(0, field_width - bbox_width + 1)
+                field_y = np.random.randint(0, field_height - bbox_height + 1)
+                
+                # Convert to canvas coordinates
+                canvas_x = field_offset_x + field_x
+                canvas_y = field_offset_y + field_y
+                
+                # Calculate which existing raspberries will be affected
+                affected_raspberries = []
+                for j, existing_mask in enumerate(all_masks):
+                    existing_region = existing_mask[canvas_y:canvas_y+bbox_height, canvas_x:canvas_x+bbox_width]
+                    overlap = existing_region & bbox_mask
+                    overlap_amount = np.sum(overlap)
+                    
+                    if overlap_amount > 0:
+                        current_size = np.sum(existing_mask)
+                        original_size = all_original_sizes[j]
+                        remaining_size = current_size - overlap_amount
+                        remaining_percentage = remaining_size / original_size
+                        
+                        affected_raspberries.append({
+                            'index': j,
+                            'overlap_pixels': overlap_amount,
+                            'current_size': current_size,
+                            'original_size': original_size,
+                            'remaining_size': remaining_size,
+                            'remaining_percentage': remaining_percentage
+                        })
+                
+                # Validate occlusion constraints for ALL affected raspberries
+                valid_placement = True
+                
+                for aff in affected_raspberries:
+                    min_factor, max_factor = wanted_size_range_per_occlusion
+                    
+                    if aff['remaining_percentage'] < min_factor:
+                        # Too much occlusion - raspberry would become too small
+                        if trial % 20 == 0:  # Print occasionally to avoid spam
+                            print(f"  Trial {trial+1}: Raspberry #{aff['index']+1} would be {aff['remaining_percentage']*100:.1f}% "
+                                f"(< {min_factor*100:.0f}% min)")
+                        valid_placement = False
+                        break
+                    
+                    if aff['remaining_percentage'] > max_factor:
+                        # Too little occlusion - not enough overlap
+                        if trial % 20 == 0:
+                            print(f"  Trial {trial+1}: Raspberry #{aff['index']+1} would be {aff['remaining_percentage']*100:.1f}% "
+                                f"(> {max_factor*100:.0f}% max)")
+                        valid_placement = False
+                        break
+                
+                if valid_placement:
+                    placement_found = True
+                    print(f"  ✓ Valid placement found on trial {trial+1}")
+                    
+                    if len(affected_raspberries) > 0:
+                        print(f"  Occludes {len(affected_raspberries)} existing raspberries:")
+                        for aff in affected_raspberries:
+                            print(f"    Raspberry #{aff['index']+1}: {aff['remaining_percentage']*100:.1f}% remaining "
+                                f"({aff['overlap_pixels']} pixels occluded)")
+                    
+                    # Apply the placement
+                    composite_img[canvas_y:canvas_y+bbox_height, canvas_x:canvas_x+bbox_width][bbox_mask] = \
+                        bbox_img[bbox_mask]
+                    
+                    # Update all affected raspberry masks
+                    for aff in affected_raspberries:
+                        j = aff['index']
+                        all_masks[j][canvas_y:canvas_y+bbox_height, canvas_x:canvas_x+bbox_width][bbox_mask] = False
+                        
+                        placement_metadata['occlusions'].append({
+                            'new_raspberry': i,
+                            'occluded_raspberry': j,
+                            'overlap_pixels': int(aff['overlap_pixels']),
+                            'remaining_percentage': float(aff['remaining_percentage'])
+                        })
+                    
+                    # Add new raspberry mask to tracking
+                    new_mask = np.zeros((canvas_size, canvas_size), dtype=bool)
+                    new_mask[canvas_y:canvas_y+bbox_height, canvas_x:canvas_x+bbox_width] = bbox_mask
+                    all_masks.append(new_mask)
+                    all_original_sizes.append(original_raspberry_size)
+                    
+                    # Store original mask
+                    original_canvas_mask = np.zeros((canvas_size, canvas_size), dtype=bool)
+                    orig_coords = np.argwhere(original_mask)
+                    if len(orig_coords) > 0:
+                        orig_y_min, orig_x_min = orig_coords.min(axis=0)
+                        orig_y_max, orig_x_max = orig_coords.max(axis=0)
+                        orig_bbox = original_mask[orig_y_min:orig_y_max+1, orig_x_min:orig_x_max+1]
+                        
+                        if orig_bbox.shape != bbox_mask.shape:
+                            orig_bbox = cv2.resize(orig_bbox.astype(np.uint8), 
+                                                (bbox_mask.shape[1], bbox_mask.shape[0]),
+                                                interpolation=cv2.INTER_NEAREST).astype(bool)
+                        
+                        original_canvas_mask[canvas_y:canvas_y+bbox_height, canvas_x:canvas_x+bbox_width] = orig_bbox
+                    
+                    all_original_masks.append(original_canvas_mask)
+                    
+                    # Calculate center
+                    ys, xs = np.where(new_mask)
+                    if len(xs) > 0:
+                        center_x = int(xs.mean())
+                        center_y = int(ys.mean())
+                    else:
+                        center_x = canvas_x + bbox_width // 2
+                        center_y = canvas_y + bbox_height // 2
+                    all_raspberry_centers.append((center_x, center_y))
+                    
+                    # Record placement
+                    placement_metadata['positions'].append((canvas_x, canvas_y))
+                    placement_metadata['placements'].append({
+                        'raspberry_id': int(idx),
+                        'canvas_position': (int(canvas_x), int(canvas_y)),
+                        'field_position': (int(field_x), int(field_y)),
+                        'bbox_size': (int(bbox_width), int(bbox_height)),
+                        'rotation': float(angle) if randomize_rotation_bool[0] else 0.0,
+                        'mask_pixels': int(original_raspberry_size),
+                        'trials_needed': trial + 1
+                    })
+                    
+                    break  # Exit trial loop
+            
+            if not placement_found:
+                print(f"Failed to find valid placement after {trials} trials, skipping raspberry {i+1}")
+        
+        print(f"\n=== Bonnet Creation Complete ===")
+        print(f"Successfully placed {len(all_masks)} / {k} raspberries")
+        print(f"Total occlusion events: {len(placement_metadata['occlusions'])}")
+        
+        # Calculate final statistics
+        final_stats = []
+        for i, mask in enumerate(all_masks):
+            visible_pixels = np.sum(mask)
+            original_pixels = all_original_sizes[i]
+            occlusion_pct = (original_pixels - visible_pixels) / original_pixels * 100 if original_pixels > 0 else 0
+            
+            final_stats.append({
+                'raspberry_index': i,
+                'original_pixels': original_pixels,
+                'visible_pixels': int(visible_pixels),
+                'occlusion_percentage': float(occlusion_pct)
+            })
+        
+        placement_metadata['final_stats'] = final_stats
+        
+        
+        # Visualization
+        if visualize_bool:
+            num_masks = len(all_masks)
+            total_plots = num_masks + 1
+            
+            cols = min(4, total_plots)
+            rows = int(np.ceil(total_plots / cols))
+            
+            fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+            axes = np.array(axes).reshape(-1)
+            
+            axes[0].imshow(np.asarray(composite_img, dtype=np.uint8))
+            axes[0].set_title("Composite Bonnet")
+            axes[0].axis("off")
+            
+            for i in range(num_masks):
+                current_mask = all_masks[i]
+                original_mask = all_original_masks[i]
+                
+                vis = np.zeros((*current_mask.shape, 3), dtype=np.uint8)
+                vis[..., 0] = original_mask.astype(np.uint8) * 255
+                vis[..., 0] |= current_mask.astype(np.uint8) * 255
+                vis[..., 1] = current_mask.astype(np.uint8) * 255
+                
+                axes[i + 1].imshow(vis)
+                
+                visible_pct = 100 - final_stats[i]['occlusion_percentage']
+                axes[i + 1].set_title(f"Raspberry #{i+1}\n{visible_pct:.0f}% visible\nRed=OG Mask, Yellow=New Mask")
+                axes[i + 1].axis("off")
+            
+            for ax in axes[total_plots:]:
+                ax.axis("off")
+            
+            plt.tight_layout()
+            plt.show()
+        else:
+            plt.figure(figsize=(8, 8))
+            plt.imshow(np.asarray(composite_img, dtype=np.uint8))
+            plt.axis('off')
+            plt.show()
+        
+        # Return only masks that were occluded at least once
+        occluded_masks = []
+        for i, stats in enumerate(final_stats):
+            if stats['occlusion_percentage'] > 0:
+                occluded_masks.append(all_masks[i])
+        
+        return composite_img, occluded_masks, placement_metadata
 
     def _paste(self, target_mask, 
             source_mask, 
@@ -760,17 +1173,13 @@ class SyntheticOcclusion:
         plt.show()
 
 
-## TOMORROW : implement the spacing idea for k_raspberries_occlusion, i.e.
-    # Define a field in which raspberries can be placed (size of a bonnet)
-    # Allow for non-occlusions aswell (i.e. random placement within the field)
-    # For occlusions, do the typical restraints as before
-
-
-
 
 
 def main():
-    synthetic_occlusion = SyntheticOcclusion(data_path='dataset_single_objects/GT/processed/img001/processed_img001_data.npz')
+    data_path_all_samples = 'dataset_single_objects/GT/processed/'
+    synthetic_occlusion = SyntheticOcclusion(base_path= data_path_all_samples, sample_folders = None)
+
+    BONNET_SIZE = (961, 644)  # Width, Height taken from bonnet of img_001
    # new_img, new_mask = synthetic_occlusion.single_raspberry_occlusion(
    #     abs_size_threshold=50,
    #     wanted_size_range=(0.3, 0.7),
@@ -781,14 +1190,24 @@ def main():
    # )
    
     new_img, new_masks = synthetic_occlusion.k_raspberries_occlusion(
-        k=5,
+        k=10,
         max_occlusions_per_raspberry=4,
         min_remaining_size_factor=0.1,
         wanted_size_range_per_occlusion=(0.7, 0.9),
         randomize_scale_bool=(False, 0.8, 1.2),
         randomize_rotation_bool=(False, -180, 180),
-        visualize_bool=True
+        visualize_bool=True,
+        weighted_sampling_bool=True
     )
+
+   # new_img, new_masks, metadata = synthetic_occlusion.create_artificial_bonnet(
+   #     k=25,
+   #     field_size=BONNET_SIZE,
+   #     show_field_boundary=True,
+   #     randomize_rotation_bool=(False, -180, 180),
+   #     wanted_size_range_per_occlusion=(0.7, 0.9),
+   #     visualize_bool=True
+   # )
 
  
 
