@@ -313,8 +313,8 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
     return dataset
 
 def main():
-    SAVE_PATH = 'dataset_single_objects/SAM_mobile'
-    PRED_MASKS_FILE = 'saved_masks/SAM_mobile/masks.npz'
+    SAVE_PATH = 'dataset_single_objects/DINO_SAM'
+    PRED_MASKS_FILE = 'saved_masks/DINO_SAM/masks.npz'
 
     ## Load original images and masks
     ds = load_dataset("FBK-TeV/RaspGrade")

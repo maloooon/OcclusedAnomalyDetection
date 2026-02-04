@@ -1,3 +1,5 @@
+# Taken from : https://github.com/NielsRogge/Transformers-Tutorials/blob/master/Grounding%20DINO/GroundingDINO_with_Segment_Anything.ipynb
+
 import random
 from dataclasses import dataclass
 from typing import Any, List, Dict, Optional, Union, Tuple
@@ -373,7 +375,7 @@ def main():
 
     image= ds["train"][1]["image"]
     labels = ["raspberry."]
-    threshold = 0.20
+    threshold = 0.10
 
     detector_id = "IDEA-Research/grounding-dino-tiny"
     segmenter_id = "facebook/sam-vit-base"

@@ -196,7 +196,7 @@ def main():
     ds = load_dataset("FBK-TeV/RaspGrade")
 
     # Visualize a random sample from the training set
-    sample = ds['train'][5]
+    sample = ds['train'][1]
     visualize_sample(sample, show_segmentation_mask=False, show_classes=False, debug=True)
 
     # Plot distribution of grades

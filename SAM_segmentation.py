@@ -7,7 +7,7 @@ from ultralytics.models.sam import Predictor as SAMPredictor
 from ultralytics.models.sam import SAM3SemanticPredictor
 from ultralytics.models.fastsam import FastSAMPredictor
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
-from ultralytics.models.sam.amg import build_point_grid
+from ultralytics.models.sam.amg import build_point_grid, remove_small_regions
 import cv2
 import os
 from time import time 
@@ -59,6 +59,220 @@ def get_boxes(results: DetectionResult) -> List[List[List[float]]]:
 
     return [boxes]
 
+
+def filter_overlapping_masks_extended(
+    masks: np.ndarray,
+    overlap_threshold: int = 30,
+    containment_threshold: float = 0.98
+) -> dict:
+    """
+    Advanced mask filtering with overlap analysis and containment checking.
+    
+    Args:
+        masks: np.ndarray of shape (k, H, W) - boolean masks
+        overlap_threshold: Minimum number of overlapping pixels to count as overlap
+        containment_threshold: Fraction of mask that must be contained to count as "entirely within"
+                              (e.g., 0.95 means 95% of pixels must be inside)
+    
+    Returns:
+        dict with keys:
+            - 'masks': filtered masks
+            - 'kept_indices': original indices of kept masks
+            - 'removed_indices': original indices of removed masks
+            - 'overlap_map': canvas showing overlap counts (0, 1, 2, 3, ...)
+            - 'overlap_dict': dict showing which masks overlap each mask
+            - 'removal_reasons': dict explaining why each mask was removed
+    
+    Algorithm:
+        1. Paint all masks onto canvas (sorted by size)
+        2. Build overlap dictionary
+        3. Apply removal rules based on overlap patterns
+    """
+    if len(masks) == 0:
+        return {
+            'masks': masks,
+            'kept_indices': np.array([], dtype=int),
+            'removed_indices': np.array([], dtype=int),
+            'overlap_map': np.zeros((0, 0), dtype=np.int32),
+            'overlap_dict': {},
+            'removal_reasons': {}
+        }
+    
+    masks = masks.astype(bool)
+    k, H, W = masks.shape
+    
+    # Sort masks by size (largest first)
+    mask_sizes = masks.sum(axis=(1, 2))
+    sorted_indices = np.argsort(mask_sizes)[::-1]
+    sorted_masks = masks[sorted_indices]
+    
+    # Phase 1: Paint all masks and build overlap map
+    canvas = np.zeros((H, W), dtype=np.int32)
+    overlap_dict = {i: [] for i in range(k)}  # mask_i: [masks that overlap with mask_i]
+    
+    for i, mask in enumerate(sorted_masks):
+        # Paint this mask
+        canvas[mask] += 1
+    
+    # Phase 2: Analyze overlaps - check each mask against the canvas
+    for i, mask_i in enumerate(sorted_masks):
+        # Get overlap counts for this mask's pixels
+        overlap_counts = canvas[mask_i]
+        
+        # Find pixels where overlap > 1 (this mask + at least one other)
+        overlapping_pixels = overlap_counts > 1
+        num_overlapping_pixels = overlapping_pixels.sum()
+        
+        if num_overlapping_pixels >= overlap_threshold:
+            # This mask has significant overlap
+            # Find which OTHER masks it overlaps with
+            # (need to check each other mask individually)
+            for j, mask_j in enumerate(sorted_masks):
+                if i == j:
+                    continue
+                
+                # Check overlap between mask_i and mask_j
+                overlap_ij = mask_i & mask_j
+                num_overlap_ij = overlap_ij.sum()
+                
+                if num_overlap_ij >= overlap_threshold:
+                    # mask_j overlaps with mask_i
+                    # Since we're processing in size order (largest first),
+                    # if i < j, mask_i is larger and mask_j overlaps it
+                    # if i > j, mask_j is larger and overlaps mask_i
+                    if i < j:
+                        # mask_i (larger) is overlapped by mask_j (smaller)
+                        overlap_dict[i].append(j)
+    
+    # Phase 3: Apply removal rules
+    flags_for_removal = set()
+    removal_reasons = {}
+
+    # Sort the overlap_dict by longest to shortest overlapping lists
+    sorted_overlap_items = sorted(overlap_dict.items(), key=lambda x: len(x[1]), reverse=True)
+    overlap_dict = dict(sorted_overlap_items)
+
+    for mask_idx, overlapping_masks in overlap_dict.items():
+        num_overlaps = len(overlapping_masks)
+        
+        if num_overlaps == 0:
+            # Rule 3: No overlap, keep mask
+            continue
+        
+        elif num_overlaps == 1:
+            # Rule 2: Overlapped by exactly 1 mask
+            overlapping_idx = overlapping_masks[0]
+            
+            # Check if overlapping mask is entirely contained within current mask
+            if is_contained(sorted_masks[overlapping_idx], sorted_masks[mask_idx], containment_threshold):
+                # The overlapping (smaller) mask is contained within this (larger) mask
+                flags_for_removal.add(overlapping_idx)
+                removal_reasons[overlapping_idx] = f"Contained within mask {mask_idx}"
+        
+        else:  # num_overlaps > 1
+            # Rule 1: Overlapped by multiple masks
+            all_contained = []
+            contained_masks = []  # Track which masks are contained
+            
+            for overlapping_idx in overlapping_masks:
+                is_cont = is_contained(sorted_masks[overlapping_idx], sorted_masks[mask_idx], containment_threshold)
+                all_contained.append(is_cont)
+                
+                if is_cont:
+                    contained_masks.append(overlapping_idx)
+            
+            # If ANY overlapping masks are NOT contained (i.e., not all are contained)
+            # then current mask likely spans multiple masks - remove it
+            if not all(all_contained):
+                # Current mask spans across multiple objects - flag it for removal
+                flags_for_removal.add(mask_idx)
+                removal_reasons[mask_idx] = f"Spans across multiple masks: {overlapping_masks}"
+                
+                # Do NOT remove the overlapping masks - they might be valid separate objects
+                # (No flags_for_removal.add() for overlapping_idx here)
+            else:
+                # ALL overlapping masks are contained within current mask
+                # These are likely small artifacts/noise - flag them for removal
+                for overlapping_idx in contained_masks:
+                    flags_for_removal.add(overlapping_idx)
+                    removal_reasons[overlapping_idx] = f"Contained within mask {mask_idx}"
+    
+    # Create final mask selection
+    keep_flags = np.array([i not in flags_for_removal for i in range(k)])
+    
+    # Map back to original indices
+    kept_indices = sorted_indices[keep_flags]
+    removed_indices = sorted_indices[~keep_flags]
+    
+    return {
+        'masks': sorted_masks[keep_flags],
+        'kept_indices': kept_indices,
+        'removed_indices': removed_indices,
+        'overlap_map': canvas,
+        'overlap_dict': {sorted_indices[k]: [sorted_indices[v] for v in vs] 
+                        for k, vs in overlap_dict.items()},  # Map back to original indices
+        'removal_reasons': {sorted_indices[k]: reason 
+                           for k, reason in removal_reasons.items()}
+    }
+
+def is_contained(mask_inner: np.ndarray, mask_outer: np.ndarray, threshold: float = 0.95) -> bool:
+    """
+    Check if mask_inner is (mostly) contained within mask_outer.
+    
+    Args:
+        mask_inner: The mask to check if contained
+        mask_outer: The mask to check containment within
+        threshold: Fraction of mask_inner that must overlap with mask_outer
+    
+    Returns:
+        True if at least `threshold` fraction of mask_inner overlaps with mask_outer
+    
+    Examples:
+        >>> inner = np.array([[0, 1, 0], [0, 1, 0], [0, 0, 0]], dtype=bool)
+        >>> outer = np.array([[1, 1, 1], [1, 1, 1], [0, 0, 0]], dtype=bool)
+        >>> is_contained(inner, outer, threshold=0.95)
+        True
+    """
+    inner_size = mask_inner.sum()
+    
+    if inner_size == 0:
+        return True  # Empty mask is contained in anything
+    
+    # Count how many pixels of inner overlap with outer
+    overlap = (mask_inner & mask_outer).sum()
+    
+    # Calculate fraction contained
+    fraction_contained = overlap / inner_size
+    
+    return fraction_contained >= threshold
+
+
+
+
+
+
+
+# Visualization helper
+def visualize_overlap_map(overlap_map: np.ndarray, title: str = "Overlap Map"):
+    """Visualize the overlap map with color coding."""
+    import matplotlib.pyplot as plt
+    
+    plt.figure(figsize=(10, 8))
+    plt.imshow(overlap_map, cmap='hot', interpolation='nearest')
+    plt.colorbar(label='Number of overlapping masks')
+    plt.title(title)
+    plt.xlabel('Width')
+    plt.ylabel('Height')
+    
+    # Add text showing unique values
+    unique_vals = np.unique(overlap_map)
+    plt.text(0.02, 0.98, f'Values: {unique_vals}', 
+             transform=plt.gca().transAxes,
+             verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.show()
 
 
 def extract_bonnet_bounding_box(sample, visualize_bool = False):
@@ -546,8 +760,7 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
     if store_masks_bool:
         store_masks(masks_list, img_ids_list, filepath='saved_masks/SAM_manipulate')
     
-
-def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None)):
+def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None), filter_holes_islands = False, filter_overlap_masks = False):
     """
     Grounding DINO to find bboxes based on text prompt + SAM to generate masks.
     """
@@ -593,27 +806,53 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
     # Let us only look at the first k samples for testing
     samples = samples[:testing_samples]
 
-    samples = [samples[0]]
-  
+   # samples = [samples[5]]
+
+
+
+
 
     for sample in samples:
 
         sample_img = sample['image']
         sample_idx = sample['image_id']
 
-
-        # TODO : understand why detector takes like 2 seconds longer here than in the grounding_SAM.py ...
         # DINO
         start_time_0 = time()
-        detections = object_detector(sample_img, candidate_labels = labels, threshold = 0.2)
+        detections = object_detector(sample_img, candidate_labels = labels, threshold = 0.10)
         end_time_0 = time()
         print(f"Detection time for sample {sample_idx}: {end_time_0 - start_time_0:.2f} seconds")
+        
         detections = [DetectionResult.from_dict(det) for det in detections]
+        
 
         bboxes_detections = get_boxes(detections)
+     
 
         # Remove one layer of the inner list 
         bboxes_detections = np.array(bboxes_detections[0])
+
+        # NOTE : idea was that when we segment based on point prompts, we might get better results than with bbox prompts, but in practice it seems worse...
+        # Turn bbox detections into point prompts by getting center points of each bbox
+        # bboxes format is [x_min, y_min, x_max, y_max]
+       # center_points = []
+       # for bbox in bboxes_detections:
+       #     x_min, y_min, x_max, y_max = bbox
+       #     center_x = (x_min + x_max) / 2
+       #     center_y = (y_min + y_max) / 2
+       #     center_points.append([center_x, center_y])
+       # center_points_to_draw = np.array(center_points).copy()
+        # Scale center points to [0, 1] range as expected by SAM
+       # H,W = sample_img.size[1], sample_img.size[0]
+       # center_points = center_points / np.array([W, H])
+       # center_points = [np.array(center_points)]
+        # Visualize center points on image
+       # plt.imshow(sample_img)
+       # plt.scatter(center_points_to_draw[:, 0], center_points_to_draw[:, 1], s=10, c='red')
+       # plt.axis('off')
+       # plt.show()
+
+        print("Total detections from DINO:", len(bboxes_detections))
 
         # SAM
         start_time_1 = time()
@@ -629,6 +868,8 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
 
         # Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
+
+        print("Total masks from SAM before filtering:", len(boxes))
         
         if len(boxes) > 0 and filter_bboxes[0]:
             valid_idx, median_area = _filter_bbox_sizes(
@@ -676,6 +917,80 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
             masks=True,
         )
 
+        if filter_holes_islands:
+            # Finally, iterate over all masks and use remove_small_regions
+            if results[0].masks is not None:
+                masks = results[0].masks.data.cpu().numpy()
+                refined_masks = []
+                for mask in masks:
+                    mask = mask.astype(np.bool_)
+                    # Plot the mask
+                #  plt.figure(figsize=(5, 5))
+                #  plt.imshow(mask, cmap='gray')
+                #  plt.axis('off')
+                #  plt.show()
+                    # Erode the mask first
+                  #  kernel = np.ones((1, 1), np.uint8)
+                  #  mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
+                  #  mask = mask.astype(np.bool_)
+                    refined_mask, _ = remove_small_regions(mask, 20000, mode = 'islands')
+                    refined_mask, _ = remove_small_regions(refined_mask, 20000, mode = 'holes')
+                    # Plot the refined mask
+                #  plt.figure(figsize=(5, 5))
+                #  plt.imshow(refined_mask, cmap='gray')
+                #  plt.axis('off')
+                #  plt.show()
+                    refined_masks.append(refined_mask)
+                refined_masks = np.array(refined_masks)
+
+                results[0].masks = torch.from_numpy(refined_masks)
+
+
+        if filter_overlap_masks:
+            if results[0].masks is not None:
+                masks = results[0].masks.data.cpu().numpy()
+            
+            masks_filtered_dict = filter_overlapping_masks_extended(
+                masks,
+                overlap_threshold=50,
+                containment_threshold=0.95,
+                
+            )
+            results[0].masks = torch.from_numpy(masks_filtered_dict['masks'])
+
+       # visualize_overlap_map(masks_filtered_dict['overlap_map'])
+
+        # Visualize kept masks after overlap filtering
+      #  img_array = np.array(sample_img)
+      #  for i, mask in enumerate(masks_filtered_dict['masks']):
+      #      color = np.random.randint(0, 255, 3).tolist()
+      #      color_mask = np.zeros_like(img_array)
+      #      color_mask[mask == True] = color
+      #      img_array = cv2.addWeighted(img_array, 1, color_mask, 0.9, 0)
+
+        # Visualize image 
+       # cv2.imwrite('output_kept_masks.jpg', cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
+
+        # Get non-kept masks
+     #   non_kept_masks = []
+     #   for i in masks_filtered_dict['removed_indices']:
+     #       non_kept_masks.append(refined_masks[i])
+
+      #  non_kept_masks = np.array(non_kept_masks)
+
+        # Visualize non-kept masks
+      #  img_array_non_kept = np.array(sample_img)
+      #  for i, mask in enumerate(non_kept_masks):
+      #      color = np.random.randint(0, 255, 3).tolist()
+      #      color_mask = np.zeros_like(img_array_non_kept)
+      #      color_mask[mask == True] = color
+      #      img_array_non_kept = cv2.addWeighted(img_array_non_kept, 1, color_mask, 0.9, 0)
+
+        # Visualize image 
+      #  cv2.imwrite('output_removed_masks.jpg', cv2.cvtColor(img_array_non_kept, cv2.COLOR_RGB2BGR))
+
+
+
         # Draw masks with different colors
         img_array = np.array(sample_img)
         if results[0].masks is not None:
@@ -701,12 +1016,9 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
     
     if store_masks_bool:
         if mode == 'mobile':
-            store_masks(masks_list, img_ids_list, filepath= 'saved_masks/SAM_mobile')
+            store_masks(masks_list, img_ids_list, filepath= 'saved_masks/DINO_SAM_mobile')
         else:
-            store_masks(masks_list, img_ids_list, filepath= 'saved_masks/SAM') 
-
-
-
+            store_masks(masks_list, img_ids_list, filepath= 'saved_masks/DINO_SAM') 
 
 def model_FastSAM(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None)):
     """
@@ -998,7 +1310,7 @@ def main():
         model_SAM(list(ds['train']), mode = 'mobile', save_imgs_bool = False, store_masks_bool = True, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
     
     elif MODE == "grounding_SAM":
-        model_grounding_SAM(list(ds['train']), mode = 'base', save_imgs_bool = True, store_masks_bool = False, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None))
+        model_grounding_SAM(list(ds['train']), mode = 'base', save_imgs_bool = False, store_masks_bool = True, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None), filter_holes_islands = True, filter_overlap_masks = True)
 
     elif MODE == "FastSAM":
         model_FastSAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = False, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
