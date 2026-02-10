@@ -2,6 +2,7 @@ import numpy as np
 from datasets import load_dataset
 from scipy.optimize import linear_sum_assignment
 import cv2 
+import pickle
 
 def calculate_segmentation_metrics(pred_masks, gt_masks, iou_threshold=0.5, mode = 'pixels'):
     """
@@ -249,25 +250,35 @@ def main():
 
     ## Load predicted masks
     PRED_MASKS_FILE = 'saved_masks/DINO_SAM/masks.npz'
-    pred_data = np.load(PRED_MASKS_FILE)
+
+    if PRED_MASKS_FILE.endswith('.pkl'):
+        with open(PRED_MASKS_FILE, 'rb') as f:
+            pred_data = pickle.load(f)
+    else:
+        pred_data = np.load(PRED_MASKS_FILE)
+
+
     all_pred_masks_ids = [(pred_data[key], key) for key in pred_data.keys()]
 
     # For testing only first 15 elements of gt mask
     all_gt_masks_ids = all_gt_masks_ids[:15]
-    #all_gt_grades = all_gt_grades[:15]
+
 
     # Sort both lists by image ID to ensure alignment
     all_gt_masks_ids.sort(key=lambda x: x[1])
     all_pred_masks_ids.sort(key=lambda x: x[1])
 
-    #all_gt_grades.sort(key=lambda x: x[1])
+
+
 
     # Remove sample idx from both lists
     all_gt_masks = [masks for masks, img_id in all_gt_masks_ids]
-    all_pred_masks = [masks for masks, img_id in all_pred_masks_ids]
 
-    #all_gt_grades = [grades for grades, img_id in all_gt_grades]
 
+    if isinstance(all_pred_masks_ids[0][0], list) and len(all_pred_masks_ids[0][0]) == 3:
+        all_pred_masks = [masks_and_xyn_and_imgs[0] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
+    else:
+        all_pred_masks = [masks for masks, img_id in all_pred_masks_ids]
 
     # Calculate metrics for each sample (since each sample is image of multiple objects)
     avg_iou = 0.0

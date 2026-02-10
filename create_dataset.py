@@ -313,7 +313,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
     return dataset
 
 def main():
-    SAVE_PATH = 'dataset_single_objects/DINO_SAM'
+    SAVE_PATH = 'dataset_single_objects/DINO_SAM' # TODO : redo dino mobile sam
     PRED_MASKS_FILE = 'saved_masks/DINO_SAM/masks.npz'
 
     ## Load original images and masks
