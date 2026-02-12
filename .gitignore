@@ -1,6 +1,7 @@
 pretrained_models/sam_b.pt
 pretrained_models/sam3.pt
 dataset_single_objects/
+runs/segment/
 area_distribution.png
 output_colored_masks.jpg
 output_w_boxes.jpg
@@ -48,3 +49,4 @@ YOLO_dataset/labels/val/img005.txt
 saved_masks/DINO_SAM/masks.npz
 saved_masks/DINO_SAM/masks.npz
 saved_masks/SAM/masks.npz
+runs/segment/yolo26n-seg-pseudo-labels/BoxF1_curve.png

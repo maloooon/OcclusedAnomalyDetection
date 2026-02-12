@@ -25,7 +25,7 @@ import plotly.graph_objects as go
 from transformers import AutoModelForMaskGeneration, AutoProcessor, pipeline
 
 
-from Depth_module.depth_anything_v2.dpt import DepthAnythingV2
+#from Depth_module.depth_anything_v2.dpt import DepthAnythingV2
 
 
 
@@ -1000,9 +1000,10 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         conf=0.75, 
         task="segment",
         mode="predict",
-        model="pretrained_models/sam3.pt",
+        model="../../disk/pretrained_models/sam3.pt",
         half=True, 
         save=False,
+        device = 2 if torch.cuda.is_available() else "cpu"
     )
     predictor = SAM3SemanticPredictor(overrides=overrides) 
 
@@ -1010,8 +1011,10 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
     img_ids_list = []
     xyn_list = []
     sample_imgs = []
+    conf_scores_list = []
     # Let us only look at the first k samples for testing
-    samples = samples[:testing_samples]
+    if type(testing_samples) is int:
+        samples = samples[:testing_samples]
 
     for sample in samples:
 
@@ -1097,9 +1100,11 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         # Save image IDs and images
         img_ids_list.append(sample_idx)
         sample_imgs.append(sample_img)
+        # Save confidence scores
+        conf_scores_list.append(results[0].boxes.conf.cpu().numpy())
     
     if store_masks_bool:
-        store_masks(masks_list, img_ids_list, xyn_list, sample_imgs, filepath= 'saved_masks/SAM3')
+        store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list, sample_imgs, filepath= '../../disk/saved_masks/SAM3')
 
 def model_SAM(samples, mode = 'mobile', save_imgs_bool = False, store_masks_bool = False, testing_samples = 1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None)):
     """
@@ -1433,27 +1438,28 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
     if type(samples) is not list:
         samples = [samples]
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+   # device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # BBOX DETECTOR : Grounding DINO
     detector_id = "IDEA-Research/grounding-dino-tiny"
-    object_detector = pipeline(model=detector_id, task="zero-shot-object-detection", device=device)
+    object_detector = pipeline(model=detector_id, task="zero-shot-object-detection", device=2 if torch.cuda.is_available() else 'cpu')
     labels = ["raspberry."]
     labels = [label if label.endswith(".") else label+"." for label in labels]
 
     # MASK GENERATOR : SAM
-    segmenter_id = "pretrained_models/sam_b.pt" if mode == 'base' else "pretrained_models/mobile_sam.pt"
+    segmenter_id = "../../disk/pretrained_models/sam_b.pt" if mode == 'base' else "../../disk/pretrained_models/mobile_sam.pt"
     overrides = dict(conf=0.70, 
                      task="segment", 
                      mode="predict", 
                      imgsz = 1024, # internal resize to (1024,1024) seems to give the best results, since SAM was trained on this size
                      model=segmenter_id,
-                     save = False) 
+                     save = False,
+                     device = 2 if torch.cuda.is_available() else 'cpu')
     mask_predictor = SAMPredictor(overrides=overrides)
 
 
     # DEPTH DETECTOR
-    pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf")
+    pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf", device= 2 if torch.cuda.is_available() else 'cpu')
 
 
   #  model_configs = {
@@ -1473,19 +1479,14 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
 
 
 
-
-
-
     masks_list = []
     img_ids_list = []
+    conf_scores_list = []
 
     # Let us only look at the first k samples for testing
     if type(testing_samples) is int:
         samples = samples[:testing_samples]
       #  samples = [samples[3]]
-
-
-
 
 
     for sample in samples:
@@ -1713,7 +1714,8 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
              #   area_fill_threshold= 0.8
                 
             )
-            results[0].masks = torch.from_numpy(masks_filtered_dict['masks'])
+            results[0].masks = results[0].masks[masks_filtered_dict['kept_indices']]
+            results[0].boxes = results[0].boxes[masks_filtered_dict['kept_indices']]
             end_time_0 = time()
             print(f"Filtering overlapping masks time for sample {sample_idx}: {end_time_0 - start_time_0:.2f} seconds")
        
@@ -1777,12 +1779,14 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
         masks_list.append(results[0].masks.data.cpu().numpy())
         # Save image IDs
         img_ids_list.append(sample_idx)
+        # Save confidence scores 
+        conf_scores_list.append(results[0].boxes.conf.cpu().numpy())
     
     if store_masks_bool:
         if mode == 'mobile':
-            store_masks(masks_list, img_ids_list, xyn_list = None, filepath= 'saved_masks/DINO_SAM_mobile')
+            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list = None, sample_imgs = None, filepath= '../../disk/saved_masks/DINO_SAM_mobile')
         else:
-            store_masks(masks_list, img_ids_list, xyn_list = None, filepath= 'saved_masks/DINO_SAM') 
+            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list = None, sample_imgs = None, filepath= '../../disk/saved_masks/DINO_SAM') 
 
 def model_FastSAM(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None)):
     """
@@ -2043,7 +2047,7 @@ def _filter_mask_sizes(masks, upper_multiplier=None, lower_multiplier=0.3, save_
     
     return valid_idx, median_area
 
-def store_masks(masks, image_ids, xyn_list, sample_imgs, filepath):
+def store_masks(masks, image_ids, conf_scores_list,xyn_list, sample_imgs, filepath):
  
     os.makedirs(filepath, exist_ok=True)
 
@@ -2053,13 +2057,14 @@ def store_masks(masks, image_ids, xyn_list, sample_imgs, filepath):
         # Since we have different amounts of polygon xyn coordinates per object, we cannot store everything in a single numpy array
         # xyn polygon coordinates are needed for YOLO lightweight model training
         output_file = os.path.join(filepath, 'masks.pkl')
-        save_data = {i: [mask, xyn, sample_img] for i, mask, xyn, sample_img in zip(image_ids, masks, xyn_list, sample_imgs)}
+        save_data = {i: [mask, xyn, conf_score, sample_img] for i, mask, xyn, conf_score, sample_img in zip(image_ids, masks, xyn_list, conf_scores_list, sample_imgs)}
         with open(output_file, 'wb') as f:
             pickle.dump(save_data, f)
     else:
-        output_file = os.path.join(filepath, 'masks.npz')
-        save_data = {i: mask for i, mask in zip(image_ids, masks)}
-        np.savez_compressed(output_file, **save_data)
+        output_file = os.path.join(filepath, 'masks.pkl')
+        save_data = {i: [mask, conf_score] for i, mask, conf_score in zip(image_ids, masks, conf_scores_list)}
+        with open(output_file, 'wb') as f:
+            pickle.dump(save_data, f)
    
     print(f"Saved {len(masks)} mask sets to {output_file}")
 
@@ -2075,7 +2080,9 @@ def main():
     # Crop to bonnet area
   #  example_img = example_img.crop((bonnet_bbox[0], bonnet_bbox[1], bonnet_bbox[2], bonnet_bbox[3])) # left, upper, right, lower
 
-    MODE = "SAM3"
+    MODE = "grounding_SAM"
+
+    full_data = list(ds['train']) + list(ds['valid'])
 
     if MODE == "SAM_manipulate":
         model_SAM_manipulate(list(ds['train']), save_imgs_bool = True, store_masks_bool = False, testing_samples = 1, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None))
@@ -2084,13 +2091,13 @@ def main():
         model_SAM(list(ds['train']), mode = 'base', save_imgs_bool = False, store_masks_bool = True, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
     
     elif MODE == "grounding_SAM":
-        model_grounding_SAM(list(ds['train']), mode = 'base', save_imgs_bool = False, store_masks_bool = True, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None), filter_holes_islands = True, filter_overlap_masks = True, filter_by_darkness = False)
+        model_grounding_SAM(full_data, mode = 'mobile', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None), filter_holes_islands = True, filter_overlap_masks = True, filter_by_darkness = False)
 
     elif MODE == "FastSAM":
         model_FastSAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = False, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
 
     elif MODE == "SAM3":
-        model_SAM3(list(ds['train']), save_imgs_bool = False, store_masks_bool = True, testing_samples = 5, filter_masks_shapes = (False, 0.95), filter_bboxes = (False, 0.2, 3.0), filter_masks_sizes = (False, 0.2, None))
+        model_SAM3(full_data, save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_masks_shapes = (False, 0.95), filter_bboxes = (False, 0.2, 3.0), filter_masks_sizes = (False, 0.2, None))
 
 
 
