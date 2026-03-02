@@ -9,6 +9,7 @@ sample_img.jpg
 mask_size_distribution.png
 test.png
 tester.py
+moviad/
 __pycache__/evaluation_segmentation.cpython-313.pyc
 __pycache__/helper.cpython-313.pyc
 pretrained_models/FastSAM-s.pt
@@ -50,3 +51,11 @@ saved_masks/DINO_SAM/masks.npz
 saved_masks/DINO_SAM/masks.npz
 saved_masks/SAM/masks.npz
 runs/segment/yolo26n-seg-pseudo-labels/BoxF1_curve.png
+loaded_image_64.png
+memory_bank_tsne.png
+normalized_image.png
+original_normal_image.png
+overlayed_image.png
+tsne_patch_pairs_grid.png
+tsne_visualization.png
+smooth_mask.png

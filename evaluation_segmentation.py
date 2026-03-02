@@ -237,9 +237,7 @@ def _extract_masks(data, extract_grades_bool = False):
     return all_gt_masks_ids
 
 
-# =============================================================================
-# AP / mAP computation (COCO-style, mask IoU, single class)
-# =============================================================================
+# AP calculation
 
 def _compute_iou_matrix(pred_masks, gt_masks):
     """Compute full IoU matrix between predicted and GT masks for one image."""
