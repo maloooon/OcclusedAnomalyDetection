@@ -10,9 +10,25 @@ from moviad.datasets.mvtec.mvtec_dataset import MVTecDataset
 from moviad.datasets.realiad.realiad_dataset import RealIadDataset, RealIadClassEnum
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from moviad.models.patchcore.patchcore import PatchCore
+from moviad.models.fastflow.fastflow import create_fastflow
+from moviad.models.cfa.cfa import CFA
+from moviad.models.stfpm.stfpm import STFPM
+from moviad.models.rd4ad.rd4ad import RD4AD
+from moviad.models.padim.padim import Padim
+from moviad.models.supersimplenet.supersimplenet import SuperSimpleNet
+from moviad.models.ganomaly.ganomaly import Ganomaly
+from moviad.trainers.trainer_rd4ad import TrainerRD4AD
+from moviad.trainers.trainer_cfa import TrainerCFA
+from moviad.trainers.trainer_stfpm import TrainerSTFPM
 from moviad.trainers.trainer_patchcore import TrainerPatchCore
+from moviad.trainers.trainer_fastflow import TrainerFastFlow
+from moviad.trainers.trainer_padim import TrainerPadim
+from moviad.trainers.trainer_ganomaly import TrainerGanomaly
+from moviad.trainers.trainer_supersimplenet import TrainerSuperSimpleNet
 from moviad.utilities.configurations import TaskType, Split
 from moviad.utilities.evaluator import Evaluator
+from moviad.models.patchcore.product_quantizer import ProductQuantizer
+from moviad.utilities.metrics import save_anomaly_map
 
 from torchvision.transforms.functional import InterpolationMode
 
@@ -168,26 +184,34 @@ class SingleRaspberryDataset(Dataset):
                 error_mask = mask
                # mask = img > 0 # NOTE : We do not have exact masks of the anomalous regions of the raspberries, therefore we set the whole mask of anomaly raspberries to the mask size of the anomaly raspberry (i.e. we have no exact mask where anomaly is)
                 needed_grade = 1 # in evaluation grades need to be 0,1 or -1,1 for the two classes
+                actual_grade = grade
             else:
                 error_mask = torch.zeros(img.shape[1], img.shape[2]) # Create a mask of the same size as the image with all 0s (i.e. no anomaly)
                 needed_grade = 0 # in evaluation grades need to be 0,1 or -1,1 for the two classes
+                actual_grade = grade
             # Add channel dimension to mask (i.e shape [H, W] -> [1, H, W]) if needed
             if len(error_mask.shape) == 2:
                 error_mask = error_mask.unsqueeze(0)
             if len(mask.shape) == 2:
                 mask = mask.unsqueeze(0)
-            return img, needed_grade, error_mask.int(), img_path, mask
+            return img, needed_grade, error_mask.int(), img_path, mask, actual_grade
 
         else:
             return img
             
-def train_patchcore(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None):
+def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore'):
 
+    mode = mode.lower()
     # initialize the feature extractor
-    feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, None)
+    if mode != 'stfpm':
+        feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, None)
+    else:
+        teacher = CustomFeatureExtractor(backbone, ad_layers, device, frozen = True)
+        student = CustomFeatureExtractor(backbone, ad_layers, device, frozen = False)
 
     # Only normal samples for training
-    train_dataset = SingleRaspberryDataset(dataset_path, split = 'train', synthetic_augmentation = False)
+    train_set_path = dataset_path  / Path('full_no_filters/processed')
+    train_dataset = SingleRaspberryDataset(train_set_path, split = 'train', synthetic_augmentation = False)
 
 
     if max_dataset_size is not None:
@@ -196,28 +220,72 @@ def train_patchcore(dataset_path : str, backbone : str, ad_layers : list, save_p
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
 
     # Only anomalous samples for testing
-    test_dataset = SingleRaspberryDataset(dataset_path, split = 'test', synthetic_augmentation = False)
+    test_set_path = dataset_path  / Path('full_no_filters/processed')
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False)
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
     print(f"Length test dataset: {len(test_dataset)}")
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=True)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False)
 
+    
 
     # Define the model
-    patchcore = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 10000)
-    patchcore.to(device)
-    patchcore.train()
+    # NOTE : Ganomaly & supersimplenet & STFPM have no device, therefore also run on cuda:0 ...
+    if mode == 'patchcore':
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 10000)
+    elif mode == 'cfa':
+        model = CFA(feature_extractor, backbone, device)
+        model.initialize_memory_bank(train_dataloader)
+    elif mode == 'fastflow':
+        model = create_fastflow((224,224), backbone, device)
+    elif mode == 'rd4ad':
+        model = RD4AD(backbone, device, input_size = (224,224))
+    elif mode == 'stfpm':
+        model = STFPM(teacher, student)
+    elif mode == 'padim':
+        diagonal_convergence = False
+        model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers)
+    elif mode == 'ganomaly':
+        model = Ganomaly(input_size = (224,224), num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
+    elif mode == 'supersimplenet':
+        model = SuperSimpleNet(feature_extractor)
 
-    trainer = TrainerPatchCore(patchcore, train_dataloader, test_dataloader, device)
-    trainer.train()
+
+    model.to(device)
+    model.train()
+
+    if mode == 'patchcore':
+        trainer = TrainerPatchCore(model, train_dataloader, test_dataloader, device)
+    elif mode == 'cfa':
+        trainer = TrainerCFA(model, feature_extractor, train_dataloader, test_dataloader, device, saving_criteria = saving_criteria)
+    elif mode == 'fastflow':
+        trainer = TrainerFastFlow(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria)
+    elif mode == 'rd4ad':
+        trainer = TrainerRD4AD(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria)
+    elif mode == 'stfpm':
+        trainer = TrainerSTFPM(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria)
+    elif mode == 'padim':
+        trainer = TrainerPadim(model, train_dataloader, test_dataloader, device, apply_diagonalization = False, logger = None)
+    elif mode == 'ganomaly':
+        trainer = TrainerGanomaly(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria)
+    elif mode == 'supersimplenet':
+        trainer = TrainerSuperSimpleNet(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria)
+
+    if mode != 'patchcore' and mode != 'padim':
+        trainer.train(epochs = 5, evaluation_epoch_interval=1)
+    else:
+        trainer.train()
 
     # save the model
     if save_path:
-        torch.save(patchcore.state_dict(), save_path)
+        if mode == 'patchcore' or mode == 'cfa':
+            torch.save(model.state_dict(), save_path)
+        elif mode == 'stfpm':
+            torch.save(model.student.model.state_dict(), save_path)
 
     # force garbage collector in case
-    del patchcore
+    del model
     del test_dataset
     del train_dataset
     del train_dataloader
@@ -225,25 +293,64 @@ def train_patchcore(dataset_path : str, backbone : str, ad_layers : list, save_p
     torch.cuda.empty_cache()
     gc.collect()
 
-def test_patchcore(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None):
+def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore'):
+    
+    # initialize the feature extractor
+    if mode != 'stfpm':
+        feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, None)
+    else:
+        teacher = CustomFeatureExtractor(backbone, ad_layers, device, frozen = True)
+        student = CustomFeatureExtractor(backbone, ad_layers, device, frozen = False)
+
 
     # Only anomalous samples for testing
-    test_dataset = SingleRaspberryDataset(dataset_path, split = 'test')
+    test_set_path = dataset_path  / Path('full_no_filters/processed')
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False)
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
     print(f"Length test dataset: {len(test_dataset)}")
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=True)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False)
 
     # load the model
-    feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, None)
-    patchcore = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 10000)
-    patchcore.load_model(model_checkpoint_path)
-    patchcore.to(device)
-    patchcore.eval()
+    if mode == 'patchcore':
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 10000)
+    elif mode == 'cfa':
+        model = CFA(feature_extractor, backbone, device)
+    elif mode == 'stfpm':
+        model = STFPM(teacher, student)
+    elif mode == 'rd4ad':
+        model = RD4AD(backbone, device, input_size = (224,224))
+
+    if mode == 'patchcore' or mode == 'cfa':
+        model.load_model(model_checkpoint_path)
+    else:
+        if mode == 'stfpm':
+            model.student.model.load_state_dict(torch.load(model_checkpoint_path, map_location=device))
+        else:
+            state_dict = torch.load(model_checkpoint_path, map_location=device)
+            assert len(state_dict) != 0, "Loaded state dict is empty. Needs some fix!."
+
+
+
+               # model.load_state_dict(
+               # torch.load(model_checkpoint_path, map_location=device), strict=False
+               # )
+
+
+    # length of state dict
+   # state_dict = torch.load(model_checkpoint_path, map_location=device)
+   # print(f"Length of state dict: {len(state_dict)}")
+  
+
+    model.to(device)
+    model.eval()
+
+
+
 
     evaluator = Evaluator(test_dataloader, device)
-    metrics = evaluator.evaluate(patchcore)
+    metrics = evaluator.evaluate(model)
 
     print("Evaluation performances:")
     print(f"""
@@ -257,8 +364,7 @@ def test_patchcore(dataset_path : str, backbone : str, ad_layers : list, model_c
     """)
 
 
-    opt_threshold = 2.5206628
-
+    opt_threshold = 1.9069002
 
 
     # chek for the visual test
@@ -272,8 +378,17 @@ def test_patchcore(dataset_path : str, backbone : str, ad_layers : list, model_c
         pred_scores_per_grade = [[] for _ in range(5)]
         mask_size_wrong_predictions = []
         mask_size_correct_predictions = []
-        for images, labels, masks, paths, full_mask in tqdm(iter(test_dataloader)):
-            anomaly_maps, pred_scores, _ , _ = patchcore((images.to(device), full_mask.to(device)))
+        for images, labels, masks, paths, full_mask, actual_grade in tqdm(iter(test_dataloader)):
+            if mode == 'patchcore':
+                anomaly_maps, pred_scores, _ , _ = model((images.to(device), full_mask.to(device)))
+            else:
+                anomaly_maps, pred_scores = model(images.to(device))
+
+            # Check if still requires grad 
+            if isinstance(pred_scores, torch.Tensor) and pred_scores.requires_grad:
+                pred_scores = pred_scores.detach()
+            if isinstance(anomaly_maps, torch.Tensor) and anomaly_maps.requires_grad:
+                anomaly_maps = anomaly_maps.detach()
 
             anomaly_maps = torch.permute(anomaly_maps, (0, 2, 3, 1))
 
@@ -293,7 +408,7 @@ def test_patchcore(dataset_path : str, backbone : str, ad_layers : list, model_c
                     else:
                         mask_size_wrong_predictions.append(full_mask[i].sum().item())
 
-                patchcore.save_anomaly_map(visual_test_path, anomaly_maps[i].cpu().numpy(), pred_scores[i], paths[i],
+                save_anomaly_map(visual_test_path, anomaly_maps[i].cpu().numpy(), pred_scores[i], paths[i],
                                            curr_label, masks[i])
                 # For later evaluation, also save the predicted scores for anomalous and non-anomalous samples separately
                 if labels[i].item() == 0:
@@ -415,25 +530,21 @@ def detailed_eval(data_path):
 
     return results
 
-    
 
-    
-def overlay_mask_on_image(image, mask):
-    green_mask = np.zeros_like(image)
-    green_mask[mask > 0] = [0, 255, 0]  # Green color
-
-    # Blend the original image with the red mask
-    blended = cv2.addWeighted(image, 0.8, green_mask, 0.2, 0)
-    cv2.imwrite("original_normal_image.png", image)
-    cv2.imwrite("overlayed_image.png", blended)
-
+def saving_criteria(best_metrics, new_metrics):
+    # Since this is needed for the AD models that have training
+    if new_metrics["img_roc_auc"] > best_metrics["img_roc_auc"]:
+        return True
+    else:
+        return False   
 
 
 def main():
 
+    MODEL_MODE = 'patchcore' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
 
 
-    dataset_path = Path('../../disk/dataset_single_objects/GT/processed/')
+    dataset_path = Path('../../disk/dataset_single_objects/GT/')
 
     # Create a folder 'synthetic' in the current directory and clear it out if it already exists
     synthetic_dir = dataset_path / 'synthetic'
@@ -441,61 +552,29 @@ def main():
         shutil.rmtree(synthetic_dir)
     synthetic_dir.mkdir(parents=True, exist_ok=True)
 
-    # TODO: how to achieve top quality for input images ?
 
      
-
-
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-    backbone = "mobilenet_v2" # "wide_resnet50_2" #"mobilenet_v2" #   #
-    ad_layers = ["features.4", "features.7", "features.10"] #["layer2", "layer3"] #   # 
-    save_path = "../../disk/pretrained_models/patch_core_mobilenet_v2.pt"
+    backbone = "mobilenet_v2" 
+   # backbone = "wide_resnet50_2"
+    ad_layers = ["features.4", "features.7", "features.10"] 
+   # ad_layers = ["layer2", "layer3"]
+    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}.pt"
 
 
-    #from torchvision.models import wide_resnet50_2
-    #from torchvision.models.feature_extraction import get_graph_node_names
+  #  train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE)
 
-    #model = wide_resnet50_2(pretrained=True)
-    #train_nodes, eval_nodes = get_graph_node_names(model)
+    # Check if visual test path exists and clear it out if it already exists
+    visual_test_path = f"../../disk/visual_test/{MODEL_MODE}_{backbone}/"
+    visual_test_dir = Path(visual_test_path)
+    if visual_test_dir.exists():
+        shutil.rmtree(visual_test_dir)
+    visual_test_dir.mkdir(parents=True, exist_ok=True)
 
-    #for node in eval_nodes:
-    #    print(node)
-
-    # Sanity check on Dataset and visualization of masks
-  #  dataset = SingleRaspberryDataset(dataset_path, split = 'test', synthetic_augmentation = False)
-
-  #  dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
-
-     #Get an example batch
-   # for images, labels, masks, paths, full_mask in dataloader:
-        # Visualize the first image and its mask
-      #  img = images[0].permute(1, 2, 0).numpy()  # Convert from [C, H, W] to [H, W, C]
-      #  img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])  # back to [0,1]
-       # img = (img * 255).clip(0, 255).astype(np.uint8)
-       # mask = masks[0].squeeze(0).numpy() > 0  # Convert from [1, H, W] to [H, W] and binarize
-
-        # Overlay the mask on the image
-       # overlay_mask_on_image(img, mask)
-
-     #   break
-
-
-
-
-
-
-    #train_patchcore(dataset_path, backbone, ad_layers, save_path, device)
-
-    test_patchcore(dataset_path, backbone, ad_layers, save_path, device, visual_test_path = "../../disk/visual_test/mobilenet_v2_3_7_10/")
-    detailed_eval("../../disk/visual_test/mobilenet_v2_3_7_10/")
-
-
-
-
-
-
+    test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, visual_test_path = visual_test_path)
+    detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}/")
 
 
 if __name__ == "__main__":

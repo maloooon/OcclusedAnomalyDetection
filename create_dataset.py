@@ -166,7 +166,7 @@ def _crop_to_bbox(img, mask, padding=10, square=True, pad_value=0):
     return cropped_img, cropped_mask
 
 
-def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = None, all_gt_grades = None):
+def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = None, all_gt_grades = None, full_bool = False):
     """
     Given a list of lists of masks (True/False values) for each image, 
     create a dataset of single object images (RGB format).
@@ -178,6 +178,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
         ids: Optional list of IDs corresponding to each image
         all_gt_masks: Optional list of lists of ground truth masks for each image
         all_gt_grades: Optional list of lists of ground truth grades for each image
+        full_bool : If True, use all data, if False, use filters
 
     Notes :
         1. all_gt_masks, if provided, are used to match predicted masks to ground truth masks
@@ -206,109 +207,111 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
             grades_matched.append(curr_grades)
 
     
-    # Filtering based on depth and mask sizes
-    save_path_depths = "../../disk/depth_masks"
-    # Delete if it already exists (to avoid confusion with old data), then create
-    if os.path.exists(save_path_depths):
-        shutil.rmtree(save_path_depths)
-    os.makedirs(save_path_depths, exist_ok=True)
-     # Load depth model ONCE outside the loop
-    pipe = pipeline(
-        task="depth-estimation", 
-        model="depth-anything/Depth-Anything-V2-Base-hf", 
-        device='cuda:2' if torch.cuda.is_available() else 'cpu'
-    )
+    if not full_bool:
+        # Filtering based on depth and mask sizes
+        save_path_depths = "../../disk/depth_masks"
+        # Delete if it already exists (to avoid confusion with old data), then create
+        if os.path.exists(save_path_depths):
+            shutil.rmtree(save_path_depths)
+        os.makedirs(save_path_depths, exist_ok=True)
+        # Load depth model 
+        pipe = pipeline(
+            task="depth-estimation", 
+            model="depth-anything/Depth-Anything-V2-Base-hf", 
+            device='cuda:2' if torch.cuda.is_available() else 'cpu'
+        )
 
-    mean_depth_masks = [[] for _ in range(len(images))]
-    depth_masks = [[] for _ in range(len(images))]
+        mean_depth_masks = [[] for _ in range(len(images))]
+        depth_masks = [[] for _ in range(len(images))]
 
-    for idx, (img, img_masks) in enumerate(zip(images, masks)):
-        depth_pil = pipe(img)["depth"]
+        for idx, (img, img_masks) in enumerate(zip(images, masks)):
+            depth_pil = pipe(img)["depth"]
 
-        depth_norm = np.array(depth_pil).astype(np.float32)
-        depth_norm = (depth_norm - depth_norm.min()) / (depth_norm.max() - depth_norm.min() + 1e-8)
-        depth_colored = (cm.inferno(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+            depth_norm = np.array(depth_pil).astype(np.float32)
+            depth_norm = (depth_norm - depth_norm.min()) / (depth_norm.max() - depth_norm.min() + 1e-8)
+            depth_colored = (cm.inferno(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+            
+            Image.fromarray(depth_colored).save(os.path.join(save_path_depths, f"img{idx:03d}_depth.png"))
+            depth = np.array(depth_pil)  # Convert PIL -> numpy
+            
+
+            for mask in img_masks:
+                depth_masked = np.zeros_like(depth)
+                depth_masked[mask > 0] = depth[mask > 0]
+
+                mean_depth_masks[idx].append(depth[mask > 0].mean())
+                depth_masks[idx].append(depth_masked)
+
+        mean_depth_masks = [np.array(depth_list) for depth_list in mean_depth_masks]
+
+        removed_dir = "../../disk/removed_raspberries"
+        # Delete if it already exists (to avoid confusion with old data), then create
+        if os.path.exists(removed_dir):
+            shutil.rmtree(removed_dir)
+        os.makedirs(removed_dir, exist_ok=True)
+        removed_count = 0
+
         
-        Image.fromarray(depth_colored).save(os.path.join(save_path_depths, f"img{idx:03d}_depth.png"))
-        depth = np.array(depth_pil)  # Convert PIL -> numpy
+        # Filter individual raspberries that are both too small AND too deep (background noise)
+        filtered_masks = []
+        filtered_images = []
+        filtered_mean_depth_masks = []
+        filtered_depth_masks = []
+        filtered_grades = []
+
+        for img_idx in range(len(masks)):
+            img_masks = masks[img_idx]
+            img_depths = mean_depth_masks[img_idx]
+            img = images[img_idx]
+
+
+            sizes = np.array([mask.sum() for mask in img_masks])
+            depths = np.array(img_depths)
+
+            # TODO : maybe even absolute filtering better, since raspberries same size, same conditions ... just filter by absolute size ?? 
+            median_size = np.median(sizes)
+            mad_size = np.median(np.abs(sizes - median_size))
+            size_lower_bound = median_size - 0.5 * mad_size
+
+            median_depth = np.median(depths)
+            mad_depth = np.median(np.abs(depths - median_depth))
+            depth_upper_bound = median_depth + 1.5 * mad_depth
+
+            keep_indices = []
+            for i in range(len(img_masks)):
+                too_small = sizes[i] < size_lower_bound
+                too_deep = depths[i] > depth_upper_bound
+                if too_small: #or too_deep:
+                    # Save removed raspberry
+                    mask = img_masks[i]
+                    img_array = np.array(img)  
+                    cropped = img_array.copy()
+                    cropped[mask == 0] = 0
+
+                    # Crop to bounding box of the mask
+                    ys, xs = np.where(mask > 0)
+                    cropped = cropped[ys.min():ys.max()+1, xs.min():xs.max()+1]
+
+                    Image.fromarray(cropped).save(
+                        os.path.join(removed_dir, f"img{img_idx:03d}_mask{i:02d}.png")
+                    )
+                    removed_count += 1
+                else:
+                    keep_indices.append(i)
+
+            filtered_masks.append([img_masks[i] for i in keep_indices])
+            filtered_images.append(img)
+            filtered_mean_depth_masks.append([img_depths[i] for i in keep_indices])
+            filtered_depth_masks.append([depth_masks[img_idx][i] for i in keep_indices])
+            filtered_grades.append(grades_matched[img_idx][keep_indices] if grades_matched else None)
+        print(f"Removed {removed_count} raspberries, saved to {removed_dir}")
+
+        masks = filtered_masks
+        images = filtered_images
+        mean_depth_masks = filtered_mean_depth_masks
+        depth_masks = filtered_depth_masks
+        grades_matched = filtered_grades
         
-
-        for mask in img_masks:
-            depth_masked = np.zeros_like(depth)
-            depth_masked[mask > 0] = depth[mask > 0]
-
-            mean_depth_masks[idx].append(depth[mask > 0].mean())
-            depth_masks[idx].append(depth_masked)
-
-    mean_depth_masks = [np.array(depth_list) for depth_list in mean_depth_masks]
-
-    removed_dir = "../../disk/removed_raspberries"
-    # Delete if it already exists (to avoid confusion with old data), then create
-    if os.path.exists(removed_dir):
-        shutil.rmtree(removed_dir)
-    os.makedirs(removed_dir, exist_ok=True)
-    removed_count = 0
-
-    # Filter individual raspberries that are both too small AND too deep (background noise)
-    filtered_masks = []
-    filtered_images = []
-    filtered_mean_depth_masks = []
-    filtered_depth_masks = []
-    filtered_grades = []
-
-    for img_idx in range(len(masks)):
-        img_masks = masks[img_idx]
-        img_depths = mean_depth_masks[img_idx]
-        img = images[img_idx]
-
-
-        sizes = np.array([mask.sum() for mask in img_masks])
-        depths = np.array(img_depths)
-
-        # TODO : maybe even absolute filtering better, since raspberries same size, same conditions ... just filter by absolute size ?? 
-        median_size = np.median(sizes)
-        mad_size = np.median(np.abs(sizes - median_size))
-        size_lower_bound = median_size - 0.5 * mad_size
-
-        median_depth = np.median(depths)
-        mad_depth = np.median(np.abs(depths - median_depth))
-        depth_upper_bound = median_depth + 1 * mad_depth
-
-        keep_indices = []
-        for i in range(len(img_masks)):
-            too_small = sizes[i] < size_lower_bound
-            too_deep = depths[i] > depth_upper_bound
-            if too_small: #or too_deep:
-                # Save removed raspberry
-                mask = img_masks[i]
-                img_array = np.array(img)  
-                cropped = img_array.copy()
-                cropped[mask == 0] = 0
-
-                # Crop to bounding box of the mask
-                ys, xs = np.where(mask > 0)
-                cropped = cropped[ys.min():ys.max()+1, xs.min():xs.max()+1]
-
-                Image.fromarray(cropped).save(
-                    os.path.join(removed_dir, f"img{img_idx:03d}_mask{i:02d}.png")
-                )
-                removed_count += 1
-            else:
-                keep_indices.append(i)
-
-        filtered_masks.append([img_masks[i] for i in keep_indices])
-        filtered_images.append(img)
-        filtered_mean_depth_masks.append([img_depths[i] for i in keep_indices])
-        filtered_depth_masks.append([depth_masks[img_idx][i] for i in keep_indices])
-        filtered_grades.append(grades_matched[img_idx][keep_indices] if grades_matched else None)
-    print(f"Removed {removed_count} raspberries, saved to {removed_dir}")
-
-    masks = filtered_masks
-    images = filtered_images
-    mean_depth_masks = filtered_mean_depth_masks
-    depth_masks = filtered_depth_masks
-    grades_matched = filtered_grades
-
 
     dataset = []
     for idx, (img, img_masks) in enumerate(zip(images, masks)):
@@ -361,7 +364,13 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
             for p in [anomalous_processed_path, normal_processed_path]:
                 os.makedirs(p, exist_ok=True)
 
-            na_grades = [2] # TODO : change!
+            if not full_bool:
+                # We only want to train later on a single grade
+                na_grades = [2]
+            
+            else:
+                na_grades = [1,2,3]
+
             a_grades = [4, 5]
 
             # Accumulate records for pkl (processed only)
@@ -369,6 +378,16 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
                 'anomalous_processed': [],
                 'normal_processed': [],
             }
+
+            # Get the test set paths of non-anomalous samples 
+            if not full_bool:
+                test_set_path = '../../disk/dataset_single_objects/GT/full/processed/splits/test_normal_paths.pkl'
+                assert os.path.exists(test_set_path), f"Full Test set paths file not found at {test_set_path}! Needed to have the same test set across all experiments and no data leakage."
+                with open(test_set_path, 'rb') as f:
+                    test_normal_paths = pickle.load(f)
+            
+                # Extract only the base name
+                test_normal_paths = [os.path.basename(path) for path in test_normal_paths]
 
             for i, item in enumerate(dataset):
                 if ids is not None and grades_matched:
@@ -382,6 +401,11 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
                     for j, (curr_img_raw, curr_img_processed) in enumerate(zip(imgs_raw, imgs_processed)):
                         grade = int(img_grades[j])
                         img_filename = f"{img_id}_obj{j}_grade{grade}.png"
+
+                        if not full_bool:
+                            if img_filename in test_normal_paths:
+                                print(f"Skipping {img_filename} as it is in the test set of non-anomalous samples to avoid data leakage.")
+                                continue
                         
                         raw_img_path = os.path.join(raw_img_folder, img_filename)
                         img_pil_raw = Image.fromarray(curr_img_raw.astype(np.uint8))
@@ -528,6 +552,8 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
 
 
 
+
+
 def data_split_non_anomalous(data_path_normal, data_path_anomalous, save_path):
     """
     Get the split of non anomalous samples for training and testing, such that we have a balanced split of normal and anomalous samples in the test set.
@@ -569,6 +595,9 @@ def data_split_non_anomalous(data_path_normal, data_path_anomalous, save_path):
     # Remaining normals go to training
     train_normal_indices = all_normal_indices[n_anomalous:]
 
+    # Save splits with img_paths
+    train_normal_paths = [normal_data[i]['img_path'] for i in train_normal_indices]
+    test_normal_paths = [normal_data[i]['img_path'] for i in test_normal_indices]
 
     # Save splits so we do not have randomness in each call
     save_path = Path(save_path)
@@ -576,223 +605,17 @@ def data_split_non_anomalous(data_path_normal, data_path_anomalous, save_path):
         pickle.dump(train_normal_indices, f)
     with open(save_path / 'test_normal_indices.pkl', 'wb') as f:
         pickle.dump(test_normal_indices, f)
+    with open(save_path / 'train_normal_paths.pkl', 'wb') as f:
+        pickle.dump(train_normal_paths, f)
+    with open(save_path / 'test_normal_paths.pkl', 'wb') as f:
+        pickle.dump(test_normal_paths, f)
 
 
 
 
 
-'''
-def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = None, all_gt_grades = None):
-    """
-    Given a list of lists of masks (True/False values) for each image, 
-    create a dataset of single object images (RGB format).
-
-    Args:
-        masks: List of lists of boolean masks for each image (predicted by some model) ; these are the masks that are used to create the dataset.
-        images: List of original images (PIL format) ; the original images from the original dataset.
-        save_path: Optional path to save the single object images
-        ids: Optional list of IDs corresponding to each image
-        all_gt_masks: Optional list of lists of ground truth masks for each image
-        all_gt_grades: Optional list of lists of ground truth grades for each image
-
-    Notes :
-        1. all_gt_masks, if provided, are used to match predicted masks to ground truth masks
-              using Hungarian matching, and then assigning all_gt_grades, if provided, accordingly. This
-              is important for our anomaly detection algorithm later, i.e. we need to know
-              what objects have what grade (i.e. what level of anomaly).
-    
-    """
-
-    grades_matched = []
-    if all_gt_masks and all_gt_grades is not None:
-        # Match predicted masks to ground truth masks for each image
-        for pred_masks_img, gt_masks_img, gt_grades_img in zip(masks, all_gt_masks, all_gt_grades):
-            curr_grades = np.full(len(pred_masks_img), -1, dtype=int) # -1 indicates no match (i.e predicted mask has no corresponding GT mask)
-            matched_pairs, _, _ = match_instances(pred_masks_img, gt_masks_img, iou_threshold= 0.5, gt_grades=gt_grades_img)
-            for pred_idx, _, _, grade in matched_pairs:
-                curr_grades[pred_idx] = grade
-            grades_matched.append(curr_grades)
-
-        
-        
-        
-
-    dataset = []
-    for idx, (img, img_masks) in enumerate(zip(images, masks)):
-        curr_img_raw = []
-        curr_img_processed = []
-        curr_masks_raw = []
-        curr_masks_processed = []
-        
-        for mask in img_masks:
-            # Create a new image for each mask
-            masked_img = img.copy()
-            masked_img = np.array(masked_img)
-            masked_img[~mask] = 0  # Apply mask
-
-            # Store raw version
-            curr_img_raw.append(masked_img)
-            curr_masks_raw.append(mask)
-
-            # Center the object in the image
-            masked_img_processed, mask_processed = _center_object(masked_img, mask)
-            # Crop to square
-            masked_img_processed, mask_processed = _crop_image(masked_img_processed, mask_processed)
-
-            # Store processed version
-            curr_img_processed.append(masked_img_processed)
-            curr_masks_processed.append(mask_processed)
-
-        if ids is not None and grades_matched:
-            dataset.append((curr_img_raw, curr_img_processed, curr_masks_raw, curr_masks_processed, ids[idx], grades_matched[idx]))
-        elif ids is not None:
-            dataset.append((curr_img_raw, curr_img_processed, curr_masks_raw, curr_masks_processed, ids[idx]))
-        else:
-            dataset.extend(list(zip(curr_img_raw, curr_img_processed, curr_masks_raw, curr_masks_processed)))
-
-    if save_path is not None:
-        # Create raw and processed subdirectories
-        raw_path = os.path.join(save_path, 'raw')
-        processed_path = os.path.join(save_path, 'processed')
-        os.makedirs(raw_path, exist_ok=True)
-        os.makedirs(processed_path, exist_ok=True)
-        
-        for i, item in enumerate(dataset):
-            if ids is not None and grades_matched:
-                imgs_raw, imgs_processed, masks_raw, masks_processed, img_id, img_grades = item
-                
-                # Make folders for both raw and processed
-                raw_img_folder = os.path.join(raw_path, img_id)
-                processed_img_folder = os.path.join(processed_path, img_id)
-                os.makedirs(raw_img_folder, exist_ok=True)
-                os.makedirs(processed_img_folder, exist_ok=True)
-
-                for j, (curr_img_raw, curr_img_processed) in enumerate(zip(imgs_raw, imgs_processed)):
-                    img_filename = f"{img_id}_obj{j}_grade{img_grades[j]}.png"
-                
-                    
-                    # Save raw version
-                    img_pil_raw = Image.fromarray(curr_img_raw.astype(np.uint8))
-                    img_pil_raw.save(os.path.join(raw_img_folder, img_filename))
-           
-                    
-                    # Save processed version
-                    img_pil_processed = Image.fromarray(curr_img_processed.astype(np.uint8))
-                    img_pil_processed.save(os.path.join(processed_img_folder, img_filename))
-
-                # Save raw and processed masks and images for all objects of an image 
-
-                raw_data_dict = {
-                    'images': np.array(imgs_raw, dtype=object),  
-                    'masks': np.array(masks_raw, dtype=object),  
-                    'grades': np.array(img_grades, dtype=np.int32),  
-                    'img_id': img_id
-                }
-
-                processed_data_dict = {
-                    'images': np.array(imgs_processed, dtype=object), 
-                    'masks': np.array(masks_processed, dtype=object),  
-                    'grades': np.array(img_grades, dtype=np.int32), 
-                    'img_id': img_id
-                }
-
-                np.savez_compressed(os.path.join(raw_img_folder, f'raw_{img_id}_data.npz'), **raw_data_dict)
-                np.savez_compressed(os.path.join(processed_img_folder, f'processed_{img_id}_data.npz'), **processed_data_dict)
-
-            elif ids is not None: 
-                imgs_raw, imgs_processed, masks_raw, masks_processed, img_id = item
-                
-                # Make folders for both raw and processed
-                raw_img_folder = os.path.join(raw_path, img_id)
-                processed_img_folder = os.path.join(processed_path, img_id)
-                os.makedirs(raw_img_folder, exist_ok=True)
-                os.makedirs(processed_img_folder, exist_ok=True)
-                
-                for j, (img_raw, img_processed) in enumerate(zip(imgs_raw, imgs_processed)):
-                    img_filename = f"{img_id}_obj{j}.png"
-                    
-                    # Save raw version
-                    img_pil_raw = Image.fromarray(img_raw.astype(np.uint8))
-                    img_pil_raw.save(os.path.join(raw_img_folder, img_filename))
-
-                    # Save processed version
-                    img_pil_processed = Image.fromarray(img_processed.astype(np.uint8))
-                    img_pil_processed.save(os.path.join(processed_img_folder, img_filename))
-
-
-                # Save raw and processed masks and images for all objects of an image 
-
-                raw_data_dict = {
-                    'images': np.array(imgs_raw, dtype=object),  
-                    'masks': np.array(masks_raw, dtype=object),  
-                    'img_id': img_id
-                }
-
-                processed_data_dict = {
-                    'images': np.array(imgs_processed, dtype=object), 
-                    'masks': np.array(masks_processed, dtype=object),  
-                    'img_id': img_id
-                }
-
-                np.savez_compressed(os.path.join(raw_img_folder, f'raw_{img_id}_data.npz'), **raw_data_dict)
-                np.savez_compressed(os.path.join(processed_img_folder, f'processed_{img_id}_data.npz'), **processed_data_dict)
-
-            else: 
-                imgs_raw, imgs_processed, masks_raw, masks_processed = item
-                
-                # Make folders for both raw and processed
-                raw_img_folder = os.path.join(raw_path, f"img_{i}")
-                processed_img_folder = os.path.join(processed_path, f"img_{i}")
-                os.makedirs(raw_img_folder, exist_ok=True)
-                os.makedirs(processed_img_folder, exist_ok=True)
-
-                for j, (img_raw, img_processed) in enumerate(zip(imgs_raw, imgs_processed)):
-                    img_filename = f"img_{i}_obj{j}.png"
-                    
-                    # Save raw version
-                    img_pil_raw = Image.fromarray(img_raw.astype(np.uint8))
-                    img_pil_raw.save(os.path.join(raw_img_folder, img_filename))
-                    # Save processed version
-                    img_pil_processed = Image.fromarray(img_processed.astype(np.uint8))
-                    img_pil_processed.save(os.path.join(processed_img_folder, img_filename))
-
-                # Save raw and processed masks and images for all objects of an image 
-
-                raw_data_dict = {
-                    'images': np.array(imgs_raw, dtype=object),  
-                    'masks': np.array(masks_raw, dtype=object),  
-                }
-
-                processed_data_dict = {
-                    'images': np.array(imgs_processed, dtype=object), 
-                    'masks': np.array(masks_processed, dtype=object),  
-                }
-
-                np.savez_compressed(os.path.join(raw_img_folder, f'raw_{img_id}_data.npz'), **raw_data_dict)
-                np.savez_compressed(os.path.join(processed_img_folder, f'processed_{img_id}_data.npz'), **processed_data_dict)
-
-    # For the raw content, visualize the overlayed raspberries for each subfolder
-    raw_folder = os.path.join(save_path, 'raw')
-
-    # Iterate over all subfolders in raw/
-    for subfolder_name in os.listdir(raw_folder):
-        subfolder_path = os.path.join(raw_folder, subfolder_name)
-        
-        # Skip if not a directory
-        if not os.path.isdir(subfolder_path):
-            continue
-        
-        # Create output filename based on subfolder name
-        output = os.path.join(subfolder_path, f'{subfolder_name}_overlayed_raspberries.png')
-        
-        # Generate overlay for this subfolder
-        overlay_raspberries(subfolder_path, output)
-
-
-    return dataset
-'''
 def main():
-    SAVE_PATH = '../../disk/dataset_single_objects/GT'
+    SAVE_PATH = '../../disk/dataset_single_objects/GT/full_no_filters'
     PRED_MASKS_FILE = '../../disk/saved_masks/DINO_SAM_mobile/masks.pkl'
 
     
@@ -845,11 +668,11 @@ def main():
     #all_gt_grades = all_gt_grades[:15]
 
     # Create dataset of single object images
-    dataset_single_objects = create_dataset_imgs(all_gt_masks, all_imgs, save_path=SAVE_PATH, ids=all_ids, all_gt_masks=all_gt_masks, all_gt_grades=all_gt_grades)
+    dataset_single_objects = create_dataset_imgs(all_gt_masks, all_imgs, save_path=SAVE_PATH, ids=all_ids, all_gt_masks=all_gt_masks, all_gt_grades=all_gt_grades,full_bool = True)
     data_split_non_anomalous(
-        data_path_normal='../../disk/dataset_single_objects/GT/processed/normal/normal_samples.pkl',
-        data_path_anomalous='../../disk/dataset_single_objects/GT/processed/anomalous/anomalous_samples.pkl',
-        save_path='../../disk/dataset_single_objects/GT/processed/splits'
+        data_path_normal='../../disk/dataset_single_objects/GT/full_no_filters/processed/normal/normal_samples.pkl',
+        data_path_anomalous='../../disk/dataset_single_objects/GT/full_no_filters/processed/anomalous/anomalous_samples.pkl',
+        save_path='../../disk/dataset_single_objects/GT/full_no_filters/processed/splits'
     )
 
 
