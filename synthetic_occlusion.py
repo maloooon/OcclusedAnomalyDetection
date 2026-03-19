@@ -1227,8 +1227,8 @@ class SyntheticOcclusion:
             
 
         # If no valid paste found after max_attempts, return original
-        print(f"Warning: No valid paste location found after {max_attempts} attempts. "
-            f"Returning original image.")
+      #  print(f"Warning: No valid paste location found after {max_attempts} attempts. "
+      #      f"Returning original image.")
         return target_img, target_mask
 
     def _visualize_paste(self, target_img, target_mask, source_img, source_mask,
@@ -1324,23 +1324,52 @@ class SyntheticOcclusion:
 
 
 
+    def clean_mask_and_img(self,img, mask):
+        """Keep only the largest connected component; zero out the rest in both mask and image.
+           This function is in order to fix the problem that the synthetic occlusion creates multiple disconnected components in the mask,
+            which is not realistic and will probably lead to little disconnected components seen as anomalies during AD."""
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), connectivity=8
+        )
+        if num_labels <= 1:
+            return img, mask
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        keep = labels == largest
+        clean_mask = keep.astype(mask.dtype)
+        clean_img = img.copy()
+        clean_img[~keep] = 0
+        return clean_img, clean_mask
+
+
+
+
 def main():
-    data_path_all_samples = '../../disk/dataset_single_objects/GT/processed/'
+    data_path_all_samples = '../../disk/dataset_single_objects/GT/full_no_filters_256/processed/'
     synthetic_occlusion = SyntheticOcclusion(base_path= data_path_all_samples, sample_folders = ['anomalous','img001'])
 
     BONNET_SIZE = (961, 644)  # Width, Height taken from bonnet of img_001
     new_img, new_mask, grade_mask = synthetic_occlusion.multi_raspberry_occlusion(
-        wanted_size_range=(0.1,0.3),
+        wanted_size_range=(0.4,0.7),
         randomize_scale_bool=(False, 0.2, 0.8),
         randomize_rotation_bool=(False, -180,180),
-        visualize_bool=False,
+        visualize_bool=True,
         reassign_source_target_bool = True,
         sampling_mode= ('N_largest', 20),
-        k = 1)
+        k = 2)
+
+    new_img = np.asarray(new_img, dtype=np.uint8)
+    new_img, new_mask = synthetic_occlusion.clean_mask_and_img(new_img, new_mask)
+
+    # Visualize the cleaned result
+    plt.figure(figsize=(8, 8))
+    plt.imshow(new_img)
+    plt.title("Cleaned Composite Image")
+    plt.axis('off')
+    plt.savefig('cleaned_example.png')
 
 
-    # TODO : extend single_raspberry_occlusion by multi_raspberry_occlusion such that we can occlude ONE raspberry with multiple other raspberries
-    # TODO : with a simple idea : just paste onto that one raspberry multiple times, taking into account restrictions and only return mask of this one raspberry
+
     
    
   #  composite_img, new_occluded_masks, grades_new_occluded_masks = synthetic_occlusion.k_raspberries_occlusion(

@@ -1,8 +1,0 @@
-path: /Users/marlon/Desktop/MasterThesis/VAD occlused objects/ThesisCode/YOLO_dataset
-
-train: images/train
-val: images/val
-
-names:
-  0: raspberry
-
