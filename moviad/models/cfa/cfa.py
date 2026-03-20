@@ -20,6 +20,16 @@ from moviad.models.components.cfa.descriptor import Descriptor
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from moviad.utilities.get_sizes import *
 
+
+SEED = 32
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 class CFA(nn.Module):
 
     def __init__(
@@ -29,6 +39,10 @@ class CFA(nn.Module):
             device: torch.device,
             gamma_c:int = 1,
             gamma_d:int = 1,
+            struct_core_instance = None,
+            scoring_mode = 'MAXMEAN_1',
+            filter_post = 'NONE',
+            mask_border_filter_thickness = 0
         ):
 
         """
@@ -58,6 +72,11 @@ class CFA(nn.Module):
         self.feature_extractor = feature_extractor
         self.Descriptor = None
         self.backbone = backbone
+
+        self.struct_core_instance = struct_core_instance
+        self.scoring_mode = scoring_mode
+        self.filter_post = filter_post
+        self.mask_border_filter_thickness = mask_border_filter_thickness
 
         self.feature_maps_shape: tuple = None # only for model footprint
 
@@ -96,8 +115,21 @@ class CFA(nn.Module):
 
         # NOTE : added
         if isinstance(x, tuple):
-            x , mask, _, _ ,_ = x
+            if len(x) == 5:
+                x, mask, batch_og, mask_og, depth_og = x
+            if len(x) == 2:
+                x, mask = x
+    
         p = self.feature_extractor(x)
+
+        # TODO : doesn't work here.. need to find a fix for dino 
+        # TODO : maybe like this ?, should be done like this 
+        # TODO : everywhere ?? I think it didnt work for some reason
+        if "dinov2" in self.feature_extractor.model_name:
+            p, cls_tokens = p
+       # if len(p) == 2:
+       #     p, cls_tokens = p
+        
         if isinstance(p, dict):
             p = list(p.values())
 
@@ -121,6 +153,21 @@ class CFA(nn.Module):
 
         if self.training:
             return self.soft_boundary(phi_p)
+       # else:
+       #     self.scale = p[0].size(2)
+       #     scores = rearrange(dist, 'b (h w) c -> b c h w', h=self.scale).cpu().detach()
+
+       #     heatmaps = torch.mean(scores, dim=1)
+       #     heatmaps = CFA.upsample(heatmaps, size=x.size(2), mode="bilinear")
+       #     heatmaps = CFA.gaussian_smooth_torch(heatmaps, sigma=4)
+       #     img_scores = CFA.rescale(heatmaps)
+       #     img_scores = scores.reshape(scores.shape[0], -1).max(axis=1).values
+
+        #    if len(heatmaps.shape) == 2:
+        #        return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), img_scores
+        #    else:
+        #        return heatmaps.unsqueeze(dim=1), img_scores
+
         else:
             self.scale = p[0].size(2)
             scores = rearrange(dist, 'b (h w) c -> b c h w', h=self.scale).cpu().detach()
@@ -128,13 +175,63 @@ class CFA(nn.Module):
             heatmaps = torch.mean(scores, dim=1)
             heatmaps = CFA.upsample(heatmaps, size=x.size(2), mode="bilinear")
             heatmaps = CFA.gaussian_smooth_torch(heatmaps, sigma=4)
-            img_scores = CFA.rescale(heatmaps)
-            img_scores = scores.reshape(scores.shape[0], -1).max(axis=1).values
 
-            if len(heatmaps.shape) == 2:
-                return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), img_scores
+
+            device = heatmaps.device
+
+            # --- Apply raspberry mask with contour-based border exclusion ---
+            if mask is not None:
+                if mask.ndim == 3:
+                    mask = mask.unsqueeze(1)
+
+                effective_mask = torch.zeros_like(mask, dtype=torch.float32)
+
+                for i in range(mask.shape[0]):
+                    sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
+
+                    if self.mask_border_filter_thickness > 0:
+                        contours, _ = cv.findContours(
+                            sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+                        )
+                        contour_band = np.zeros_like(sample_mask)
+                        cv.drawContours(
+                            contour_band, contours, -1, 255, thickness=self.mask_border_filter_thickness
+                        )
+                        inner_mask = sample_mask.copy()
+                        inner_mask[contour_band == 255] = 0
+                    else:
+                        inner_mask = sample_mask
+
+                    effective_mask[i, 0] = torch.from_numpy(
+                        inner_mask.astype(np.float32)
+                    ).to(device)
+
+                effective_mask = (effective_mask > 0).float()
+                effective_mask = effective_mask.to(device)
+                heatmaps = heatmaps * effective_mask
+
+            # Filter holes
+            if 'HOLE_DARKNESS' in self.filter_post:
+                thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+                heatmaps = filter_holes_batched(
+                    heatmaps, batch, batch_og, mask_og, depth_og,
+                    depth_threshold_percentile=int(thresh_depth),
+                    brightness_threshold_percentile=int(thresh_dark)
+                )
+
+            # Compute per-image anomaly score
+            flat = heatmaps.view(heatmaps.size(0), -1)
+            anomaly_scores = torch.max(flat, dim=1)[0]
+
+            if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+                anomaly_scores = self.struct_core_instance.score(heatmaps, anomaly_scores)
             else:
-                return heatmaps.unsqueeze(dim=1), img_scores
+                k = float(self.scoring_mode.split('_')[-1])
+                max_scores = anomaly_scores
+                mean_scores = torch.mean(flat, dim=1)
+                anomaly_scores = k * max_scores + (1 - k) * mean_scores
+
+            return heatmaps, anomaly_scores
 
     def soft_boundary(self, phi_p: torch.Tensor) -> float:
         """

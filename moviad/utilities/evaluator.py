@@ -140,7 +140,7 @@ class Evaluator:
         all_actual_grades = list() # NOTE : added
         all_image_paths = list() # NOTE : added
         all_cls_tokens = list() # NOTE : added
-
+    
         for images, labels, masks, path, full_mask, actual_grade, og_img, og_mask, og_depth in tqdm(self.test_dataloader, desc="Eval"):
             # get anomaly map and score
             with torch.no_grad():

@@ -26,6 +26,16 @@ from moviad.models.components.simplenet.anomaly_generator import AnomalyGenerato
 from moviad.models.components.simplenet.feature_extractor import UpscalingFeatureExtractor
 from moviad.models.components.blur import GaussianBlur
 
+import numpy as np
+SEED = 32
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 class SuperSimpleNet(nn.Module):
 
     DEFAULT_PARAMETERS = {

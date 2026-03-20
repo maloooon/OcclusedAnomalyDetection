@@ -8,6 +8,15 @@ import numpy as np
 from moviad.models.components.rd4ad.resnet import resnet18
 from moviad.models.components.rd4ad.deresnet import de_resnet18
 
+SEED = 32
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 class RD4AD(torch.nn.Module):
 
     DEFAULT_PARAMETERS = {
@@ -17,15 +26,20 @@ class RD4AD(torch.nn.Module):
         "betas": (0.5,0.999),
     }
 
-    def __init__(self, backbone_name, device, input_size = (224, 224)):
+    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0):
         super().__init__()
 
         self.backbone_name = backbone_name
         self.device = device
         self.input_size = input_size
-
+        self.struct_core_instance = struct_core_instance
+        self.scoring_mode = scoring_mode
+        self.filter_post = filter_post
+        self.mask_border_filter_thickness = mask_border_filter_thickness
         self.encoder, self.bn = resnet18(pretrained=True)
         self.decoder = de_resnet18(pretrained=False)
+
+
 
     def to(self, device: torch.device):
         self.encoder.to(device)
@@ -52,17 +66,25 @@ class RD4AD(torch.nn.Module):
         """
 
         if (isinstance(batch, tuple)):
-            batch, mask, _ , _ , _ = batch
+            if len(batch) == 5:
+                batch, mask, batch_og, mask_og, depth_og = batch
+            if len(batch) == 2:
+                batch, mask = batch
+                batch_og, mask_og, depth_og = None, None, None
 
         enc_batch = self.encoder(batch)
+        # For DinoV2 also return cls token
+        if len(enc_batch) == 2:
+            enc_batch, cls_token = enc_batch
         bn_batch = self.bn(enc_batch)
         dec_batch = self.decoder(bn_batch)
 
         if self.training:
             return enc_batch, bn_batch, dec_batch
         else:
-            return self.post_process(enc_batch, dec_batch)
+            return self.post_process(enc_batch, dec_batch, batch, batch_og, mask_og, depth_og, mask, border_thickness = self.mask_border_filter_thickness)
         
+    '''
     def post_process(self, enc_batch, dec_batch) -> torch.Tensor:
         anomaly_map = None
         blur = GaussianBlur(1, sigma = 4)
@@ -90,6 +112,84 @@ class RD4AD(torch.nn.Module):
         image_score = alpha * max_score + (1 - alpha) * mean_score
         return anomaly_map, image_score
       #  return anomaly_map, torch.max(anomaly_map.view(anomaly_map.size(0), -1), dim = 1)[0]
+      '''
+
+
+    
+    def post_process(self, enc_batch, dec_batch, batch, batch_og, mask_og, depth_og, mask, border_thickness=5) -> torch.Tensor:
+        anomaly_map = None
+        blur = GaussianBlur(1, sigma = 4)
+
+        #iterate over the feature extraction layers batches
+        for i in range(len(enc_batch)):
+            fs = dec_batch[i]
+            ft = enc_batch[i]
+
+            a_map = 1 - F.cosine_similarity(fs, ft)
+            a_map = torch.unsqueeze(a_map, dim=1)
+            a_map = F.interpolate(a_map, size=self.input_size, mode='bilinear', align_corners=True)
+
+            if anomaly_map is None:
+                anomaly_map = a_map
+            else:
+                anomaly_map += a_map
+
+        anomaly_map = blur(anomaly_map)
+
+        # --- Apply raspberry mask with contour-based border exclusion ---
+        device = anomaly_map.device
+
+        if mask is not None:
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+
+            effective_mask = torch.zeros_like(mask, dtype=torch.float32)
+
+            for i in range(mask.shape[0]):
+                sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
+
+                if border_thickness > 0:
+                    contours, _ = cv.findContours(
+                        sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+                    )
+                    contour_band = np.zeros_like(sample_mask)
+                    cv.drawContours(
+                        contour_band, contours, -1, 255, thickness=border_thickness
+                    )
+                    inner_mask = sample_mask.copy()
+                    inner_mask[contour_band == 255] = 0
+                else:
+                    inner_mask = sample_mask
+
+                effective_mask[i, 0] = torch.from_numpy(
+                    inner_mask.astype(np.float32)
+                ).to(device)
+
+            effective_mask = (effective_mask > 0).float()
+            anomaly_map = anomaly_map * effective_mask
+
+        # Filter holes before computing anomaly scores
+        if 'HOLE_DARKNESS' in self.filter_post:
+            thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+            anomaly_map = filter_holes_batched(
+                anomaly_map, batch, batch_og, mask_og, depth_og,
+                depth_threshold_percentile=int(thresh_depth),
+                brightness_threshold_percentile=int(thresh_dark)
+            )
+
+        # Compute per-image anomaly score
+        flat = anomaly_map.view(anomaly_map.size(0), -1)
+        anomaly_scores = torch.max(flat, dim=1)[0]
+
+        if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+            anomaly_scores = self.struct_core_instance.score(anomaly_map, anomaly_scores)
+        else:
+            k = float(self.scoring_mode.split('_')[-1])
+            max_scores = anomaly_scores
+            mean_scores = torch.mean(flat, dim=1)
+            anomaly_scores = k * max_scores + (1 - k) * mean_scores
+
+        return anomaly_map, anomaly_scores
 
     def __call__(self, batch):
         return self.forward(batch)

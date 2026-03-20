@@ -9,10 +9,11 @@ from moviad.models.patchcore.patchcore import PatchCore
 from moviad.models.patchcore.kcenter_greedy import CoresetExtractor
 from moviad.utilities.evaluator import Evaluator
 from moviad.trainers.trainer import Trainer, TrainerResult
+import numpy as np
+import torch
 
-
-SEED = 42
-
+SEED = 32
+import random
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)

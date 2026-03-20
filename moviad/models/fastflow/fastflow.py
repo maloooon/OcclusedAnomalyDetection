@@ -11,6 +11,15 @@ from timm.models.cait import Cait
 from scipy.stats import special_ortho_group
 import warnings
 
+SEED = 32
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 def create_fastflow(img_shape, backbone_name, device):
     backbone_name = "wide_resnet50_2"
 

@@ -50,6 +50,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+SEED = 32
+import random
+import numpy as np
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 
 class Encoder(nn.Module):
     """Encoder Network.
@@ -447,8 +457,18 @@ class Ganomaly(nn.Module):
         latent_vec_size: int = 100,
         extra_layers: int = 0,
         add_final_conv_layer: bool = True,
+        struct_core_instance = None,
+        scoring_mode = 'MAXMEAN_1',
+        filter_post = 'NONE',
+        mask_border_filter_thickness = 0
     ) -> None:
         super().__init__()
+
+        self.struct_core_instance = struct_core_instance
+        self.scoring_mode = scoring_mode
+        self.filter_post = filter_post
+        self.mask_border_filter_thickness = mask_border_filter_thickness
+
         self.generator: Generator = Generator(
             input_size=input_size,
             latent_vec_size=latent_vec_size,
@@ -523,8 +543,11 @@ class Ganomaly(nn.Module):
                 - Batch containing anomaly scores
         """
 
-        if isinstance(batch, tuple):
-            batch, mask, _ ,_ ,_ = batch
+        if (isinstance(batch, tuple)):
+            if len(batch) == 5:
+                batch, mask, batch_og, mask_og, depth_og = batch
+            if len(batch) == 2:
+                batch, mask = batch
 
         padded_batch = Ganomaly.pad_nextpow2(batch)
         fake, latent_i, latent_o = self.generator(padded_batch)

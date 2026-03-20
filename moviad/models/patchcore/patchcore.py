@@ -20,7 +20,7 @@ from ...utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.get_sizes import *
 
 
-SEED = 42
+SEED = 32
 import random
 random.seed(SEED)
 np.random.seed(SEED)
@@ -126,7 +126,6 @@ class PatchCore(nn.Module):
  
     
 
-        mask = None
     
     
         #extract the features for the input tensor

@@ -470,7 +470,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None, all_gt_masks = 
             # Crop to square
            # masked_img_processed, mask_processed = _crop_image(masked_img_processed, mask_processed)
 
-         #   masked_img_processed, mask_processed, depth_processed = _crop_to_bbox(masked_img, mask, padding=10, square=True, pad_value=0, depth_image = depth_masks[idx][j])
+         #   masked_img_processed, mask_processed, depth_processed = _crop_to_bbox(masked_img, mask, padding=8, square=True, pad_value=0, depth_image = depth_masks[idx][j])
             masked_img_processed, mask_processed, depth_processed = _center_and_crop(masked_img, mask, target_size=img_size, pad_value=0, depth_image = depth_masks[idx][j])
 
           #  masked_img_processed, mask_processed, depth_processed = find_holes_fix(masked_img_processed, mask_processed, depth_processed, small_hole_max_area = 100, save_folder = None, filename = None, visualize_bool=False) 
@@ -756,12 +756,14 @@ def data_split_non_anomalous(data_path_normal, data_path_anomalous, save_path):
 
 def main():
 
+    # TODO : currently in code other crop method set for 'variable', need to change by hand (hardcoded)
+
     SIZE_FILTERING = False
     SIZE_FILTERING_FACTOR = 1.5
     DARKNESS_FILTERING = False
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
-    IMG_SIZE = 256
+    IMG_SIZE = 266
 
     filter_parts = []
     if SIZE_FILTERING:
@@ -821,11 +823,6 @@ def main():
     # If available, keep them for naming the files later
     all_ids = [img_id for _, img_id in all_pred_masks_ids]
 
-    # NOTE : for testing ,only first 15 images
-    #all_imgs = all_imgs[:15]
-    #all_ids = all_ids[:15]
-    #all_gt_masks = all_gt_masks[:15]
-    #all_gt_grades = all_gt_grades[:15]
 
     # Create dataset of single object images
     dataset_single_objects = create_dataset_imgs(all_gt_masks, all_imgs, save_path=SAVE_PATH, ids=all_ids, all_gt_masks=all_gt_masks, all_gt_grades=all_gt_grades,filter_train_data_leak = False, size_filtering=SIZE_FILTERING, darkness_filtering=DARKNESS_FILTERING, darkness_threshold=DARKNESS_THRESHOLD, max_dark_ratio=MAX_DARK_RATIO, size_filtering_factor=SIZE_FILTERING_FACTOR, img_size = IMG_SIZE)

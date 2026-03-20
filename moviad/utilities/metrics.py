@@ -430,7 +430,7 @@ def save_anomaly_map(dirpath, anomaly_map, pred_score, filepath, x_type, mask):
     anomaly_map_norm = cvt2heatmap(255 * min_max_norm(anomaly_map))
 
     # Overlay the anomaly map to the origimal image.
-    output_image = (anomaly_map_norm / 2 + original_image / 2).astype(np.uint8)#anomaly_map_norm.astype(np.uint8) #(anomaly_map_norm / 2 + original_image / 2).astype(np.uint8) 
+    output_image = anomaly_map_norm.astype(np.uint8)#anomaly_map_norm.astype(np.uint8) #(anomaly_map_norm / 2 + original_image / 2).astype(np.uint8) 
 
     # Create a figure and axes
     fig, axes = plt.subplots(1, 3, figsize=(10, 5))

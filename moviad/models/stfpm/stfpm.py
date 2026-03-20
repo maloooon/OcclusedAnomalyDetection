@@ -8,6 +8,15 @@ import matplotlib.pyplot as plt
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.filters import filter_holes_batched
 
+SEED = 32
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 class STFPM(torch.nn.Module):
 
     DEFAULT_PARAMETERS = {
@@ -25,7 +34,7 @@ class STFPM(torch.nn.Module):
         struct_core_instance = None,
         scoring_mode = 'MAXMEAN_1',
         filter_post = 'NONE',
-        mask_border_filter_thickness = 8
+        mask_border_filter_thickness = 0
     ):
         super().__init__()
         self.teacher = teacher
@@ -37,22 +46,41 @@ class STFPM(torch.nn.Module):
 
     def forward(self, batch: torch.Tensor):
 
+
+
         if (isinstance(batch, tuple)):
-            batch, mask, batch_og, mask_og, depth_og = batch
-        else:
-            batch_og, mask_og, depth_og = None, None, None
-            mask = None
+            if len(batch) == 5:
+                batch, mask, batch_og, mask_og, depth_og = batch
+            if len(batch) == 2:
+                batch, mask = batch
+               
+
+        
+    
+            
+
         if self.training:
             teacher_features, student_features = None, None
             with torch.no_grad():
                 teacher_features = self.teacher(batch)
             student_features = self.student(batch)
 
+            
+            if len(teacher_features) == 2:
+                # In case we use dinov2, also returns the cls tokens currently
+                teacher_features, teacher_cls_tokens = teacher_features
+                student_features, student_cls_tokens = student_features
             return teacher_features, student_features
 
         else:
             student_features = self.student(batch)
             teacher_features = self.teacher(batch)
+
+
+            if len(teacher_features) == 2:
+                # In case we use dinov2, also returns the cls tokens currently
+                teacher_features, teacher_cls_tokens = teacher_features
+                student_features, student_cls_tokens = student_features
 
 
             return self.post_process(

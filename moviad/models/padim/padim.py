@@ -11,6 +11,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+SEED = 32
+import random
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 from ...utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 
 # Dict: "backbone_model_name" -> {(layer_idxs): (true_dimension, random_projection_dimension)}
@@ -151,7 +160,11 @@ class Padim(nn.Module):
     def forward(self, x):
 
         if isinstance(x, tuple):
-            x, mask, _ ,_ ,_ = x
+            if len(x) == 5:
+                x, mask, batch_og, mask_og, depth_og = x
+            if len(x) == 2:
+                x, mask = x
+ 
 
         # 1. extract feature maps and get the raw layer outputs (conv. feature maps)
         layer_outputs: dict[str, list[torch.Tensor]] = {
@@ -161,6 +174,7 @@ class Padim(nn.Module):
         with torch.no_grad():
             # _ = self.backbone(x)
             _ = self.backbone(x)
+
         # get intermediate layer outputs
         for layer, output in zip(self.layers_idxs, self.outputs):  # new
             layer_outputs[layer].append(output.cpu().detach())  # new
