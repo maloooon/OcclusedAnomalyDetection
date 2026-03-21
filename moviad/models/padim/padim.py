@@ -48,8 +48,10 @@ EMBEDDING_SIZES = {
         ("features.10", "features.13", "features.16"): (320, 80),
         ("features.3", "features.8", "features.14"): (248, 62),
     },
-    "wide_resnet50_2": {("layer1", "layer2", "layer3"): (1792, 550)},
-    "wide_resnet50_2": {("layer2", "layer3"): (1792, 550)}, # NOTE : Added
+    "wide_resnet50_2": {
+        ("layer1", "layer2", "layer3"): (1792, 550),
+        ("layer2", "layer3"): (1536, 550),
+},
 }
 
 
@@ -81,6 +83,10 @@ class Padim(nn.Module):
             device,
             layers_idxs: list,
             diag_cov=False,
+            struct_core_instance=None,
+            scoring_mode = 'MAXMEAN_1',
+            filter_post = 'NONE',
+            mask_border_filter_thickness = 0,
     ):
         """
         Args:
@@ -113,6 +119,11 @@ class Padim(nn.Module):
         self.train_outputs = None  # list of mean and covariance matrix numpy arrays
         self.gauss_mean = None
         self.gauss_cov = None
+
+        self.struct_core_instance = struct_core_instance
+        self.scoring_mode = scoring_mode
+        self.filter_post = filter_post
+        self.mask_border_filter_thickness = mask_border_filter_thickness
 
     @staticmethod
     def embedding_concat(x, y):
@@ -206,14 +217,76 @@ class Padim(nn.Module):
         # 5. apply gaussian smoothing on the score map
         for i in range(score_map.shape[0]):
             score_map[i] = gaussian_filter(score_map[i], sigma=4)
+
+
+        # Convert to torch for consistent mask/filter logic
+        score_map_t = torch.from_numpy(score_map).unsqueeze(1).float()  # (B, 1, H, W)
+        device = score_map_t.device
+
+        if mask is not None:
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+
+            mask_np = mask.cpu() if mask.is_cuda else mask
+            effective_mask = torch.zeros_like(mask_np, dtype=torch.float32)
+
+            for i in range(mask.shape[0]):
+                sample_mask = mask_np[i, 0].numpy().astype(np.uint8)
+
+                if self.mask_border_filter_thickness > 0:
+                    contours, _ = cv.findContours(
+                        sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+                    )
+                    contour_band = np.zeros_like(sample_mask)
+                    cv.drawContours(
+                        contour_band, contours, -1, 255,
+                        thickness=self.mask_border_filter_thickness
+                    )
+                    inner_mask = sample_mask.copy()
+                    inner_mask[contour_band == 255] = 0
+                else:
+                    inner_mask = sample_mask
+
+                effective_mask[i, 0] = torch.from_numpy(inner_mask.astype(np.float32))
+
+            effective_mask = (effective_mask > 0).float()
+            score_map_t = score_map_t * effective_mask
+
+        if 'HOLE_DARKNESS' in self.filter_post:
+            thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+            score_map_t = filter_holes_batched(
+                score_map_t, batch, batch_og, mask_og, depth_og,
+                depth_threshold_percentile=int(thresh_depth),
+                brightness_threshold_percentile=int(thresh_dark)
+            )
+
+        flat = score_map_t.view(score_map_t.size(0), -1)
+        anomaly_scores = torch.max(flat, dim=1)[0]
+
+        if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+            anomaly_scores = self.struct_core_instance.score(score_map_t, anomaly_scores)
+        else:
+            k = float(self.scoring_mode.split('_')[-1])
+            max_scores = anomaly_scores
+            mean_scores = torch.mean(flat, dim=1)
+            anomaly_scores = k * max_scores + (1 - k) * mean_scores
+
+        # Convert back to numpy to match PaDiM's return convention
+        score_map = score_map_t.numpy()
+        img_scores = anomaly_scores.numpy()
+
+        return score_map, img_scores
+
+
+
         # 6. the image anomaly score is the maximum score in the score map
-        img_scores = score_map.reshape(score_map.shape[0], -1).max(axis=1)
+       # img_scores = score_map.reshape(score_map.shape[0], -1).max(axis=1)
 
         # need to unsqueeze to have (batch, 1, H, W), where 1 is the single channel
         # that represents the anomaly score for each pixel
-        score_map = np.expand_dims(score_map, axis=1)
+      #  score_map = np.expand_dims(score_map, axis=1)
 
-        return score_map, img_scores
+      #  return score_map, img_scores
 
     def fit_multivariate_diagonal_gaussian(self, embedding_vectors: torch.Tensor, update_params: bool, logger=None) -> (torch.Tensor, torch.Tensor):
         """

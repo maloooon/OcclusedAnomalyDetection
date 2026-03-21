@@ -20,10 +20,10 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-def create_fastflow(img_shape, backbone_name, device):
+def create_fastflow(img_shape, backbone_name, device, struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0):
     backbone_name = "wide_resnet50_2"
 
-    fast_flow_model = CompleteFastFlowModel(backbone_name,input_size= img_shape, normalize = True)
+    fast_flow_model = CompleteFastFlowModel(backbone_name,input_size= img_shape, normalize = True, struct_core_instance = struct_core_instance, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     fast_flow_module = FastflowModel(input_size = img_shape,flow_steps=8,conv3x3_only=False,hidden_ratio=1.0,channels=fast_flow_model.channels,scales=fast_flow_model.scales)
     fast_flow_model.fast_flow_module = fast_flow_module
 
@@ -602,7 +602,7 @@ class AnomalyMapGenerator(nn.Module):
 
 
 class CompleteFastFlowModel(nn.Module):
-    def __init__(self,backbone_name,input_size,normalize):
+    def __init__(self,backbone_name,input_size,normalize, struct_core_instance, scoring_mode, filter_post, mask_border_filter_thickness):
         super().__init__()
 
         if backbone_name in ["cait_m48_448", "deit_base_distilled_patch16_384"]:
@@ -619,6 +619,11 @@ class CompleteFastFlowModel(nn.Module):
         self.input_size = input_size
         self.feature_extractor = feature_extractor
         self.anomaly_map_generator = AnomalyMapGenerator(input_size=input_size)
+
+        self.struct_core_instance = struct_core_instance
+        self.scoring_mode = scoring_mode
+        self.filter_post = filter_post
+        self.mask_border_filter_thickness = mask_border_filter_thickness
 
         if backbone_name in ["cait_m48_448", "deit_base_distilled_patch16_384"]:
             channels = [768]
@@ -654,11 +659,17 @@ class CompleteFastFlowModel(nn.Module):
         self.channels = channels
         self.scales = scales
 
+        self.backbone_name = backbone_name
+
 
     def forward(self,input_tensor):
 
         if isinstance(input_tensor, tuple):
-            input_tensor, mask, _,_,_ = input_tensor
+            if len(input_tensor) == 5:
+                input_tensor, mask, batch_og, mask_og, depth_og = input_tensor
+            if len(input_tensor) == 2:
+                input_tensor, mask = input_tensor
+                batch_og, mask_og, depth_og = None, None, None
 
         if isinstance(self.feature_extractor, VisionTransformer):
             # print("get_vit_features")
@@ -666,6 +677,8 @@ class CompleteFastFlowModel(nn.Module):
         elif isinstance(self.feature_extractor, Cait):
             # print("get_cait_features")
             features = self._get_cait_features(input_tensor)
+        elif "dinov2" in self.backbone_name:
+            features, cls_tokens = self._get_cnn_features(input_tensor)
         else:
             # print("get_cnn_features")
             features = self._get_cnn_features(input_tensor)
@@ -680,15 +693,82 @@ class CompleteFastFlowModel(nn.Module):
             )
             return return_val
 
-     #   if not self.training:
-     #       anomaly_maps = self.anomaly_map_generator(hidden_variables)
-     #       flat = anomaly_maps.view(anomaly_maps.shape[0], -1)
-      #      max_score = flat.max(dim=1).values
-      #      mean_score = flat.mean(dim=1)
-      #      alpha = 0.25  # tune this # TODO : as tunable hyperparam during model training ?
-      #      image_score = alpha * max_score + (1 - alpha) * mean_score
-      #      return_val = (anomaly_maps, image_score)
-      #      return return_val
+        '''
+        if not self.training:
+            anomaly_maps = self.anomaly_map_generator(hidden_variables)
+            print(anomaly_maps.shape)
+            print(mask.shape)
+
+            device = anomaly_maps.device
+
+            if mask is not None:
+                if mask.ndim == 3:
+                    mask = mask.unsqueeze(1)
+
+                effective_mask = torch.zeros_like(mask, dtype=torch.float32)
+
+                for i in range(mask.shape[0]):
+                    import cv2 as cv
+                    sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
+
+                    # Save mask fig
+                    sample_mask_fig = (sample_mask * 255).astype(np.uint8)
+                    cv.imwrite(f"sample_mask_{i}.png", sample_mask_fig)
+                    # Save anomaly map fig
+                    sample_anomaly_map = anomaly_maps[i, 0].cpu().numpy()
+                    sample_anomaly_map_fig = ((sample_anomaly_map - sample_anomaly_map.min()) / (sample_anomaly_map.max() - sample_anomaly_map.min()) * 255).astype(np.uint8)
+                    cv.imwrite(f"sample_anomaly_map_{i}.png", sample_anomaly_map_fig)
+
+
+                    if self.mask_border_filter_thickness > 0:
+                        contours, _ = cv.findContours(
+                            sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+                        )
+                        contour_band = np.zeros_like(sample_mask)
+                        cv.drawContours(
+                            contour_band, contours, -1, 255,
+                            thickness=self.mask_border_filter_thickness
+                        )
+                        inner_mask = sample_mask.copy()
+                        inner_mask[contour_band == 255] = 0
+                    else:
+                        inner_mask = sample_mask
+
+                    effective_mask[i, 0] = torch.from_numpy(
+                        inner_mask.astype(np.float32)
+                    ).to(device)
+
+                effective_mask = (effective_mask > 0).float()
+                anomaly_maps = anomaly_maps * effective_mask
+
+                # Save first anomaly map after mask filtering fig
+                sample_anomaly_map_filtered = anomaly_maps[0, 0].cpu().numpy()
+                sample_anomaly_map_filtered_fig = ((sample_anomaly_map_filtered - sample_anomaly_map_filtered.min()) / (sample_anomaly_map_filtered.max() - sample_anomaly_map_filtered.min()) * 255).astype(np.uint8)
+                cv.imwrite(f"sample_anomaly_map_filtered_0.png", sample_anomaly_map_filtered_fig)
+                exit()
+
+            if 'HOLE_DARKNESS' in self.filter_post:
+                thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+                anomaly_maps = filter_holes_batched(
+                    anomaly_maps, input_tensor, batch_og, mask_og, depth_og,
+                    depth_threshold_percentile=int(thresh_depth),
+                    brightness_threshold_percentile=int(thresh_dark)
+                )
+
+            flat = anomaly_maps.view(anomaly_maps.shape[0], -1)
+            anomaly_scores = torch.max(flat, dim=1).values
+
+            if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+                anomaly_scores = self.struct_core_instance.score(anomaly_maps, anomaly_scores)
+            else:
+                k = float(self.scoring_mode.split('_')[-1])
+                max_scores = anomaly_scores
+                mean_scores = torch.mean(flat, dim=1)
+                anomaly_scores = k * max_scores + (1 - k) * mean_scores
+
+            return_val = (anomaly_maps, anomaly_scores)
+            return return_val
+        '''
 
         return (hidden_variables, log_jacobians)
 

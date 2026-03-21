@@ -189,6 +189,8 @@ class CFA(nn.Module):
                 for i in range(mask.shape[0]):
                     sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
 
+
+
                     if self.mask_border_filter_thickness > 0:
                         contours, _ = cv.findContours(
                             sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
@@ -274,6 +276,9 @@ class CFA(nn.Module):
         for i, x in enumerate(tqdm(data_loader)):
             x = x.to(self.device)
             p = feature_extractor(x)
+
+            if "dinov2" in feature_extractor.model_name:
+                p, cls_tokens = p
 
             if isinstance(p, dict):
                 p = list(p.values())
