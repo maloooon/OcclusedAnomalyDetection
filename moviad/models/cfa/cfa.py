@@ -161,7 +161,7 @@ class CFA(nn.Module):
        #     heatmaps = CFA.upsample(heatmaps, size=x.size(2), mode="bilinear")
        #     heatmaps = CFA.gaussian_smooth_torch(heatmaps, sigma=4)
        #     img_scores = CFA.rescale(heatmaps)
-       #     img_scores = scores.reshape(scores.shape[0], -1).max(axis=1).values
+       #     img_scores = scores.reshape(scores.shape[0], -1).max(axis=1).values 
 
         #    if len(heatmaps.shape) == 2:
         #        return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), img_scores
@@ -212,6 +212,7 @@ class CFA(nn.Module):
                 effective_mask = effective_mask.to(device)
                 heatmaps = heatmaps * effective_mask
 
+
             # Filter holes
             if 'HOLE_DARKNESS' in self.filter_post:
                 thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
@@ -223,6 +224,10 @@ class CFA(nn.Module):
 
             # Compute per-image anomaly score
             flat = heatmaps.view(heatmaps.size(0), -1)
+
+          #  anomaly_scores = CFA.rescale(heatmaps)
+          #  anomaly_scores = scores.reshape(anomaly_scores.shape[0], -1).max(axis=1).values
+            
             anomaly_scores = torch.max(flat, dim=1)[0]
 
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
@@ -233,7 +238,11 @@ class CFA(nn.Module):
                 mean_scores = torch.mean(flat, dim=1)
                 anomaly_scores = k * max_scores + (1 - k) * mean_scores
 
-            return heatmaps, anomaly_scores
+            if len(heatmaps.shape) == 2:
+               return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), anomaly_scores
+            else:
+               # return heatmaps.unsqueeze(dim=1), anomaly_scores
+                return heatmaps, anomaly_scores
 
     def soft_boundary(self, phi_p: torch.Tensor) -> float:
         """

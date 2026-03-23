@@ -760,10 +760,10 @@ def main():
 
     SIZE_FILTERING = False
     SIZE_FILTERING_FACTOR = 1.5
-    DARKNESS_FILTERING = False
+    DARKNESS_FILTERING = True
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
-    IMG_SIZE = 266
+    IMG_SIZE = 256
 
     filter_parts = []
     if SIZE_FILTERING:

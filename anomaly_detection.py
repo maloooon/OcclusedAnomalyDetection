@@ -590,7 +590,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 16.023365
+    opt_threshold = 1.1632621
 
 
     # chek for the visual test
@@ -787,9 +787,8 @@ def main():
     # TODO : add structcore, filtering, mask only etc. for rd4ad and ganomaly possibly (since these best models) ;
     # TODO : in general, add to all models and redo some benchmarks and then do final ones
 
-    MODEL_MODE = 'rd4ad' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
+    MODEL_MODE = 'patchcore' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
 
-    
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
     # NOTE : current full no filters 256 has darkness filter
@@ -830,12 +829,12 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-   # backbone = "mobilenet_v2" 
-    backbone = "wide_resnet50_2"
-  #  backbone = "dinov2_vitb14"
-   # ad_layers = ["features.4", "features.7", "features.10"] 
-    ad_layers = ["layer2", "layer3"]
-   # ad_layers = [3,6] 
+  #  backbone = "mobilenet_v2" 
+  #  backbone = "wide_resnet50_2"
+    backbone = "dinov2_vitb14"
+  #  ad_layers = ["features.4", "features.7", "features.10"] 
+   # ad_layers = ["layer2", "layer3"]
+    ad_layers = [3,6] 
     save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}.pt"
 
    # train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
@@ -848,7 +847,7 @@ def main():
     visual_test_dir.mkdir(parents=True, exist_ok=True)
 
     test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = test_target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
-   # detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
+  #  detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
 
 
 if __name__ == "__main__":

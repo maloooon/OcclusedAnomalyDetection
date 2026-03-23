@@ -40,7 +40,7 @@ def find_contour(image,mask):
 
     contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour_mask = np.zeros_like(mask_uint8)
-    cv2.drawContours(contour_mask, contours, -1, 255, thickness=1)
+    cv2.drawContours(contour_mask, contours, -1, 255, thickness=8)
 
     cv2.imwrite("contour.png", contour_mask)
 
@@ -536,7 +536,7 @@ def main():
             # Convert sample to rgb
             normal_sample = cv2.cvtColor(normal_sample, cv2.COLOR_BGR2RGB)
             # Visualize normal img
-          #  cv2.imwrite("original_normal_image.png", normal_sample)
+            cv2.imwrite("original_normal_image.png", normal_sample)
 
            # find_contour(normal_sample, normal_mask)
 
@@ -547,7 +547,8 @@ def main():
         #  edge_smoothing(anomalous_sample, anomalous_mask)
         #  overlay_mask_on_image(anomalous_sample, anomalous_mask)
         #  normalize_distribution(anomalous_sample, anomalous_mask, target_mean, target_std)
-            find_holes(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
+         #   find_holes(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
+            find_contour(normal_sample, normal_mask)
            
           #  find_holes_fix(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
           #  clean_protrusions(normal_sample, normal_mask, normal_depth)
