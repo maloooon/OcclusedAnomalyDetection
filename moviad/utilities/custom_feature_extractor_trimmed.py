@@ -13,6 +13,7 @@ from moviad.backbones.mcunet.mcunet.model_zoo import net_id_list, build_model
 from moviad.backbones.micronet.micronet import micronetBB
 from torchsummary import summary
 
+
 try:
     from micromind.networks.phinet import PhiNet
 except ModuleNotFoundError:
@@ -38,6 +39,7 @@ TORCH_BACKBONES = (
     "wide_resnet50_2",
     "efficientnet_b5",
     "mobilenet_v2",
+    "mobilenet_v2_cutout"
 )
 
 DINOV2_BACKBONES = (
@@ -52,6 +54,8 @@ DINOV2_BACKBONES = (
 )
 
 
+
+
 class CustomFeatureExtractor:
 
     def __init__(
@@ -62,6 +66,7 @@ class CustomFeatureExtractor:
         frozen=True,
         quantized=False,
         calibration_dataloader=None,
+        custom_weights_path=None
     ):
         """
         Constructor
@@ -77,6 +82,8 @@ class CustomFeatureExtractor:
         self.layers_idx = layers_idx
         self.device = device
         self.project_path = Path(__file__).parent.parent
+        self.custom_weights_path = custom_weights_path
+
 
         # ¢heck for backbone support
         if model_name not in OTHERS_BACKBONES + TORCH_BACKBONES + DINOV2_BACKBONES:
@@ -84,10 +91,15 @@ class CustomFeatureExtractor:
                 f"The backbone: {model_name} is not supported for feature extraction"
             )
 
-        elif model_name in TORCH_BACKBONES:
+       # elif model_name in TORCH_BACKBONES:
 
+       #     self.model = CustomFeatureExtractor.get_feature_extractor(
+       #         model_name, layers_idx, frozen
+       #     )
+
+        elif model_name in TORCH_BACKBONES:
             self.model = CustomFeatureExtractor.get_feature_extractor(
-                model_name, layers_idx, frozen
+                model_name, layers_idx, frozen, custom_weights_path= self.custom_weights_path
             )
 
         elif model_name in DINOV2_BACKBONES:
@@ -274,6 +286,8 @@ class CustomFeatureExtractor:
             metrics=None,
         )
 
+
+    '''
     @staticmethod
     def get_feature_extractor(backbone: str, return_nodes, pretrained=True):
         """Get the feature extractor from the backbone CNN.
@@ -299,6 +313,25 @@ class CustomFeatureExtractor:
         feature_extractor = create_feature_extractor(
             model=model, return_nodes=return_nodes
         )
+
+        return feature_extractor
+    '''
+
+
+    @staticmethod
+    def get_feature_extractor(backbone: str, return_nodes, pretrained=True, custom_weights_path=None):
+
+        if pretrained:
+            model = getattr(torchvision.models, backbone)(weights="IMAGENET1K_V1")
+        else:
+            model = getattr(torchvision.models, backbone)()
+
+        if custom_weights_path is not None:
+            finetuned_weights = torch.load(custom_weights_path, map_location='cpu')
+            model.load_state_dict(finetuned_weights, strict=False)
+
+        return_nodes = {layer: layer for layer in return_nodes}
+        feature_extractor = create_feature_extractor(model=model, return_nodes=return_nodes)
 
         return feature_extractor
 

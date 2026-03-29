@@ -8,6 +8,7 @@ import torch
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import os
+import random 
 
 def edge_smoothing(image, mask, ksize=(5, 5), sigma=3, thickness=5):
     """
@@ -32,7 +33,52 @@ def edge_smoothing(image, mask, ksize=(5, 5), sigma=3, thickness=5):
     cv2.imwrite("edge_smoothed_image.png", result)
     
 
-    return result, mask#
+    return result, mask
+
+
+def apply_cutout(image, mask, n_holes=3, hole_size_range=(32, 64)):
+    """
+    Apply random rectangular cutouts ONLY within the raspberry mask region.
+    Returns the masked images and a binary tensor indicating which pixels
+    were cut out (for computing loss only on the masked region).
+    
+    Args:
+        images: (B, 3, H, W) tensor
+        mask: (B, 1, H, W) binary mask of raspberry region
+        n_holes: number of cutout rectangles
+        hole_size_range: (min_size, max_size) for each rectangle edge
+    """
+    H, W, C = image.shape
+    mask = np.expand_dims(mask, axis=2)  # ensure (H, W, 1)
+    cutout_mask = np.ones((H, W, 1))
+
+    print(H)
+    print(W)
+
+
+    for _ in range(n_holes):
+        h = random.randint(hole_size_range[0], hole_size_range[1])
+        w = random.randint(hole_size_range[0], hole_size_range[1])
+        y = random.randint(0, H - h)
+        x = random.randint(0, W - w)
+        cutout_mask[y:y+h, x:x+w] = 0.0
+
+    
+
+    # Only cut out within the raspberry region
+    cutout_mask = cutout_mask + (1.0 - mask)  # preserve background (i.e. make sure we only cut out where we have the raspberry mask)
+    cutout_mask = cutout_mask.clip(0, 1)
+
+
+
+    masked_image = image * cutout_mask
+    # The "holes" are where cutout_mask is 0 AND mask is 1
+    holes = (1.0 - cutout_mask) * mask
+
+    cv2.imwrite("masked_image.png", masked_image)
+    cv2.imwrite("cutout_mask.png", cutout_mask.squeeze(2) * 255)
+
+    return masked_image, holes
 
 def find_contour(image,mask):
 
@@ -548,7 +594,8 @@ def main():
         #  overlay_mask_on_image(anomalous_sample, anomalous_mask)
         #  normalize_distribution(anomalous_sample, anomalous_mask, target_mean, target_std)
          #   find_holes(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
-            find_contour(normal_sample, normal_mask)
+           # find_contour(normal_sample, normal_mask)
+            apply_cutout(normal_sample, normal_mask)
            
           #  find_holes_fix(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
           #  clean_protrusions(normal_sample, normal_mask, normal_depth)

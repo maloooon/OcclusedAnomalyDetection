@@ -190,6 +190,20 @@ def distribution_of_grades(samples):
     plt.show()
     
 
+def save_all_imgs(ds):
+    """
+    Save all images from the dataset to disk for manual inspection.
+    
+    Args:
+        ds: The dataset containing samples with 'image' field
+    """
+    train_data = list(ds['train'])
+    valid_data = list(ds['valid'])
+    all_samples = train_data + valid_data
+    for idx, sample in enumerate(all_samples):
+        img = sample['image']
+        img.save(f"../../disk/dataset_bonnets/raspberries_original/{idx}.jpg")
+
 
 def main():
     # Get raspberry dataset
@@ -197,7 +211,9 @@ def main():
 
     # Visualize a random sample from the training set
     sample = ds['train'][3] # 3
-    visualize_sample(sample, show_segmentation_mask=False, show_classes=False, debug=True)
+    print(sample['image'])
+    #visualize_sample(sample, show_segmentation_mask=False, show_classes=False, debug=True)
+  #  save_all_imgs(ds)
 
     # Plot distribution of grades
     #distribution_of_grades(list(ds['train']) + list(ds['valid']))

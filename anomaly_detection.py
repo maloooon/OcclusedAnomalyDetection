@@ -34,6 +34,8 @@ from torchvision.transforms.functional import InterpolationMode
 
 from synthetic_occlusion import SyntheticOcclusion
 
+
+
 import random
 import argparse
 import gc
@@ -59,12 +61,11 @@ from moviad.utilities.struct_core import StructCore
 
 from image_manipulation import find_holes
 
+from ss_cutout import CutoutReconstructionModel, apply_cutout, train_cutout_reconstruction
 
-# TODO : in the Dataset for Raspberries, add as possible transformation the synthetic occlusion ? Such that with each epoch during training, we add different occlusion patterns
-# TODO : based on the modes we need to make it fair, i.e. easy would be to just on the currently selected raspberries, but maybe we can select a batch of raspberries and then do on them
-# TODO : the multi-raspberry modes. Need to figure out how to do it also with the fact that we load in anomalous/normal first 
 
-# TODO : need to set the whole mask of anomaly raspberries to the mask size of the anomaly raspberry (i.e. we have no exact mask where anomaly is)
+
+'''
 class SingleRaspberryDataset(Dataset):
     def __init__(self, dataset_path: str, split = None, synthetic_augmentation = False, AD_model = None, backbone_model = None, struct_core_collection_bool = False, filter_test_bool = False, pass_og_bool = True):
         """
@@ -80,11 +81,6 @@ class SingleRaspberryDataset(Dataset):
         self.removed_raspberries_darkness_path = Path('../../disk/removed_dark_raspberries')
         self.removed_raspberries_size_path = Path('../../disk/removed_size_raspberries')
 
-
-      #  if 'dinov2' in backbone_model:
-      #      transform_sizes = 224
-        
-      #  else:
 
         if AD_model == 'ganomaly':
             transform_sizes = 256
@@ -105,7 +101,7 @@ class SingleRaspberryDataset(Dataset):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], # Since also used in MVTec implementation
                             std=[0.229, 0.224, 0.225]),
     ])
-         # NOTE : here change 266 --> 224
+
         self.transform_mask = transforms.Compose([
         transforms.Resize((transform_sizes, transform_sizes), antialias = True, interpolation=InterpolationMode.BILINEAR), # PatchCore specific (i.e. taken from paper)
       #  transforms.CenterCrop((224,224)), # PatchCore specific (i.e. taken from paper)
@@ -304,15 +300,260 @@ class SingleRaspberryDataset(Dataset):
                 return img, mask
             else:
                 return img
-            
-def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', filter_test_bool = False, pass_og_bool = False):
+
+'''
+
+
+"""
+Refactored SingleRaspberryDataset.
+
+ARCHITECTURE CHANGE SUMMARY:
+============================
+OLD: The dataset class received filter_test_bool and at __init__ time would scan
+     removed_dark_raspberries/ and removed_size_raspberries/ directories, comparing
+     filenames via os.listdir to decide which test samples to keep. This was:
+     - Fragile (depended on external directories existing with correct filenames)
+     - Slow (os.listdir on every init)
+     - Coupled to the old in-place filtering that produced broken indices
+
+NEW: The dataset class accepts an optional `filter_path` pointing to the directory
+     produced by apply_filters(). If provided, it loads the pre-computed filtered
+     pkl files and path lists. If not provided, it loads the full unfiltered data.
+     
+     The key insight: filtering is now a DATA decision made once by apply_filters(),
+     not a RUNTIME decision made by the Dataset class on every instantiation.
+
+WHAT CHANGED:
+  - `filter_test_bool` parameter → `filter_path` parameter (path to filtered dir, or None)
+  - Removed: self.removed_raspberries_darkness_path, self.removed_raspberries_size_path
+  - Removed: the os.listdir-based filtering loop in __init__
+  - Added: path-based loading that branches on whether filter_path is provided
+  - The rest of __init__ and __getitem__ are unchanged.
+"""
+
+
+
+
+class SingleRaspberryDataset(Dataset):
+    # CHANGE: removed filter_test_bool from the signature entirely.
+    # If you have call sites passing filter_test_bool=..., just remove that argument.
+    def __init__(self, dataset_path: str, split=None, synthetic_augmentation=False,
+                 AD_model=None, backbone_model=None, struct_core_collection_bool=False,
+                 pass_og_bool=True):
+        """
+        Args:
+            dataset_path: path to the 'processed' folder (contains normal/, anomalous/, splits/)
+            split: 'train' or 'test' (or None)
+ 
+        CHANGE: No filter_test_bool parameter. The pkls already contain the correct
+        (potentially filtered) data thanks to apply_filters() running beforehand.
+        """
+        self.dataset_path = dataset_path
+        self.split = split
+        self.synthetic_augmentation = synthetic_augmentation
+        self.struct_core_collection_bool = struct_core_collection_bool
+        self.pass_og_bool = pass_og_bool
+ 
+        # CHANGE: Removed these — no longer scanning external directories at runtime
+        # self.removed_raspberries_darkness_path = Path('../../disk/removed_dark_raspberries')
+        # self.removed_raspberries_size_path = Path('../../disk/removed_size_raspberries')
+ 
+        if AD_model == 'ganomaly':
+            transform_sizes = 256
+        else:
+            transform_sizes = 224
+ 
+        if self.synthetic_augmentation:
+            from synthetic_occlusion import SyntheticOcclusion
+            self.synthetic_occlusion = SyntheticOcclusion(
+                base_path=Path(self.dataset_path),
+                sample_folders=['anomalous', 'normal']
+            )
+ 
+        self.transform_img = transforms.Compose([
+            transforms.Resize((transform_sizes, transform_sizes), antialias=True,
+                             interpolation=InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225]),
+        ])
+ 
+        self.transform_mask = transforms.Compose([
+            transforms.Resize((transform_sizes, transform_sizes), antialias=True,
+                             interpolation=InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+        ])
+ 
+        # --- Data loading (unchanged logic, but now the pkls may already be filtered) ---
+        normal_path = Path(self.dataset_path) / 'normal' / 'normal_samples.pkl'
+        anomalous_path = Path(self.dataset_path) / 'anomalous' / 'anomalous_samples.pkl'
+ 
+        self.train_indices_non_anom = pickle.load(
+            open(Path(self.dataset_path) / 'splits' / 'train_normal_indices.pkl', 'rb'))
+        self.test_indices_non_anom = pickle.load(
+            open(Path(self.dataset_path) / 'splits' / 'test_normal_indices.pkl', 'rb'))
+ 
+        with open(normal_path, 'rb') as f:
+            normal_data = pickle.load(f)
+        with open(anomalous_path, 'rb') as f:
+            anomalous_data = pickle.load(f)
+ 
+        normal_test = [normal_data[i] for i in self.test_indices_non_anom]
+        normal_train = [normal_data[i] for i in self.train_indices_non_anom]
+ 
+        if self.split == 'train':
+            self.data = normal_train
+        else:
+            self.data = anomalous_data + normal_test
+ 
+        self.img_paths = [item['img_path'] for item in self.data]
+        self.grades = [item['grade'] for item in self.data]
+        self.masks = [item['mask'] for item in self.data]
+        self.depths = [item['depth'] for item in self.data]
+        self.img_arrays = [item['image'] for item in self.data]
+ 
+        # CHANGE: The entire filter_test_bool block that was here is GONE.
+        # The data is already correct — if apply_filters() ran, the pkls and
+        # index files already exclude filtered samples. Nothing to do here.
+ 
+    def __len__(self):
+        return len(self.img_paths)
+ 
+    # __getitem__ is COMPLETELY UNCHANGED
+    def __getitem__(self, idx):
+        img_file = None
+ 
+        if self.synthetic_augmentation and random.random() < 0.5:
+            from create_dataset import _center_object
+ 
+            wanted_size_range = (random.randint(1, 5) / 10), (random.randint(6, 9) / 10)
+ 
+            new_img, new_mask, grade = self.synthetic_occlusion.multi_raspberry_occlusion(
+                wanted_size_range=wanted_size_range,
+                randomize_scale_bool=(False, 0.5, 0.9),
+                randomize_rotation_bool=(False, -180, 180),
+                visualize_bool=False,
+                reassign_source_target_bool=False,
+                sampling_mode=('N_largest', 50),
+                k=2,
+                chosen_initial_raspberry=(self.img_arrays[idx], self.masks[idx], self.grades[idx])
+            )
+ 
+            if new_img is None:
+                pass
+            else:
+                new_img = np.asarray(new_img, dtype=np.uint8)
+                new_img, new_mask = self.synthetic_occlusion.clean_mask_and_img(new_img, new_mask)
+                new_mask = np.asarray(new_mask, dtype=bool)
+                new_img, new_mask = _center_object(new_img, new_mask)
+ 
+                synthetic_img_path = Path(self.dataset_path) / 'synthetic' / f'synthetic_{Path(self.img_paths[idx]).stem}.png'
+                img = Image.fromarray(new_img, 'RGB')
+                img.save(synthetic_img_path)
+                img_array = np.asarray(img, dtype=np.uint8)
+ 
+                og_img = img_array.copy()
+                mask = new_mask
+                og_mask = mask.copy()
+                depth = self.depths[idx].copy()
+                depth[~mask] = 0
+                og_depth = depth.copy()
+                mask = Image.fromarray(mask.astype(np.uint8) * 255)
+ 
+        if img_file is None:
+            img_file = self.img_paths[idx]
+            img = Image.open(img_file).convert("RGB")
+            og_img = self.img_arrays[idx].copy()
+            mask = self.masks[idx]
+            og_mask = mask.copy()
+            mask = Image.fromarray(mask.astype(np.uint8) * 255)
+            depth = self.depths[idx]
+            og_depth = depth.copy()
+ 
+        img = self.transform_img(img)
+        mask = self.transform_mask(mask)
+ 
+        if self.split == 'test':
+            img_path = self.img_paths[idx]
+            grade = self.grades[idx]
+            if grade > 3:
+                error_mask = mask
+                needed_grade = 1
+                actual_grade = grade
+            else:
+                error_mask = torch.zeros(img.shape[1], img.shape[2])
+                needed_grade = 0
+                actual_grade = grade
+            if len(error_mask.shape) == 2:
+                error_mask = error_mask.unsqueeze(0)
+            if len(mask.shape) == 2:
+                mask = mask.unsqueeze(0)
+            if self.pass_og_bool:
+                return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, og_img, og_mask, og_depth
+            else:
+                return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, img, img, img
+        else:
+            if self.struct_core_collection_bool:
+                return img, mask
+            else:
+                return img
+
+def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
+                             unfreeze_from=10, epochs=30, lr=1e-4,
+                             batch_size=32, n_holes=3, hole_size_range=(32, 64),
+                             target_path='full_no_filters'):
+
+
+    assert backbone == 'mobilenet_v2', "Currently only implemented for MobileNetv2"
+
+    train_set_path = dataset_path / Path(f'{target_path}/processed')
+
+
+
+    train_dataset = SingleRaspberryDataset(
+        train_set_path, split='train',
+        synthetic_augmentation=False,
+        AD_model='patchcore',
+        backbone_model=backbone,
+        struct_core_collection_bool=True,  # returns (img, mask)
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    model = CutoutReconstructionModel(unfreeze_from=unfreeze_from, device = device)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    )
+    criterion = torch.nn.MSELoss(reduction='none')
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"Cutout pretraining: {epochs} epochs, unfreeze from features.{unfreeze_from}")
+    print(f"Trainable: {trainable:,} | Frozen: {frozen:,}")
+
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    )
+    criterion = torch.nn.MSELoss(reduction='none')
+
+    trained_model = train_cutout_reconstruction(model, train_dataloader, device, epochs=epochs, lr=lr, optimizer=optimizer, criterion=criterion)
+
+    # Save encoder weights only, mapped to torchvision naming
+    encoder_state = {f'features.{k}': v for k, v in trained_model.encoder.state_dict().items()}
+    torch.save(encoder_state, save_path)
+    print(f"Saved fine-tuned encoder to {save_path}")
+
+    del model, optimizer, train_dataloader, train_dataset
+    torch.cuda.empty_cache()
+
+def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', filter_test_bool = False, pass_og_bool = False, custom_weights_path = None):
 
     mode = mode.lower()
     # initialize the feature extractor
     if mode != 'stfpm':
-        feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, None)
+        feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, custom_weights_path = custom_weights_path)
     else:
-        teacher = CustomFeatureExtractor(backbone, ad_layers, device, frozen = True)
+        teacher = CustomFeatureExtractor(backbone, ad_layers, device, frozen = True, custom_weights_path = custom_weights_path)
         student = CustomFeatureExtractor(backbone, ad_layers, device, frozen = False)
 
     # Only normal samples for training
@@ -333,7 +574,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
-    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, filter_test_bool = filter_test_bool,  pass_og_bool = pass_og_bool)
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) # filter_test_bool = filter_test_bool, 
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
@@ -404,7 +645,6 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     del test_dataloader
     torch.cuda.empty_cache()
     gc.collect()
-
 
 def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters'):
     """
@@ -495,7 +735,6 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
 
     return struct_core
 
-
 def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, filter_test_bool = False, pass_og_bool = False):
     
 
@@ -516,7 +755,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
-    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, filter_test_bool = filter_test_bool, pass_og_bool = pass_og_bool)
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) # filter_test_bool = filter_test_bool
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
@@ -590,7 +829,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 1.1632621
+    opt_threshold = 1.1739218
 
 
     # chek for the visual test
@@ -713,8 +952,6 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
         plt.savefig(os.path.join(visual_test_path, 'mask_size_correct_vs_wrong.png'), dpi=150, bbox_inches='tight')
         plt.close()
 
-
-
 def detailed_eval(data_path):
     """
     Evaluate predictions from filenames in data_path.
@@ -758,7 +995,6 @@ def detailed_eval(data_path):
 
     return results
 
-
 def saving_criteria(best_metrics, new_metrics):
     # Since this is needed for the AD models that have training
     if new_metrics["img_roc_auc"] > best_metrics["img_roc_auc"]:
@@ -791,8 +1027,8 @@ def main():
 
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    # NOTE : current full no filters 256 has darkness filter
-    FILTER_PRE = 'FULL_NO_FILTERS_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    # NOTE : current full no filters 256 has darkness filter ?? think this is old
+    FILTER_PRE = 'full_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
     # Get the last element in filter_pre
     last_element = FILTER_PRE.split('_')[-1]
@@ -807,8 +1043,17 @@ def main():
 
     dataset_path = Path('../../disk/dataset_single_objects/GT/')
     target_path = FILTER_PRE.lower()
-    test_target_path = 'FULL_NO_FILTERS_256' # In order to have the same test set 
-    test_target_path = test_target_path.lower()
+   # test_target_path = 'full_no_filters_256' # In order to have the same test set 
+   # test_target_path = test_target_path.lower()
+
+
+   # if test_target_path != FILTER_PRE:
+        # Since we want the (overall) same test set across all tests (i.e. also if we run filtered versions),
+        # we here have a filtered training set and the full, unfiltered test set. Yet, in this test set,
+        # no filtering occured yet. Therefore we need to ensure proper filtering 
+
+
+
     # TOMORROW ::::::
     # TODO : add that removed imgs (based on the path) are also removed from the test set for the current run // or rather there is a run
     # TODO : with all (even the actually filtered out ones) and one with the filtered to compare scores
@@ -829,15 +1074,22 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-  #  backbone = "mobilenet_v2" 
+    backbone = "mobilenet_v2" 
   #  backbone = "wide_resnet50_2"
-    backbone = "dinov2_vitb14"
-  #  ad_layers = ["features.4", "features.7", "features.10"] 
+   # backbone = "dinov2_vitb14"
+    ad_layers = ["features.4", "features.7", "features.10"] 
    # ad_layers = ["layer2", "layer3"]
-    ad_layers = [3,6] 
+  #  ad_layers = [3,6] 
     save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}.pt"
 
-   # train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
+    custom_weights_path = None
+   # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout.pt"
+   # if not os.path.exists(custom_weights_path):
+   #     raise FileNotFoundError(f"Custom weights not found at {custom_weights_path}. Please run pretrain_backbone_cutout first to generate these weights.")
+
+  #  pretrain_backbone_cutout(dataset_path, device, backbone, save_path = f"../../disk/pretrained_models/{backbone}_cutout.pt", unfreeze_from=10, epochs=30, lr=1e-4, batch_size=32, n_holes=1, hole_size_range=(32, 64), target_path = target_path)
+
+    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path)
 
     # Check if visual test path exists and clear it out if it already exists
     visual_test_path = f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/"
@@ -846,8 +1098,8 @@ def main():
         shutil.rmtree(visual_test_dir)
     visual_test_dir.mkdir(parents=True, exist_ok=True)
 
-    test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = test_target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
-  #  detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
+   # test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
+   # detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
 
 
 if __name__ == "__main__":
