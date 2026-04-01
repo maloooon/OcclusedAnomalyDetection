@@ -144,11 +144,15 @@ class Evaluator:
         for images, labels, masks, path, full_mask, actual_grade, og_img, og_mask, og_depth in tqdm(self.test_dataloader, desc="Eval"):
             # get anomaly map and score
             with torch.no_grad():
+                
 
+                
                 out = model((images.to(self.device), full_mask.to(self.device), og_img.to(self.device), og_mask.to(self.device), og_depth.to(self.device))) # NOTE : added full_mask and depth
-
+            
                 if len(out) == 5: # NOTE : added for patchcore currently
                     anomaly_maps, anomaly_scores, embeddings, memory_bank, cls_tokens = out
+                elif len(out) == 1: # NOTE : currently for SINBAD
+                    anomaly_scores = out[0]
                 else:
                     anomaly_maps, anomaly_scores = out
               #  print(embeddings.shape) # NOTE : added
@@ -167,11 +171,15 @@ class Evaluator:
                 if len(out) == 5 and cls_tokens is not None: # NOTE : added for patchcore currently
                     all_cls_tokens.extend(cls_tokens.cpu().numpy()) # NOTE : added
 
-            if anomaly_maps.shape[2:] != masks.shape[2:]:
-                raise Exception(
-                    "The output anomaly maps should have the same resolution as the target masks."
-                    + f"Expected shape: {masks.shape}, got: {anomaly_maps.shape}"
-                )
+
+
+
+            if len(out) > 1: # Added for SINBAD, since we have no anomaly maps 
+                if anomaly_maps.shape[2:] != masks.shape[2:]:
+                    raise Exception(
+                        "The output anomaly maps should have the same resolution as the target masks."
+                        + f"Expected shape: {masks.shape}, got: {anomaly_maps.shape}"
+                    )
             
 
 
@@ -180,13 +188,20 @@ class Evaluator:
             gt_masks_list.extend(masks.cpu().numpy().astype(int))
             true_img_scores.extend(labels.cpu().numpy())
 
-            # add predicted masks and img anomaly scores (check for numpy arrays or tensors)
-            if isinstance(anomaly_maps, torch.Tensor):
-                pred_masks.extend(anomaly_maps.cpu().numpy())
-                pred_img_scores.extend(anomaly_scores.cpu().numpy())
-            else:
-                pred_masks.extend(anomaly_maps)
-                pred_img_scores.extend(anomaly_scores)
+
+            if len(out) > 1: # Added for SINBAD, since we have no anomaly maps
+                # add predicted masks and img anomaly scores (check for numpy arrays or tensors)
+                if isinstance(anomaly_maps, torch.Tensor):
+                    pred_masks.extend(anomaly_maps.cpu().numpy())
+                    pred_img_scores.extend(anomaly_scores.cpu().numpy())
+                else:
+                    pred_masks.extend(anomaly_maps)
+                    pred_img_scores.extend(anomaly_scores)
+            else:  # SINBAD: no anomaly maps, only scores
+                if isinstance(anomaly_scores, torch.Tensor):
+                    pred_img_scores.extend(anomaly_scores.cpu().numpy())
+                else:
+                    pred_img_scores.extend(anomaly_scores)
 
        # if len(out) == 4:
           #  all_embeddings = np.asarray(all_embeddings) # NOTE : added
@@ -213,7 +228,9 @@ class Evaluator:
         pred_masks = np.asarray(pred_masks)
         pred_img_scores = np.asarray(pred_img_scores)
 
-        pred_masks = min_max_norm(pred_masks)
+        # Added for SINBAD, since we have no anomaly maps
+        if len(out) > 1:
+            pred_masks = min_max_norm(pred_masks)
 
         """Image-level AUROC"""
         fpr, tpr, img_roc_auc = cal_img_roc(pred_img_scores, true_img_scores)

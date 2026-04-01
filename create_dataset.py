@@ -1646,9 +1646,9 @@ def main():
     UNBLURRED = False
  
     # CHANGE: These are now only used by apply_filters(), not by create_dataset_imgs()
-    SIZE_FILTERING = False
+    SIZE_FILTERING = True
     SIZE_FILTERING_FACTOR = 1.5
-    DARKNESS_FILTERING = True
+    DARKNESS_FILTERING = False
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
  

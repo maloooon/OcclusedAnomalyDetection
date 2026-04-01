@@ -14,6 +14,7 @@ from moviad.models.fastflow.fastflow import create_fastflow
 from moviad.models.cfa.cfa import CFA
 from moviad.models.stfpm.stfpm import STFPM
 from moviad.models.rd4ad.rd4ad import RD4AD
+from moviad.models.sinbad.sinbad import SINBAD
 from moviad.models.padim.padim import Padim
 from moviad.models.supersimplenet.supersimplenet import SuperSimpleNet
 from moviad.models.ganomaly.ganomaly import Ganomaly
@@ -22,6 +23,7 @@ from moviad.trainers.trainer_cfa import TrainerCFA
 from moviad.trainers.trainer_stfpm import TrainerSTFPM
 from moviad.trainers.trainer_patchcore import TrainerPatchCore
 from moviad.trainers.trainer_fastflow import TrainerFastFlow
+from moviad.trainers.trainer_sinbad import TrainerSINBAD
 from moviad.trainers.trainer_padim import TrainerPadim
 from moviad.trainers.trainer_ganomaly import TrainerGanomaly
 from moviad.trainers.trainer_supersimplenet import TrainerSuperSimpleNet
@@ -603,6 +605,16 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
         model = Ganomaly(input_size = (256,256), num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
     elif mode == 'supersimplenet':
         model = SuperSimpleNet(feature_extractor)
+    elif mode == 'sinbad':
+        model = SINBAD(
+            device=device,
+            input_size=(224, 224),
+            feature_extractor=feature_extractor,
+            n_projections=1000,   # paper default
+            n_quantiles=5,        # paper default
+            shrinkage=0.1,        # paper default
+            scoring_mode='knn',   # 'knn' (original) or 'mean' (simpler)
+        )
 
 
     model.to(device)
@@ -624,8 +636,9 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
         trainer = TrainerGanomaly(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria, save_path = save_path)
     elif mode == 'supersimplenet':
         trainer = TrainerSuperSimpleNet(model, train_dataloader, test_dataloader, device, logger = None, saving_criteria = saving_criteria, save_path = save_path)
-
-    if mode != 'patchcore' and mode != 'padim':
+    elif mode == 'sinbad':
+        trainer = TrainerSINBAD(model, train_dataloader, test_dataloader, device,save_path=save_path, logger=None)
+    if mode not in ('patchcore', 'padim', 'sinbad'):
         trainer.train(epochs = 30, evaluation_epoch_interval=1)
     else:
         trainer.train()
@@ -633,9 +646,10 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     # save the model
     if save_path:
         # Can save at the very end since we do not have typical epoch training (i.e. do not need to save best results during training, just the one result at the end)
-        if mode == 'patchcore' or mode == 'padim':
+        if mode != 'patchcore' and mode != 'padim':
             torch.save(model.state_dict(), save_path)
-
+        elif mode == 'sinbad':
+            torch.save(model.state_dict_sinbad(), save_path)
 
     # force garbage collector in case
     del model
@@ -829,7 +843,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 1.1739218
+    opt_threshold = 1.1237944
 
 
     # chek for the visual test
@@ -1016,19 +1030,14 @@ def main():
     # TODO : try dinomaly in anomalib ; even though model implemented for multi-class, maybe it can help since its ViT based and more global ?
 
 
-    # TODAY :::::::
-    # TODO : TRY DINO WITH REGISTER MODE !!
-    # TODO : try hole filters 
 
-    # TODO : add structcore, filtering, mask only etc. for rd4ad and ganomaly possibly (since these best models) ;
-    # TODO : in general, add to all models and redo some benchmarks and then do final ones
+    # TODO : try hole filters 
 
     MODEL_MODE = 'patchcore' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
 
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    # NOTE : current full no filters 256 has darkness filter ?? think this is old
-    FILTER_PRE = 'full_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    FILTER_PRE = 'FULL_NO_FILTERS_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
     # Get the last element in filter_pre
     last_element = FILTER_PRE.split('_')[-1]
@@ -1043,25 +1052,7 @@ def main():
 
     dataset_path = Path('../../disk/dataset_single_objects/GT/')
     target_path = FILTER_PRE.lower()
-   # test_target_path = 'full_no_filters_256' # In order to have the same test set 
-   # test_target_path = test_target_path.lower()
 
-
-   # if test_target_path != FILTER_PRE:
-        # Since we want the (overall) same test set across all tests (i.e. also if we run filtered versions),
-        # we here have a filtered training set and the full, unfiltered test set. Yet, in this test set,
-        # no filtering occured yet. Therefore we need to ensure proper filtering 
-
-
-
-    # TOMORROW ::::::
-    # TODO : add that removed imgs (based on the path) are also removed from the test set for the current run // or rather there is a run
-    # TODO : with all (even the actually filtered out ones) and one with the filtered to compare scores
-    # TODO : that way we have a cleaner comparison between different dataset filtering methods 
-    # TODO : need to fix that it accesses the folders now, but they are built based on the lastest run through create_dataset.py ...
-    # TODO : I think thats okay, jsut need to have it in mind
-    # TODO : then idea is that we train on more clean set (i.e. memory bank is created on cleaner set), but evaluate on the same set
-    # TODO : as before (when we trained on all data) to see if it improves 
 
     # Create a folder 'synthetic' in the current directory and clear it out if it already exists
     synthetic_dir = dataset_path / 'synthetic'
@@ -1074,12 +1065,14 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-    backbone = "mobilenet_v2" 
-  #  backbone = "wide_resnet50_2"
+   # backbone = "mobilenet_v2" 
+   # backbone = "wide_resnet50_2"
    # backbone = "dinov2_vitb14"
-    ad_layers = ["features.4", "features.7", "features.10"] 
-   # ad_layers = ["layer2", "layer3"]
-  #  ad_layers = [3,6] 
+    backbone = "dinov3_vitb16"
+   # ad_layers = ["features.4", "features.7", "features.10"] 
+   # ad_layers = ["features.10"] # SINBAD tests
+  #  ad_layers = ["layer1", "layer2", "layer3"]
+    ad_layers = [3,6,9] 
     save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}.pt"
 
     custom_weights_path = None
@@ -1098,8 +1091,8 @@ def main():
         shutil.rmtree(visual_test_dir)
     visual_test_dir.mkdir(parents=True, exist_ok=True)
 
-   # test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
-   # detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
+  #  test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool)
+  #  detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
 
 
 if __name__ == "__main__":

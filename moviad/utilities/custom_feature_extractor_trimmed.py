@@ -53,6 +53,12 @@ DINOV2_BACKBONES = (
     "dinov2_vitg14_reg",
 )
 
+DINOV3_BACKBONES = (
+    "dinov3_vits16",
+    "dinov3_vitb16",
+    "dinov3_vitl16",
+)
+
 
 
 
@@ -86,7 +92,7 @@ class CustomFeatureExtractor:
 
 
         # ¢heck for backbone support
-        if model_name not in OTHERS_BACKBONES + TORCH_BACKBONES + DINOV2_BACKBONES:
+        if model_name not in OTHERS_BACKBONES + TORCH_BACKBONES + DINOV2_BACKBONES + DINOV3_BACKBONES:
             raise NotImplementedError(
                 f"The backbone: {model_name} is not supported for feature extraction"
             )
@@ -105,6 +111,12 @@ class CustomFeatureExtractor:
         elif model_name in DINOV2_BACKBONES:
             self.model = torch.hub.load('facebookresearch/dinov2', model_name, pretrained=frozen)
             self.attached = False
+
+        elif model_name in DINOV3_BACKBONES:
+            repo_dir = 'dinov3'
+            weights_path = f'../../disk/pretrained_models/{model_name}_weights.pth'
+            self.model = torch.hub.load(repo_dir, model_name, source = 'local', weights = weights_path)
+            self.attached = False 
 
         else:
             # check for mcunet backbone
@@ -351,7 +363,7 @@ class CustomFeatureExtractor:
         elif "phinet" in self.model_name:
             layers = list(self.model._layers)[:max_idx]
         
-        elif "dinov2" in self.model_name:
+        elif "dino" in self.model_name:
             return
 
         # actually trim the model
@@ -361,7 +373,7 @@ class CustomFeatureExtractor:
         def hook(module, input, output):
             self.features.append(output)
 
-        if "dinov2" in self.model_name:
+        if "dino" in self.model_name:
             for idx in self.layers_idx:
                 self.model.blocks[int(idx)].register_forward_hook(hook)
             return
@@ -390,20 +402,26 @@ class CustomFeatureExtractor:
             self.features = []
             self.model(batch.to(self.device))
 
-            if "dinov2" in self.model_name:
+            if "dino" in self.model_name:
                 # Since dinov2 intermediate layers return (B, N_tokens, D), where B : batch_size, N_tokens : number of tokens, D : model dimension ,
                 # we need to reshape them. Each token represents a 14x14x3 (dino specific) patch (that was linearly projected to D dimension). 
                 # So we reshape the output to (B, D, 14, 14) to be consistent with the other backbones outputs.
 
-                patch_size = 14  # DINOv2 always uses 14x14 patches
+                if "dinov2" in self.model_name:
+                    patch_size = 14  # DINOv2 always uses 14x14 patches
+                elif "dinov3" in self.model_name:
+                    patch_size = 16  # DINOv3 always uses 16x16 patches
                 img_size = batch.shape[-1]
                 h = w = img_size // patch_size  # e.g. 224//14 = 16
                 reshaped = []
                 cls_tokens = []
                 for feat in self.features:
 
+                    if "dinov3" in self.model_name:
+                        feat = feat[0] # in dinov3 stored in a list for some reason
+
                     cls_token = feat[:, 0:1, :]  # CLS is always position 0
-                    if "reg" in self.model_name:
+                    if "reg" in self.model_name or "dinov3" in self.model_name: # Apparently dinov3 stores register tokens automatically (i.e. we have 201 tokens standard and since we have img size 224 patch size 16, that is 224/16 = 14, 14*14 = 196 + 1 CLS token + 4 register tokens = 201 tokens)
                         feat = feat[:, 5:, :]  # skip CLS + 4 registers
                     else:
                         feat = feat[:, 1:, :]  # skip CLS only

@@ -131,7 +131,7 @@ class PatchCore(nn.Module):
         #extract the features for the input tensor
         self.memory_bank.to(self.device)
         with torch.no_grad():
-            if "dinov2" in self.feature_extractor.model_name:
+            if "dino" in self.feature_extractor.model_name:
                 features, cls_tokens = self.feature_extractor(input_tensor.to(self.device))
             else:
                  features = self.feature_extractor(input_tensor.to(self.device))
@@ -144,7 +144,7 @@ class PatchCore(nn.Module):
 
     
         
-        if "dinov2" in self.feature_extractor.model_name:
+        if "dino" in self.feature_extractor.model_name:
             # Per-layer L2 normalization (StructCore protocol)
             features = [F.normalize(f, p=2, dim=1) for f in features]
             cls_tokens = [F.normalize(cls_token, p=2, dim=1) for cls_token in cls_tokens]
@@ -269,7 +269,7 @@ class PatchCore(nn.Module):
             
                 pred_scores = self.struct_core_instance.score(anomaly_maps, pred_scores)
             
-            if "dinov2" in self.feature_extractor.model_name:
+            if "dino" in self.feature_extractor.model_name:
                 output = (anomaly_maps, pred_scores, embedding, self.memory_bank, cls_tokens) 
             else:
                 output = (anomaly_maps, pred_scores, embedding, self.memory_bank, None)
