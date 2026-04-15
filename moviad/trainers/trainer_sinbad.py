@@ -17,12 +17,10 @@ from __future__ import annotations
 import torch
 import numpy as np
 from tqdm import tqdm
+import pickle
 
 from moviad.trainers.trainer import Trainer, TrainerResult
 
-# Adjust this import to your actual module path:
-# from moviad.models.sinbad.sinbad import SINBAD, CumulativeSetFeatures, MahalanobisScorer
-# For now, assuming sinbad.py is importable:
 
 SEED = 32
 import random
@@ -143,11 +141,12 @@ class TrainerSINBAD(Trainer):
         all_fg_concat = torch.cat(all_fg_patches, dim=1)  # [C, P_total]
 
         # Subsample if too many patches (>500k should be fine, but cap at 1M)
-        max_patches_for_fit = 1_000_000
-        if all_fg_concat.shape[1] > max_patches_for_fit:
-            perm = torch.randperm(all_fg_concat.shape[1])[:max_patches_for_fit]
-            all_fg_concat = all_fg_concat[:, perm]
-            print(f"  Subsampled to {max_patches_for_fit} patches for threshold fitting")
+        # TODO : see if it works without
+      #  max_patches_for_fit = 1_000_000
+       # if all_fg_concat.shape[1] > max_patches_for_fit:
+       #     perm = torch.randperm(all_fg_concat.shape[1])[:max_patches_for_fit]
+       #     all_fg_concat = all_fg_concat[:, perm]
+       #     print(f"  Subsampled to {max_patches_for_fit} patches for threshold fitting")
 
         # fit() expects [N, C, P] — wrap in batch dim
         set_extractor.fit(all_fg_concat.unsqueeze(0))
@@ -178,10 +177,21 @@ class TrainerSINBAD(Trainer):
               f"std: {train_scores.std():.4f}, max: {train_scores.max():.4f}")
 
         # ---- Step 5: Save if requested ----
-      #  if self.save_path:
-      #      state = self.model.state_dict_sinbad()
-      #      torch.save(state, self.save_path)
-      #      print(f"  Model saved to {self.save_path}")
+    
+        if self.save_path:
+            save_path_pkl = self.save_path.replace('.pt', '.pkl').replace('.pth', '.pkl')
+            if not save_path_pkl.endswith('.pkl'):
+                save_path_pkl = save_path_pkl + '.pkl'
+            
+            state = self.model.state_dict_sinbad()
+            with open(save_path_pkl, 'wb') as f:
+                pickle.dump(state, f)
+            
+            # Sanity check
+            with open(save_path_pkl, 'rb') as f:
+                state_check = pickle.load(f)
+            print(f"  Sanity check — n_channels: {state_check['n_channels']}, keys: {list(state_check.keys())}")
+            print(f"  Model saved to {save_path_pkl}")
 
 
         print("Starting Evaluation...")

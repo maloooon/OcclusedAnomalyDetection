@@ -10,9 +10,10 @@ from moviad.models.stfpm.stfpm import STFPM
 from moviad.utilities.evaluator import Evaluator
 from moviad.trainers.trainer import TrainerResult, Trainer
 
+
 SEED = 32
-import numpy as np
 import random
+import numpy as np
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -20,6 +21,7 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+from time import time
 
 class TrainerSTFPM(Trainer):
 
@@ -71,9 +73,12 @@ class TrainerSTFPM(Trainer):
 
             avg_batch_loss = 0
             #train the model
-            for batch in tqdm(self.train_dataloader):
 
+            for batch in tqdm(self.train_dataloader):
+                time_batch_start = time()
                 batch = batch.to(self.device)
+          
+                
                 teacher_features, student_features = self.model(batch)
 
                 for i in range(len(student_features)):
@@ -87,6 +92,7 @@ class TrainerSTFPM(Trainer):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
 
             avg_batch_loss /= len(self.train_dataloader)
             if self.logger:

@@ -55,6 +55,7 @@ DINOV2_BACKBONES = (
 
 DINOV3_BACKBONES = (
     "dinov3_vits16",
+    "dinov3_vits16plus",
     "dinov3_vitb16",
     "dinov3_vitl16",
 )

@@ -455,4 +455,39 @@ def save_anomaly_map(dirpath, anomaly_map, pred_score, filepath, x_type, mask):
     axes[2].axis('off')
 
     # Show the plot
-    plt.savefig(str(dirpath + f"/{x_type}_{filename}.jpg"))
+    plt.savefig(str(dirpath + f"/{x_type}_{pred_score:.4f}_{filename}"))
+
+
+
+def save_imgs(dirpath, pred_score, filepath, x_type, mask):
+    """
+    Same as save anomaly map, just without the anomaly map.
+    For models that do not produce an anomaly map, e.g. SINBAD
+    
+    Args:
+        dirpath     (str)       : Output directory path.
+        pred_score  (float)     : Predicted anomaly score.
+        filepath    (str)       : Path of the input image.
+        x_type      (str)       : Label string (e.g. "0_PRED_0", "1_PRED_1").
+        mask        (np.ndarray): Segmentation mask.
+    """
+    filename = os.path.basename(filepath)
+
+    original_image = cv.imread(filepath)
+    original_image = cv.resize(original_image, (224, 224))
+
+    fig, axes = plt.subplots(1, 2, figsize=(8, 5))
+
+    original_image = cv.cvtColor(original_image, cv.COLOR_BGR2RGB)
+
+    axes[0].imshow(original_image)
+    axes[0].set_title(f'Original Image {x_type}')
+    axes[0].axis('off')
+
+    axes[1].imshow(mask.squeeze(), cmap='gray')
+    axes[1].set_title(f'Mask | Score: {pred_score:.4f}')
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(str(dirpath + f"/{x_type}_{pred_score:.4f}_{filename}"))
+    plt.close()

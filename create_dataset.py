@@ -1360,12 +1360,12 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
 # unfiltered dataset. This split is the single source of truth.
 # ==============================================================================
 
-def data_split_non_anomalous(data_path_normal, data_path_anomalous, save_path):
+def data_split_non_anomalous(data_path_normal, data_path_anomalous, save_path, seed = 42):
     """
     Split non-anomalous samples into train/test, balanced against anomalous count.
-    Deterministic (seed=42). Saves indices AND paths.
+    Deterministic by seed.
     """
-    random.seed(42)
+    random.seed(seed) # For reproducibility
 
     splits_path = Path(save_path)
     splits_path.mkdir(parents=True, exist_ok=True)
@@ -1644,6 +1644,7 @@ def main():
     # --- Config ---
     IMG_SIZE = 256
     UNBLURRED = False
+    SEED = 42
  
     # CHANGE: These are now only used by apply_filters(), not by create_dataset_imgs()
     SIZE_FILTERING = True
@@ -1666,10 +1667,11 @@ def main():
  
     if filter_parts:
         filter_str = "filtered_" + "_and_".join(filter_parts)
+        filter_str += "_seed_" + str(SEED)
     else:
-        filter_str = "full_no_filters"
+        filter_str = "full_no_filters" + "_seed_" + str(SEED)
  
-    SAVE_PATH = f'../../disk/dataset_single_objects/GT/{filter_str}_{IMG_SIZE}'
+    SAVE_PATH = f'../../nvme1/dataset_single_objects/GT/{filter_str}_{IMG_SIZE}' # NOTE : disk normally
     PRED_MASKS_FILE = '../../disk/saved_masks/DINO_SAM_mobile/masks.pkl'
 
     # --- Load data (unchanged) ---
@@ -1723,7 +1725,8 @@ def main():
     data_split_non_anomalous(
         data_path_normal=f'{SAVE_PATH}/processed/normal/normal_samples.pkl',
         data_path_anomalous=f'{SAVE_PATH}/processed/anomalous/anomalous_samples.pkl',
-        save_path=f'{SAVE_PATH}/processed/splits'
+        save_path=f'{SAVE_PATH}/processed/splits',
+        seed = SEED
     )
 
     # --- Step 3 (NEW): Apply filters post-hoc if requested ---

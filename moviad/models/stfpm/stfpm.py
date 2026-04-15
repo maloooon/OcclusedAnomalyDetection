@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.filters import filter_holes_batched
+from time import time
 
 SEED = 32
 import random
@@ -61,12 +62,17 @@ class STFPM(torch.nn.Module):
 
         if self.training:
             teacher_features, student_features = None, None
+
+
+        
             with torch.no_grad():
                 teacher_features = self.teacher(batch)
             student_features = self.student(batch)
+           
+          
 
             
-            if len(teacher_features) == 2:
+            if "dino" in self.teacher.model_name:
                 # In case we use dinov2, also returns the cls tokens currently
                 teacher_features, teacher_cls_tokens = teacher_features
                 student_features, student_cls_tokens = student_features
@@ -77,7 +83,7 @@ class STFPM(torch.nn.Module):
             teacher_features = self.teacher(batch)
 
 
-            if len(teacher_features) == 2:
+            if "dino" in self.teacher.model_name:
                 # In case we use dinov2, also returns the cls tokens currently
                 teacher_features, teacher_cls_tokens = teacher_features
                 student_features, student_cls_tokens = student_features

@@ -18,7 +18,7 @@ from .product_quantizer import ProductQuantizer
 from ...models.patchcore.anomaly_map import AnomalyMapGenerator
 from ...utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.get_sizes import *
-
+from ...utilities.filters import filter_holes_batched
 
 SEED = 32
 import random
@@ -262,7 +262,7 @@ class PatchCore(nn.Module):
 
             if 'HOLE_DARKNESS' in self.filter_post:
                 thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-                anomaly_maps = filter_holes_batched(anomaly_maps, batch, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
+                anomaly_maps = filter_holes_batched(anomaly_maps, input_tensor, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
 
     
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':

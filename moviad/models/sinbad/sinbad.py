@@ -1,20 +1,9 @@
 """
-SINBAD: Set INspection Based Anomaly Detection
 
-Adapted from: https://github.com/NivC/SINBAD
-Paper: "Set Features for Fine-grained Anomaly Detection" (TMLR 2024)
-
-This implementation adapts SINBAD for single-class raspberry anomaly detection.
-It plugs into the MoViAD pipeline using the same CustomFeatureExtractor backbone,
-but replaces the patch-level memory bank + kNN + max-aggregation with a
-distributional (set-level) descriptor + Mahalanobis scoring.
 
 Key differences from the original SINBAD code:
 - No multi-crop ensemble (raspberries are centered & segmented)
-- Mask-aware: background patches are excluded before building histograms
-- No wandb hard dependency
-- Uses the same CustomFeatureExtractor interface as PatchCore
-- Single pyramid level per run (multi-level ensembling can be done externally)
+- Single pyramid level per run (multi-level ensembling can be done externally, right now NOT implemented)
 """
 
 from __future__ import annotations
@@ -96,14 +85,13 @@ class CumulativeSetFeatures:
         cdf = torch.zeros(N, self.n_projections, self.n_quantiles)
 
         for q in range(self.n_quantiles):
-            threshold = self.min_vals + (self.max_vals - self.min_vals) * (q + 1) / (self.n_quantiles + 1)
+            threshold = self.min_vals + (self.max_vals - self.min_vals) * (q + 1) / (self.n_quantiles + 1) # Calculates a threshold for EACH projection ! (and with e.g. 5 quantiles we then have 5 lists of len (n_projection), such that we have quantiles for each projection)
             # threshold: [n_proj] -> [1, n_proj, 1] for broadcasting
             # a < threshold: [N, n_proj, P] boolean -> mean over P gives CDF value
-            cdf[:, :, q] = (a < threshold.unsqueeze(0).unsqueeze(2)).float().mean(2)
+            cdf[:, :, q] = (a < threshold.unsqueeze(0).unsqueeze(2)).float().mean(2) # adds the fraction of values that fall in this current histogram "bin" (for each projection)
 
         cdf = cdf.reshape(N, -1).numpy()
         return cdf
-
 
 class MahalanobisScorer:
     """
@@ -133,6 +121,7 @@ class MahalanobisScorer:
         self.train_mean = None
 
     def fit(self, descriptors: np.ndarray):
+        # TODO : fix. Do with faiss as in original
         """
         Fit the scorer on training descriptors.
 
@@ -149,7 +138,8 @@ class MahalanobisScorer:
 
         if self.mode == 'knn':
             # Whiten training descriptors for L2-based kNN
-            self.train_descriptors_whitened = descriptors @ self.cov_inv
+            self.train_descriptors_whitened = descriptors @ self.cov_inv #descriptors.dot(self.cov_inv) #
+            
 
     def score(self, descriptors: np.ndarray) -> np.ndarray:
         """
@@ -169,23 +159,51 @@ class MahalanobisScorer:
             return scores
 
         elif self.mode == 'knn':
+            # TODO : fix. in OG done via faiss, see if we can also just implement faiss here to match original
             # Distance to nearest training sample in whitened space (like original SINBAD)
             whitened_test = descriptors @ self.cov_inv
             # Brute-force 1-NN in whitened space
             # For ~3000 train × ~1000 test × 5000 dims, this is manageable
             # If memory is an issue, batch this
+
+            # in OG K is still a parameter, but it is set to 1 (i.e. we just search the closest neighbour) (see Appendix in paper)
             scores = np.zeros(len(descriptors))
-            batch_size = 64
+            batch_size = 128
             for i in range(0, len(descriptors), batch_size):
-                batch = whitened_test[i:i + batch_size]
+                batch = whitened_test[i:i + batch_size] # Grab a batch of test descriptors
                 # [batch, D] vs [N_train, D] -> [batch, N_train]
                 dists = np.sum((batch[:, None, :] - self.train_descriptors_whitened[None, :, :]) ** 2, axis=2)
+                
                 scores[i:i + batch_size] = dists.min(axis=1)
             return scores
 
         else:
             raise ValueError(f"Unknown scoring mode: {self.mode}")
 
+
+'''
+class MahalanobisScorer:
+    # faiss not working??
+    def __init__(self, shrinkage: float = 0.1):
+        self.shrinkage = shrinkage
+        self.cov_inv = None
+
+    def fit(self, descriptors: np.ndarray):
+        cov = ShrunkCovariance(shrinkage=self.shrinkage).fit(descriptors).covariance_
+        try:
+            self.cov_inv = np.linalg.inv(cov)
+        except:
+            self.cov_inv = np.linalg.pinv(cov)
+
+        whitened = descriptors.dot(self.cov_inv)
+        self.index = faiss.IndexFlatL2(whitened.shape[1])
+        self.index.add(np.ascontiguousarray(whitened.astype('float32')))
+
+    def score(self, descriptors: np.ndarray) -> np.ndarray:
+        whitened = descriptors.dot(self.cov_inv)
+        D, I = self.index.search(np.ascontiguousarray(whitened.astype('float32')), 1)
+        return D[:, 0]
+'''
 
 class SINBAD(nn.Module):
     """
@@ -247,7 +265,7 @@ class SINBAD(nn.Module):
 
         # Extract features
         with torch.no_grad():
-            if "dinov2" in self.feature_extractor.model_name:
+            if "dino" in self.feature_extractor.model_name:
                 features, cls_tokens = self.feature_extractor(input_tensor.to(self.device))
             else:
                 features = self.feature_extractor(input_tensor.to(self.device))
@@ -256,11 +274,12 @@ class SINBAD(nn.Module):
         if isinstance(features, dict):
             features = list(features.values())
 
-        if "dinov2" in self.feature_extractor.model_name:
+        if "dino" in self.feature_extractor.model_name:
             # Per-layer L2 normalization
             features = [F.normalize(f, p=2, dim=1) for f in features]
             embedding = torch.cat(features, dim=1)  # [B, C_total, H, W]
         else:
+            # TODO : Possible that this problematic, i.e. try with how they did it in the paper 
             # CNN path: resize to common spatial dims
             H_max = max(f.shape[2] for f in features)
             W_max = max(f.shape[3] for f in features)
@@ -276,18 +295,6 @@ class SINBAD(nn.Module):
             # Also return mask info so trainer can filter
             patch_features = embedding.reshape(B, C, H * W).cpu()
 
-            '''
-            if mask is not None:
-                # Build patch-level mask
-                if mask.ndim == 3:
-                    mask = mask.unsqueeze(1)
-                mask_resized = F.interpolate(
-                    mask.float(), size=(H, W), mode="nearest"
-                )
-                patch_mask = (mask_resized > 0.5).reshape(B, H * W).cpu()  # [B, P] bool
-                return patch_features, patch_mask
-            else:
-            '''
             return patch_features, None
 
         else:
@@ -297,21 +304,6 @@ class SINBAD(nn.Module):
 
             patch_features = embedding.reshape(B, C, H * W).cpu()
 
-            '''
-            # Apply mask if available
-            if mask is not None:
-                if mask.ndim == 3:
-                    mask = mask.unsqueeze(1)
-                mask_resized = F.interpolate(
-                    mask.float(), size=(H, W), mode="nearest"
-                )
-                patch_mask = (mask_resized > 0.5).reshape(B, H * W).cpu() # [B, P]
-
-                # For each image, keep only foreground patches
-                # Pad to max foreground count for batched conv1d
-                descriptors = self._compute_masked_descriptors(patch_features, patch_mask)
-            else:
-            '''
             descriptors = self.set_feature_extractor.forward(patch_features)
 
             # Score
