@@ -36,6 +36,8 @@ from torchvision.transforms.functional import InterpolationMode
 
 from synthetic_occlusion import SyntheticOcclusion
 
+from time import time
+
 
 from create_dataset import _center_object
 
@@ -69,8 +71,6 @@ from ss_cutout import CutoutReconstructionModel, apply_cutout, train_cutout_reco
 
 
 class SingleRaspberryDataset(Dataset):
-    # CHANGE: removed filter_test_bool from the signature entirely.
-    # If you have call sites passing filter_test_bool=..., just remove that argument.
     def __init__(self, dataset_path: str, split=None, synthetic_augmentation=False, synthetic_augmentation_mode = 'replace',
                  AD_model=None, backbone_model=None, struct_core_collection_bool=False,
                  pass_og_bool=True):
@@ -88,9 +88,6 @@ class SingleRaspberryDataset(Dataset):
         self.struct_core_collection_bool = struct_core_collection_bool
         self.pass_og_bool = pass_og_bool
  
-        # CHANGE: Removed these — no longer scanning external directories at runtime
-        # self.removed_raspberries_darkness_path = Path('../../disk/removed_dark_raspberries')
-        # self.removed_raspberries_size_path = Path('../../disk/removed_size_raspberries')
  
         if AD_model == 'ganomaly':
             transform_sizes = 256
@@ -166,11 +163,34 @@ class SingleRaspberryDataset(Dataset):
                     if new_img is None:
                         continue
 
-                    # --- same post-processing as in __getitem__ ---
                     new_img = np.asarray(new_img, dtype=np.uint8)
                     new_img, new_mask = self.synthetic_occlusion.clean_mask_and_img(new_img, new_mask)
                     new_mask = np.asarray(new_mask, dtype=bool)
+
+                    new_mask_unfiltered = item['mask_unfiltered'] & ~(item['mask'] & ~new_mask)
+
+                    new_mask_pre_center = new_mask.copy()
                     new_img, new_mask = _center_object(new_img, new_mask)
+
+                    coords = np.argwhere(new_mask_pre_center)
+                    if len(coords) > 0:
+                        y_min, x_min = coords.min(axis=0)
+                        y_max, x_max = coords.max(axis=0)
+                        img_h, img_w = new_mask_pre_center.shape
+                        obj_h, obj_w = y_max - y_min + 1, x_max - x_min + 1
+                        paste_y = img_h // 2 - obj_h // 2
+                        paste_x = img_w // 2 - obj_w // 2
+                        src_y_start = max(0, -paste_y)
+                        src_x_start = max(0, -paste_x)
+                        src_y_end   = min(obj_h, img_h - paste_y)
+                        src_x_end   = min(obj_w, img_w - paste_x)
+                        dst_y_start, dst_x_start = max(0, paste_y), max(0, paste_x)
+                        dst_y_end = dst_y_start + (src_y_end - src_y_start)
+                        dst_x_end = dst_x_start + (src_x_end - src_x_start)
+                        centered_unfiltered = np.zeros_like(new_mask_unfiltered)
+                        centered_unfiltered[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = \
+                            new_mask_unfiltered[y_min:y_max+1, x_min:x_max+1][src_y_start:src_y_end, src_x_start:src_x_end]
+                        new_mask_unfiltered = centered_unfiltered
 
                     new_depth = item['depth'].copy()
                     new_depth[~new_mask] = 0
@@ -180,6 +200,7 @@ class SingleRaspberryDataset(Dataset):
                         'img_path': item['img_path'],  # or mark as synthetic if you want
                         'grade': grade,
                         'mask': new_mask,
+                        'mask_unfiltered': new_mask_unfiltered,
                         'depth': new_depth,
                         'image': new_img
                     }
@@ -188,12 +209,16 @@ class SingleRaspberryDataset(Dataset):
 
             # extend dataset
             self.data = self.data + augmented_data
+
+
  
         self.img_paths = [item['img_path'] for item in self.data]
         self.grades = [item['grade'] for item in self.data]
         self.masks = [item['mask'] for item in self.data]
         self.depths = [item['depth'] for item in self.data]
         self.img_arrays = [item['image'] for item in self.data]
+        self.masks_unfiltered = [item['mask_unfiltered'] for item in self.data]
+
  
  
     def __len__(self):
@@ -227,16 +252,43 @@ class SingleRaspberryDataset(Dataset):
                 new_img = np.asarray(new_img, dtype=np.uint8)
                 new_img, new_mask = self.synthetic_occlusion.clean_mask_and_img(new_img, new_mask)
                 new_mask = np.asarray(new_mask, dtype=bool)
+
+                # Compute unfiltered mask before centering:
+                # remove only the pixels that occlusion took from the filtered mask
+                new_mask_unfiltered = self.untouched_masks[idx] & ~(self.masks[idx] & ~new_mask)
+
+                # Save bbox reference from new_mask before centering, then center img+mask
+                new_mask_pre_center = new_mask.copy()
                 new_img, new_mask = _center_object(new_img, new_mask)
- 
+
+                # Apply the identical centering transform to new_mask_unfiltered
+                coords = np.argwhere(new_mask_pre_center)
+                if len(coords) > 0:
+                    y_min, x_min = coords.min(axis=0)
+                    y_max, x_max = coords.max(axis=0)
+                    img_h, img_w = new_mask_pre_center.shape
+                    obj_h, obj_w = y_max - y_min + 1, x_max - x_min + 1
+                    paste_y = img_h // 2 - obj_h // 2
+                    paste_x = img_w // 2 - obj_w // 2
+                    src_y_start = max(0, -paste_y)
+                    src_x_start = max(0, -paste_x)
+                    src_y_end   = min(obj_h, img_h - paste_y)
+                    src_x_end   = min(obj_w, img_w - paste_x)
+                    dst_y_start, dst_x_start = max(0, paste_y), max(0, paste_x)
+                    dst_y_end = dst_y_start + (src_y_end - src_y_start)
+                    dst_x_end = dst_x_start + (src_x_end - src_x_start)
+                    centered_unfiltered = np.zeros_like(new_mask_unfiltered)
+                    centered_unfiltered[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = \
+                        new_mask_unfiltered[y_min:y_max+1, x_min:x_max+1][src_y_start:src_y_end, src_x_start:src_x_end]
+                    new_mask_unfiltered = centered_unfiltered
 
                 # Saving the image is nice for visualization purposes, but obviously a bottleneck during training loop..
                # synthetic_img_path = Path(self.dataset_path) / 'synthetic' / f'synthetic_{Path(self.img_paths[idx]).stem}.png'
-              
+
                 img = Image.fromarray(new_img, 'RGB')
                # img.save(synthetic_img_path)
                 img_array = np.asarray(img, dtype=np.uint8)
- 
+
                 og_img = img_array.copy()
                 mask = new_mask
                 og_mask = mask.copy()
@@ -244,6 +296,7 @@ class SingleRaspberryDataset(Dataset):
                 depth[~mask] = 0
                 og_depth = depth.copy()
                 mask = Image.fromarray(mask.astype(np.uint8) * 255)
+                mask_unfiltered = Image.fromarray(new_mask_unfiltered.astype(np.uint8) * 255)
  
         if not synthetic_added:
             #img_file = self.img_paths[idx]
@@ -251,14 +304,17 @@ class SingleRaspberryDataset(Dataset):
             img = Image.fromarray(self.img_arrays[idx])
             og_img = self.img_arrays[idx].copy()
             mask = self.masks[idx]
+            mask_unfiltered = self.masks_unfiltered[idx]
             og_mask = mask.copy()
             mask = Image.fromarray(mask.astype(np.uint8) * 255)
+            mask_unfiltered = Image.fromarray(mask_unfiltered.astype(np.uint8) * 255)
             depth = self.depths[idx]
             og_depth = depth.copy()
  
         img = self.transform_img(img)
         mask = self.transform_mask(mask)
- 
+        mask_unfiltered = self.transform_mask(mask_unfiltered)
+
         if self.split == 'test':
             img_path = self.img_paths[idx]
             grade = self.grades[idx]
@@ -275,9 +331,9 @@ class SingleRaspberryDataset(Dataset):
             if len(mask.shape) == 2:
                 mask = mask.unsqueeze(0)
             if self.pass_og_bool:
-                return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, og_img, og_mask, og_depth
+                return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, mask_unfiltered, og_img, og_mask, og_depth
             else:
-                return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, img, img, img
+                return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, mask_unfiltered, img, img, img # last 3 do not matter
         else:
             if self.struct_core_collection_bool:
                 return img, mask
@@ -332,7 +388,7 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
     del model, optimizer, train_dataloader, train_dataset
     torch.cuda.empty_cache()
 
-def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace'):
+def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, cls_token_viz_bool = False):
 
     mode = mode.lower()
     # initialize the feature extractor
@@ -356,11 +412,11 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     if max_dataset_size is not None:
         train_dataset = torch.utils.data.Subset(train_dataset, range(max_dataset_size))
     
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=8, shuffle=True)
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
-    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) # filter_test_bool = filter_test_bool, 
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) 
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
@@ -374,16 +430,23 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     # TODO : change if len(2) for dino to backbone.model_name  because else it messes up (i.e. STFPM fucked up with len(2) ...)
     # NOTE : Ganomaly & supersimplenet & STFPM have no device, therefore also run on cuda:0 ...
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500)
+        # NOTE : CLS TOKEN BOOL ACTIVATED !
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool) 
     elif mode == 'cfa':
-        model = CFA(feature_extractor, backbone, device)
-        model.initialize_memory_bank(train_dataloader)
+        model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+    elif mode == 'stfpm':
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0)
+  #  if mode == 'patchcore':
+   #     model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, cls_token_scoring_bool = False) # NOTE : adjust to keep testing
+    #elif mode == 'cfa':
+    #    model = CFA(feature_extractor, backbone, device)
+    #    model.initialize_memory_bank(train_dataloader)
     elif mode == 'fastflow':
         model = create_fastflow((224,224), backbone, device)
     elif mode == 'rd4ad':
         model = RD4AD(backbone, device, input_size = (224,224))
-    elif mode == 'stfpm':
-        model = STFPM(teacher, student)
+    #elif mode == 'stfpm':
+    #    model = STFPM(teacher, student)
     elif mode == 'padim':
         diagonal_convergence = False
         model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers)
@@ -433,7 +496,10 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     if save_path:
 
         # Can save at the very end since we do not have typical epoch training (i.e. do not need to save best results during training, just the one result at the end)
-        if mode == 'patchcore' or mode == 'padim':
+        if mode == 'patchcore':
+            print("Saving model ...")
+            model.save_model(save_path)
+        if mode == 'padim':
             print("Saving model ...")
             torch.save(model.state_dict(), save_path)
 
@@ -536,7 +602,7 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
 
     return struct_core
 
-def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, filter_test_bool = False, pass_og_bool = False, custom_weights_path = None):
+def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, pass_og_bool = False, custom_weights_path = None, cls_token_viz_bool = False):
     
 
     
@@ -556,7 +622,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
-    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) # filter_test_bool = filter_test_bool
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) 
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
@@ -570,13 +636,15 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
         # occluded raspberry is an anomaly), we set some thickness to the contour and then remove this area. Obviously we lose some raspberry by this
         # but the anomalies seem not be directly at the border area, so we lose little.
 
+
+    model_load_start_time = time()
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post)
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool)
     elif mode == 'cfa':
         model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0, protrusion_damping_gamma = 0.5)
     elif mode == 'rd4ad':
         model = RD4AD(backbone, device, input_size = (224,224), struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'fastflow':
@@ -594,6 +662,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     
 
     if mode == 'patchcore' or mode == 'cfa':
+        print(model_checkpoint_path)
         model.load_model(model_checkpoint_path)
     else:
         if mode == 'stfpm':
@@ -615,6 +684,8 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
             model.load_state_dict(
             torch.load(model_checkpoint_path, map_location=device), strict=False)
 
+    model_load_end_time = time()
+    print(f"Model loading time: {model_load_end_time - model_load_start_time:.2f} seconds")
 
     # length of state dict
    # state_dict = torch.load(model_checkpoint_path, map_location=device)
@@ -630,6 +701,8 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     evaluator = Evaluator(test_dataloader, device)
     metrics = evaluator.evaluate(model)
 
+
+
     print("Evaluation performances:")
     print(f"""
     img_roc: {metrics['img_roc_auc']}
@@ -642,7 +715,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 1571021.4
+    opt_threshold = 0.34043863
 
 
     # chek for the visual test
@@ -656,13 +729,13 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
         pred_scores_per_grade = [[] for _ in range(5)]
         mask_size_wrong_predictions = []
         mask_size_correct_predictions = []
-        for images, labels, masks, paths, full_mask, actual_grade, og_img, og_mask, og_depth in tqdm(iter(test_dataloader)):
+        for images, labels, masks, paths, full_mask, actual_grade, mask_unfiltered, og_img, og_mask, og_depth in tqdm(iter(test_dataloader)):
             if mode == 'patchcore':
-                anomaly_maps, pred_scores, _ , _, cls_tokens = model((images.to(device), full_mask.to(device), og_img.to(device), og_mask.to(device), og_depth.to(device)))
+                anomaly_maps, pred_scores, _ , _, cls_tokens = model((images.to(device), mask_unfiltered.to(device), full_mask.to(device), og_img.to(device), og_mask.to(device), og_depth.to(device)))
             elif mode == 'stfpm' or mode == 'cfa' or mode == 'rd4ad':
-                anomaly_maps, pred_scores = model((images.to(device), full_mask.to(device), og_img.to(device), og_mask.to(device), og_depth.to(device)))
+                anomaly_maps, pred_scores = model((images.to(device), full_mask.to(device), mask_unfiltered.to(device), og_img.to(device), og_mask.to(device), og_depth.to(device)))
             elif mode == 'sinbad':
-                output = model((images.to(device), full_mask.to(device), og_img.to(device), og_mask.to(device), og_depth.to(device)))
+                output = model((images.to(device), full_mask.to(device), mask_unfiltered.to(device), og_img.to(device), og_mask.to(device), og_depth.to(device)))
                 anomaly_maps = None
                 pred_scores = output[0]
             else:
@@ -779,17 +852,18 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
 def detailed_eval(data_path):
     """
     Evaluate predictions from filenames in data_path.
-    Filename format: {actual}_PRED_{predicted}_img{X}_obj{Y}_grade{Z}.png.jpg
+    Filename format: {actual}_PRED_{predicted}_img{X}_obj{Y}_grade{Z}.png
     """
 
     results = []
     for fname in os.listdir(data_path):
-        if not fname.endswith('.jpg'):
+        if not fname.startswith('1') and not fname.startswith('0'):
             continue
+        
         parts = fname.split('_')
         actual = int(parts[0])
         predicted = int(parts[2])
-        grade = int(parts[-1].replace('grade', '').replace('.png.jpg', ''))
+        grade = int(parts[-1].replace('grade', '').replace('.png', ''))
         results.append({'file': fname, 'actual': actual, 'predicted': predicted, 'grade': grade})
 
     actuals = [r['actual'] for r in results]
@@ -829,26 +903,20 @@ def saving_criteria(best_metrics, new_metrics):
 
 def main():
 
-    # TODO : try cfa, first do l2 and all that also in cfa code! for dinov2 ; doesnt work trivially ...
+    # TODO : best score I think was post hole filtering ,not pre, with stfpm augment, filtere darkness, filter post hole darkness ; main problem being non-anomalies that were caught bc of holes!
 
-    # TODO : use the cls token from ViT (dinov2) as a global anomaly score ? ; dont seem to work as well, see plots..
-
-    # TODO : dinov2 only on the masked area of the object, i.e. we ignore background ; but same issue in MVtec etc. dont think it will change a lot ...
-
-    # TODO : ask about self-supervised pre-training based on dataset : we only have roughly 4800 non-anomalous imgs, arent these too little for good pre-training/transfer learning ? i.e .compared to amount that these models were trained on
-
-    # TODO : try dinomaly in anomalib ; even though model implemented for multi-class, maybe it can help since its ViT based and more global ?
-
-
-
-    # TODO : try hole filters 
+    # TODO : NOTE THAT POST FILTERS are NOT in the training loop, i.e. results based on FILTER_POST we ONLY get by running test_model !!! ; only for patchcore, stfpm now in train loop
+    # TODO : fix yolo dataset creation ...
 
     MODEL_MODE = 'stfpm' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
     SYN_AUG_BOOL = True # whether to use synthetic occlusions during training
-    SYN_AUG_MODE = 'replace' # 'replace' or 'augment'
+    SYN_AUG_MODE = 'augment' # 'replace' or 'augment'
+
+    # NOTE : this only works with patchcore + dinov2 
+    CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    FILTER_PRE = 'FULL_NO_FILTERS_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    FILTER_PRE = 'FILTERED_DARKNESS_80_0.3_AND_FILTER_HOLES_SEED_42_GT_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
     # Get the last element in filter_pre
     last_element = FILTER_PRE.split('_')[-1]
@@ -857,11 +925,11 @@ def main():
     else:
         pass_og_bool = False
 
-    FILTER_POST = 'NONE' # HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details
+    FILTER_POST = 'NONE' # HOLE_DARKNESS_15_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details
     SCORING = 'MAXMEAN_1' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
 
 
-    dataset_path = Path('../../disk/dataset_single_objects/GT/') 
+    dataset_path = Path('../../nvme1/dataset_single_objects/GT/') 
     target_path = FILTER_PRE.lower()
 
 
@@ -872,7 +940,7 @@ def main():
   #  synthetic_dir.mkdir(parents=True, exist_ok=True)
 
 
-    # TODO : run sinbad with wrn-50-2 just layer 2 and see if dimensions are correct !
+
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
@@ -880,13 +948,16 @@ def main():
    # backbone = "dinov2_vitb14"
    # backbone = 'mobilenet_v2'
    # backbone = "dinov3_vitb16"
-   # ad_layers = ["features.4", "features.7", "features.10"] 
+  #  ad_layers = ["features.4", "features.7", "features.10"] 
    # ad_layers = ["layer4"]
   #  ad_layers = ["features.10"] # SINBAD tests
     ad_layers = ["layer2", "layer3"]
-   # ad_layers = [3,6]
+    
+   # ad_layers = [3,6] 
+  #  if CLS_TOKEN_VIZ_BOOL:
+  #      ad_layers.append(11) # extracting also CLS token for visualizations
     end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
-    save_path = f"../../nvme1/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}"
+    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}"
 
     custom_weights_path = None
    # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout_{'_'.join(ad_layers)}.pt"
@@ -895,18 +966,22 @@ def main():
 
    # pretrain_backbone_cutout(dataset_path, device, backbone, save_path = custom_weights_path, unfreeze_from=4, epochs=50, lr=1e-4, batch_size=32, n_holes=1, hole_size_range=(32, 64), target_path = target_path)
 
-    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE)
+    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
 
     # Check if visual test path exists and clear it out if it already exists
-    visual_test_path = f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/" # NOTE : disk normally
+    if SYN_AUG_BOOL:
+        visual_test_path = f"../../nvme1/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{SYN_AUG_MODE}/" # NOTE : disk normally
+    else:
+        visual_test_path = f"../../nvme1/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/" # NOTE : disk normally
     visual_test_dir = Path(visual_test_path)
     if visual_test_dir.exists():
         shutil.rmtree(visual_test_dir)
     visual_test_dir.mkdir(parents=True, exist_ok=True)
 
 
-   # test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, filter_test_bool = FILTER_TEST_BOOL, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path)
-  #  detailed_eval(f"../../disk/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/")
+    
+    test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
+    detailed_eval(visual_test_path)
 
 
 if __name__ == "__main__":

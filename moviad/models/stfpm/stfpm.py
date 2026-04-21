@@ -6,7 +6,7 @@ import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
-from ...utilities.filters import filter_holes_batched
+from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions
 from time import time
 
 SEED = 32
@@ -35,7 +35,9 @@ class STFPM(torch.nn.Module):
         struct_core_instance = None,
         scoring_mode = 'MAXMEAN_1',
         filter_post = 'NONE',
-        mask_border_filter_thickness = 0
+        mask_border_filter_thickness = 0,
+        protrusion_damping_radius: int = 0,
+        protrusion_damping_gamma: float = 1,
     ):
         super().__init__()
         self.teacher = teacher
@@ -44,21 +46,20 @@ class STFPM(torch.nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.protrusion_damping_radius = protrusion_damping_radius
+        self.protrusion_damping_gamma = protrusion_damping_gamma
 
     def forward(self, batch: torch.Tensor):
 
 
 
         if (isinstance(batch, tuple)):
-            if len(batch) == 5:
-                batch, mask, batch_og, mask_og, depth_og = batch
+            if len(batch) == 6:
+                batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch # NOTE : added mask_unfiltered
             if len(batch) == 2:
                 batch, mask = batch
+                batch_og, mask_og, depth_og = None, None, None
                
-
-        
-    
-            
 
         if self.training:
             teacher_features, student_features = None, None
@@ -88,9 +89,10 @@ class STFPM(torch.nn.Module):
                 teacher_features, teacher_cls_tokens = teacher_features
                 student_features, student_cls_tokens = student_features
 
+            
 
             return self.post_process(
-                teacher_features, student_features, batch.shape[2:], batch, batch_og, mask_og, depth_og, mask, border_thickness = self.mask_border_filter_thickness
+                teacher_features, student_features, batch.shape[2:], batch, batch_og, mask_og, depth_og, mask, border_thickness = self.mask_border_filter_thickness, mask_unfiltered = mask_unfiltered
             )
 
     def __call__(self, batch: torch.Tensor):
@@ -179,7 +181,7 @@ class STFPM(torch.nn.Module):
 
 
 
-    def post_process(self, t_feat, s_feat, output_shape, batch, batch_og, mask_og, depth_og, mask, border_thickness = 5) -> torch.Tensor:
+    def post_process(self, t_feat, s_feat, output_shape, batch, batch_og, mask_og, depth_og, mask, border_thickness = 5, mask_unfiltered = None) -> torch.Tensor:
 
         """
         This method actually produces the anomaly maps for evalution purposes
@@ -210,9 +212,6 @@ class STFPM(torch.nn.Module):
             )
             # aggregate score map by element-wise product
             score_maps = score_maps * sm
-
-        # TODO : consider that mask, batch_og etc. is not given in trainloader, so StructCore cant work with it as of now ...
-        # TODO : possibly need to add
 
         # --- Apply raspberry mask with contour-based border exclusion ---
         
@@ -254,13 +253,33 @@ class STFPM(torch.nn.Module):
             effective_mask = (effective_mask > 0).float()
 
             # Zero out everything outside the effective mask
-            score_maps = score_maps * effective_mask
+           # score_maps = score_maps * effective_mask
+     
+       # if 'HOLE_DARKNESS' in self.filter_post:
+       #     thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+        #    hole_mask_patch = compute_hole_mask_patchgrid(
+        #        batch_og, mask_og, depth_og,
+        #        patch_h=batch.shape[2], patch_w=batch.shape[3],
+        #        depth_threshold_percentile=int(thresh_depth),
+        #        brightness_threshold_percentile=int(thresh_dark),
+        #    ).to(effective_mask.device)
+        #    effective_mask = effective_mask * (1.0 - hole_mask_patch)
 
+       # effective_mask_flat = effective_mask.reshape(batch_size, -1)
+        score_maps = score_maps * effective_mask
+
+
+        if self.protrusion_damping_radius > 0 and mask_unfiltered is not None:
+            score_maps = suppress_removed_mask_regions(
+                score_maps, mask, mask_unfiltered,
+                influence_radius=self.protrusion_damping_radius,
+                gamma=self.protrusion_damping_gamma,
+            )
 
         # Filter holes before computing anomaly scores
-        if 'HOLE_DARKNESS' in self.filter_post:
-            thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-            score_maps = filter_holes_batched(score_maps, batch, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
+      #  if 'HOLE_DARKNESS' in self.filter_post:
+      #      thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+       #     score_maps = filter_holes_batched(score_maps, batch, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
 
         # Compute per-image anomaly score only over valid regions
         flat = score_maps.view(score_maps.size(0), -1)
@@ -269,6 +288,8 @@ class STFPM(torch.nn.Module):
 
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
             anomaly_scores = self.struct_core_instance.score(score_maps, anomaly_scores)
+
+
 
         else:
             k = float(self.scoring_mode.split('_')[-1])

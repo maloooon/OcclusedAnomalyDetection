@@ -211,7 +211,8 @@ def main():
 
     # Visualize a random sample from the training set
     sample = ds['train'][3] # 3
-    print(sample['image'])
+  #  print(sample['image'])
+    print(sample['image'].size)
     #visualize_sample(sample, show_segmentation_mask=False, show_classes=False, debug=True)
   #  save_all_imgs(ds)
 

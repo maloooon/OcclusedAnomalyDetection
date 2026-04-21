@@ -10,6 +10,7 @@ from pathlib import Path
 import pickle
 import shutil
 from ultralytics import YOLO
+from SAM_segmentation import store_masks
 
 
 def setup_yolo_dataset_structure_extended(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, N_VAL_SAMPLES):
@@ -163,7 +164,48 @@ def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_label
         label_file.write_text("\n".join(lines))
 
 
+def run_yolo_and_store_masks(model, filepath, device=2):
 
+    masks_list = []
+    xyn_list = []
+    conf_scores_list = []
+    sample_imgs = []
+    img_ids_list = []
+
+
+    # Get raspberry dataset
+    ds = load_dataset("FBK-TeV/RaspGrade")
+
+    full_data = list(ds['train']) + list(ds['valid'])
+
+
+    train_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/train").glob("*.png")))
+    val_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/val").glob("*.png")))
+
+    all_img_paths = train_img_paths + val_img_paths
+
+    for img_id, sample_path in enumerate(all_img_paths):
+        img = full_data[img_id]['image']
+        idx = full_data[img_id]['image_id']
+        
+  
+        results = model.predict(sample_path, device=device, verbose=False)
+
+        if results[0].masks is None:
+            # No detections: store empty arrays
+            masks_list.append(np.zeros((0, img.size[1], img.size[0]), dtype=bool))
+            xyn_list.append([])
+            conf_scores_list.append(np.array([]))
+        else:
+            masks_list.append(results[0].masks.data.cpu().numpy().astype(bool))
+            xyn_list.append(results[0].masks.xyn)
+            conf_scores_list.append(results[0].boxes.conf.cpu().numpy())
+
+        
+        sample_imgs.append(img)
+        img_ids_list.append(idx)
+
+    store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list, sample_imgs, filepath=filepath)
 
 
 def main():
@@ -175,8 +217,8 @@ def main():
     # Note that we will take the N_TRAIN_SAMPLES from our large model (e.g. SAM3),
     # but the N_VAL_SAMPLES from the original GT.
     N_TRAIN_SAMPLES = 160
-    N_VAL_SAMPLES = 20
-    N_TEST_SAMPLES = 20
+    N_VAL_SAMPLES = 40
+  #  N_TEST_SAMPLES = 20
 
     # Load GT masks for evaluation later on
     val_data = list(ds['valid'])
@@ -191,7 +233,7 @@ def main():
     val_labels = [[label[1:] for label in sample_labels] for sample_labels in val_labels]
 
     ## Load predicted masks
-    PRED_MASKS_FILE = '../../disk/saved_masks/SAM3/masks.pkl'
+    PRED_MASKS_FILE = '../../disk/saved_masks/sam3/masks.pkl'
     with open(PRED_MASKS_FILE, 'rb') as f:
         pred_data = pickle.load(f)
 
@@ -204,7 +246,9 @@ def main():
     all_pred_ids = [img_id for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
     all_pred_masks = [masks_and_xyn_and_imgs[0] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
     all_pred_xyn = [masks_and_xyn_and_imgs[1] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
-    all_imgs = [masks_and_xyn_and_imgs[2] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
+    all_conf_scores = [masks_and_xyn_and_imgs[2] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
+    all_imgs = [masks_and_xyn_and_imgs[3] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
+   # all_imgs = [masks_and_xyn_and_imgs[2] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
 
 
    # setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES)
@@ -213,29 +257,31 @@ def main():
 
 
     # Load a model
-  #  model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
+   # model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
     # Train the model
-  #  results = model.train(data="../../disk/YOLO_dataset_extended/RaspGrade-seg.yaml", epochs=100, imgsz=640, name = "yolo26n-seg-pseudo-labels-extended", device = 2)
+  #  results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz=[1280,800], name = "yolo26n-seg-pseudo-labels", device = 2)
 
     # Load trained model
-    model = YOLO("/home/marlon_helbing/MasterThesis/OcclusedAnomalyDetection/runs/segment/yolo26n-seg-pseudo-labels/weights/best.pt")
-   # metrics = model.val(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", device = 'cpu')
+    model = YOLO("../../disk/pretrained_models/yolo26n-seg-pseudo-labels-fullsize-best.pt")
+   # metrics = model.val(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", device = 2)
    # print(metrics.seg.f1)
+
+    run_yolo_and_store_masks(model, filepath="../../disk/saved_masks/yolo_fullsize", device=2)
 
 
     # Get inference time by evaluating on 5 random samples in /home/marlon_helbing/disk/YOLO_dataset/images/val
 
-    import time 
-    val_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/val").glob("*.png")))
-    sample_paths = np.random.choice(val_img_paths, size=5, replace=False)
+   # import time 
+   # val_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/val").glob("*.png")))
+   # sample_paths = np.random.choice(val_img_paths, size=5, replace=False)
     
-    for i, img_path in enumerate(sample_paths):
-        if i == 1:  # Skip the first one to avoid including any potential model loading time
-            start_time = time.time()
-        model.predict(img_path, device = 2)
-    end_time = time.time()
-    avg_inference_time = (end_time - start_time) / (len(sample_paths) -1)
-    print(f"Average inference time on GPU for 5 samples: {avg_inference_time:.4f} seconds")
+   # for i, img_path in enumerate(sample_paths):
+   #     if i == 1:  # Skip the first one to avoid including any potential model loading time
+   #         start_time = time.time()
+   #     model.predict(img_path, device = 2)
+   # end_time = time.time()
+   # avg_inference_time = (end_time - start_time) / (len(sample_paths) -1)
+   # print(f"Average inference time on GPU for 5 samples: {avg_inference_time:.4f} seconds")
          
 
 

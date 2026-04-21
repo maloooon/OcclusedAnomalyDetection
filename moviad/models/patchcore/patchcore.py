@@ -18,7 +18,7 @@ from .product_quantizer import ProductQuantizer
 from ...models.patchcore.anomaly_map import AnomalyMapGenerator
 from ...utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.get_sizes import *
-from ...utilities.filters import filter_holes_batched
+from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid
 
 SEED = 32
 import random
@@ -43,7 +43,8 @@ class PatchCore(nn.Module):
         struct_core_instance = None,
         scoring_mode = 'MAXMEAN_1',
         mask_border_filter_thickness = 0,
-        filter_post = 'NONE'
+        filter_post = 'NONE',
+        cls_token_viz_bool = False
 
     ) -> None:
 
@@ -66,6 +67,11 @@ class PatchCore(nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+
+
+        self.cls_token_viz_bool = cls_token_viz_bool
+        self.cls_memory_bank: Tensor | None = None
+      #  self.cls_alpha: float = 1
 
 
         self.feature_extractor = feature_extractor
@@ -110,7 +116,7 @@ class PatchCore(nn.Module):
                 anomaly map and anomaly score for testing.
         """
     
-        # NOTE : clean up
+    
         if isinstance(input_tensor, tuple):
             if len(input_tensor) == 2:
                 # This is the case for struct core collection.
@@ -119,6 +125,7 @@ class PatchCore(nn.Module):
                 # We need the mask such that we can collect the descriptor values
                 # based on only the raspberry mask area (i.e. we do not care for the black background)
                 input_tensor, mask = input_tensor
+                batch_og, masK_og, depth_og = None
             if len(input_tensor) == 5:
                 # For evaluation, we need the mask for only looking at the raspberry
                 # and the og values for the hole/darkness filtering
@@ -133,6 +140,8 @@ class PatchCore(nn.Module):
         with torch.no_grad():
             if "dino" in self.feature_extractor.model_name:
                 features, cls_tokens = self.feature_extractor(input_tensor.to(self.device))
+               # print(cls_tokens[0].shape) # [batch_size, 1, dimension] for each extracted layer 
+
             else:
                  features = self.feature_extractor(input_tensor.to(self.device))
      
@@ -147,10 +156,20 @@ class PatchCore(nn.Module):
         if "dino" in self.feature_extractor.model_name:
             # Per-layer L2 normalization (StructCore protocol)
             features = [F.normalize(f, p=2, dim=1) for f in features]
-            cls_tokens = [F.normalize(cls_token, p=2, dim=1) for cls_token in cls_tokens]
+            cls_tokens = [F.normalize(cls_token, p=2, dim=-1) for cls_token in cls_tokens]
+            if self.cls_token_viz_bool:
+                ### TODO : FOR TESTING CURRENTLY ###
+                # Discard features of the last layer ; we just want the cls token information of that layer
+                features = features[:-1]
+                ### TODO : FOR TESTING CURRENTLY ###
             # No smoothing — tokens already have global context
             embedding = torch.cat(features, dim=1)
             cls_tokens = torch.cat(cls_tokens, dim=1)
+
+            if self.cls_token_viz_bool:
+                cls_vec = cls_tokens[:,-1,:].squeeze(1)  # (B, dim), already L2-normed per layer ; just the last layers cls token, which has the most global information
+        
+            
         else:
             # CNN: apply local neighborhood aggregation
             # Apply smoothing (3x3 average pooling) to the features.
@@ -178,7 +197,10 @@ class PatchCore(nn.Module):
         #embedding shape: (#num_patches, emb_dim)
     
         if self.training:
-            output = embedding
+            if self.cls_token_viz_bool:
+                output = (embedding, cls_vec)
+            else:
+                output = embedding
         else:
     
             if self.feature_extractor.quantized:
@@ -237,19 +259,23 @@ class PatchCore(nn.Module):
                 effective_mask = (effective_mask > 0).float()
     
                 # Flatten and zero out everything outside the effective mask
-                effective_mask_flat = effective_mask.reshape(batch_size, -1)
-                patch_scores = patch_scores * effective_mask_flat
+              #  effective_mask_flat = effective_mask.reshape(batch_size, -1)
+               # patch_scores = patch_scores * effective_mask_flat
             # --------------------------------------------------------- #
-            # --------------------------------------------------------- #
-            # mask out background patches before computing anomaly score
-        #  if mask is not None:
-                # mask: (batch_size,1, H, W) boolean
-                # Resize mask to match patch grid dimensions (width, height)
-            #    mask_resized = torch.nn.functional.interpolate(
-            #        mask.float(), size=(width, height), mode="nearest"
-            #    ).reshape(batch_size, -1).bool()
-            #   patch_scores[~mask_resized] = 0.0
-            # --------------------------------------------------------- #
+
+            if 'HOLE_DARKNESS' in self.filter_post:
+                thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+                hole_mask_patch = compute_hole_mask_patchgrid(
+                    batch_og, mask_og, depth_og,
+                    patch_h=width, patch_w=height,
+                    depth_threshold_percentile=int(thresh_depth),
+                    brightness_threshold_percentile=int(thresh_dark),
+                ).to(effective_mask.device)
+                effective_mask = effective_mask * (1.0 - hole_mask_patch)
+
+            effective_mask_flat = effective_mask.reshape(batch_size, -1)
+            patch_scores = patch_scores * effective_mask_flat
+
     
             # compute the anomaly score of the images
             pred_scores = self.compute_anomaly_score(patch_scores, locations, embedding)
@@ -260,14 +286,34 @@ class PatchCore(nn.Module):
             # get the anomaly map
             anomaly_maps = self.anomaly_map_generator(patch_scores, image_size = self.input_size)
 
-            if 'HOLE_DARKNESS' in self.filter_post:
-                thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-                anomaly_maps = filter_holes_batched(anomaly_maps, input_tensor, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
+
+            # TODO : fix .... hole darkness is AFTER pred scores are calculated, so they literally change nothing currently in the scoring 
+           # if 'HOLE_DARKNESS' in self.filter_post:
+           #     thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+           #     anomaly_maps = filter_holes_batched(anomaly_maps, input_tensor, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
 
     
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
             
                 pred_scores = self.struct_core_instance.score(anomaly_maps, pred_scores)
+
+
+            # ── CLS-based image-level score ────────────────────────────
+          #  if "dino" in self.feature_extractor.model_name and self.cls_memory_bank is not None and self.cls_token_scoring_bool:
+          #      cls_memory = self.cls_memory_bank.to(self.device)  # (N_train, dim)
+                # Cosine similarity → distance; both sides already L2-normed
+           #     sim   = cls_vec @ cls_memory.T          # (B, N_train)
+           #     k     = 3 
+           #     topk  = sim.topk(k, dim=1).values       # (B, k) highest similarities
+           #     cls_dist = 1.0 - topk.mean(dim=1)       # (B,) ∈ [0, 2], lower = more normal
+           #     cls_score = cls_dist
+                # Normalise to roughly [0,1] using training statistics stored at fit time
+              #  cls_score = (cls_dist - self.cls_score_mean) / (self.cls_score_std + 1e-8)
+              #  cls_score = cls_score.clamp(min=0.0)
+             #   pred_scores = cls_score
+            #    #((1.0 - self.cls_alpha) * pred_scores + self.cls_alpha * cls_score)
+     
+            # ──────────────────────────────────────────────────────────
             
             if "dino" in self.feature_extractor.model_name:
                 output = (anomaly_maps, pred_scores, embedding, self.memory_bank, cls_tokens) 
@@ -481,6 +527,8 @@ class PatchCore(nn.Module):
         """
 
         model_state_dict = self.state_dict()
+        if self.cls_memory_bank is not None:
+            model_state_dict["cls_memory_bank"] = self.cls_memory_bank
         if self.apply_quantization:
             assert self.product_quantizer is not None
             self.product_quantizer.save(output_path + "/product_quantizer.bin")
@@ -582,3 +630,4 @@ class PatchCore(nn.Module):
 
         # load the memory bank
         self.memory_bank = state_dict["memory_bank"]
+        self.cls_memory_bank = state_dict.get("cls_memory_bank", None)

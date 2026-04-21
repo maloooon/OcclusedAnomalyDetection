@@ -13,17 +13,148 @@ from ..utilities.metrics import *
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import normalize
+from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score, roc_curve
 import umap
+from time import time
 
-def visualize_cls_tokens(all_cls_tokens, all_actual_grades, layers_idx=[3, 6]):
+def _cls_one_class_analysis(test_cls_last, train_cls, binary_grades, grades, grade_colors, output_prefix='cls'):
     """
-    all_cls_tokens: np.array of shape (num_images, num_layers, dim_per_layer)
-    all_actual_grades: np.array of shape (num_images,)
-    layers_idx: which layers the CLS tokens came from
+    Visualize how well grades 1-5 can be separated in CLS-token space using
+    Mahalanobis (LedoitWolf) and kNN-cosine distances from training normals.
+
+    Produces a single 2×2 figure saved to {output_prefix}_grade_separability.png:
+      (0,0) PCA scatter of test tokens colored by grade (train as gray background)
+      (0,1) Pairwise cosine-distance heatmap between per-grade centroids
+      (1,0) Mahalanobis score violin+strip plot per grade
+      (1,1) kNN cosine distance violin+strip plot per grade
+
+    Args:
+        test_cls_last:  (N_test, dim)  — last-layer CLS tokens from test set
+        train_cls:      (N_train, dim) — last-layer CLS tokens from training normals
+        binary_grades:  unused (kept for API compatibility)
+        grades:         (N_test,) int  — grade labels 1-5
+        grade_colors:   dict {grade: color}
+        output_prefix:  filename prefix for saved plot
+    """
+    train_np   = np.asarray(train_cls,      dtype=np.float64)
+    test_np    = np.asarray(test_cls_last,  dtype=np.float64)
+    grades_arr = np.asarray(grades)
+    unique_grades = sorted(np.unique(grades_arr).tolist())
+
+    # ── Mahalanobis (LedoitWolf) ──────────────────────────────────────
+    lw = LedoitWolf(assume_centered=False)
+    lw.fit(train_np)
+    delta = test_np - lw.location_
+    maha_scores = np.einsum('ij,jk,ik->i', delta, lw.precision_, delta)
+    # clip p99 for readability
+    maha_scores_plot = np.clip(maha_scores, None, np.percentile(maha_scores, 99))
+
+    # ── kNN cosine distance (k=5) ─────────────────────────────────────
+    train_n = train_np / (np.linalg.norm(train_np, axis=1, keepdims=True) + 1e-8)
+    test_n  = test_np  / (np.linalg.norm(test_np,  axis=1, keepdims=True) + 1e-8)
+    sim = test_n @ train_n.T
+    k = min(5, train_n.shape[0])
+    knn_scores = 1.0 - np.partition(sim, -k, axis=1)[:, -k:].mean(axis=1)
+
+    # ── PCA 2D ────────────────────────────────────────────────────────
+    pca = PCA(n_components=2)
+    pca.fit(np.vstack([train_np, test_np]))
+    test_pca  = pca.transform(test_np)
+    train_pca = pca.transform(train_np)
+
+    # ── Cosine distance between per-grade centroids ───────────────────
+    centroids = {}
+    for g in unique_grades:
+        v = test_n[grades_arr == g].mean(axis=0)
+        centroids[g] = v / (np.linalg.norm(v) + 1e-8)
+    n_g = len(unique_grades)
+    dist_mat = np.array([[1.0 - centroids[g1] @ centroids[g2]
+                          for g2 in unique_grades] for g1 in unique_grades])
+
+    # ── Figure ────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # (0,0) PCA scatter
+    ax = axes[0, 0]
+    ax.scatter(train_pca[:, 0], train_pca[:, 1],
+               c='lightgray', s=12, alpha=0.35, label='Train normals', zorder=1)
+    for g in unique_grades:
+        mask = grades_arr == g
+        ax.scatter(test_pca[mask, 0], test_pca[mask, 1],
+                   c=grade_colors[g], s=22, alpha=0.7,
+                   label=f'Grade {g} (n={mask.sum()})', zorder=2)
+    for g in unique_grades:
+        mask = grades_arr == g
+        cx, cy = test_pca[mask, 0].mean(), test_pca[mask, 1].mean()
+        ax.scatter(cx, cy, c=grade_colors[g], s=200, marker='*',
+                   edgecolors='black', linewidths=1.2, zorder=3)
+    ax.set_title(f'PCA — test CLS tokens  (var={pca.explained_variance_ratio_.sum():.1%})', fontsize=12)
+    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    ax.legend(fontsize=8, markerscale=1.4)
+
+    # (0,1) Centroid cosine-distance heatmap
+    ax = axes[0, 1]
+    im = ax.imshow(dist_mat, cmap='RdYlGn_r', vmin=0, vmax=dist_mat.max())
+    plt.colorbar(im, ax=ax, fraction=0.046, label='Cosine distance')
+    tick_labels = [f'G{g}' for g in unique_grades]
+    ax.set_xticks(range(n_g)); ax.set_xticklabels(tick_labels)
+    ax.set_yticks(range(n_g)); ax.set_yticklabels(tick_labels)
+    for i in range(n_g):
+        for j in range(n_g):
+            ax.text(j, i, f'{dist_mat[i, j]:.3f}', ha='center', va='center', fontsize=9)
+    ax.set_title('Per-grade centroid cosine distances\n(lower = more similar)', fontsize=12)
+
+    # (1,0) Mahalanobis violin + strip per grade
+    ax = axes[1, 0]
+    data_maha = [maha_scores_plot[grades_arr == g] for g in unique_grades]
+    parts = ax.violinplot(data_maha, positions=unique_grades, showmedians=True, showextrema=False)
+    for pc, g in zip(parts['bodies'], unique_grades):
+        pc.set_facecolor(grade_colors[g]); pc.set_alpha(0.65)
+    parts['cmedians'].set_color('black'); parts['cmedians'].set_linewidth(1.5)
+    rng = np.random.default_rng(0)
+    for g, d in zip(unique_grades, data_maha):
+        jitter = rng.uniform(-0.15, 0.15, size=len(d))
+        ax.scatter(np.full(len(d), g) + jitter, d, c=grade_colors[g], s=8, alpha=0.35, zorder=2)
+    ax.set_xticks(unique_grades); ax.set_xticklabels([f'Grade {g}' for g in unique_grades])
+    ax.set_title('Mahalanobis (LW) score per grade', fontsize=12)
+    ax.set_ylabel('Score  (↑ = further from train normals)')
+
+    # (1,1) kNN cosine violin + strip per grade
+    ax = axes[1, 1]
+    data_knn = [knn_scores[grades_arr == g] for g in unique_grades]
+    parts = ax.violinplot(data_knn, positions=unique_grades, showmedians=True, showextrema=False)
+    for pc, g in zip(parts['bodies'], unique_grades):
+        pc.set_facecolor(grade_colors[g]); pc.set_alpha(0.65)
+    parts['cmedians'].set_color('black'); parts['cmedians'].set_linewidth(1.5)
+    for g, d in zip(unique_grades, data_knn):
+        jitter = rng.uniform(-0.15, 0.15, size=len(d))
+        ax.scatter(np.full(len(d), g) + jitter, d, c=grade_colors[g], s=8, alpha=0.35, zorder=2)
+    ax.set_xticks(unique_grades); ax.set_xticklabels([f'Grade {g}' for g in unique_grades])
+    ax.set_title(f'kNN cosine distance (k={k}) per grade', fontsize=12)
+    ax.set_ylabel('Score  (↑ = further from train normals)')
+
+    fig.suptitle('CLS Token Grade Separability  (last layer)', fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_grade_separability.png', dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved grade separability plot → {output_prefix}_grade_separability.png")
+
+
+def visualize_cls_tokens(all_cls_tokens, all_actual_grades, layers_idx=[3, 6], training_cls_tokens=None):
+    """
+    all_cls_tokens:       np.array (N_test, num_layers, dim_per_layer) — test CLS tokens
+    all_actual_grades:    np.array (N_test,) — grade labels 1-5
+    layers_idx:           which layers the CLS tokens came from
+    training_cls_tokens:  np.array (N_train, dim) — last-layer CLS tokens from training normals
+                          (pass model.cls_memory_bank.cpu().numpy()); enables Mahalanobis/kNN analysis
     """
     grades = np.asarray(all_actual_grades)
-    normal_mask = np.isin(grades, [1, 2, 3])
     grade_colors = {1: '#2ecc71', 2: '#3498db', 3: '#f39c12', 4: '#e74c3c', 5: '#8e44ad'}
+    binary_colors = {0: '#2ecc71', 1: '#e74c3c'}  # 0 = normal, 1 = anomalous
+    binary_labels = {0: 'Normal (1–3)', 1: 'Anomalous (4–5)'}
+    binary_grades = np.where(np.isin(grades, [1, 2, 3]), 0, 1)
 
     # Per-layer tokens + concatenated version
     keys = list(layers_idx) + ['concat']
@@ -37,67 +168,72 @@ def visualize_cls_tokens(all_cls_tokens, all_actual_grades, layers_idx=[3, 6]):
     ncols = min(len(keys), 3)
     nrows = (len(keys) + ncols - 1) // ncols
 
-    # --- UMAP ---
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
-    axes = np.atleast_2d(axes).flatten()
-
-    for idx, key in enumerate(keys):
+    # Compute all projections once, reuse for both figures
+    projections = {}
+    for key in keys:
         tokens = layer_cls[key]
         reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
-        proj = reducer.fit_transform(tokens)
+        projections[key] = reducer.fit_transform(tokens)
 
-        ax = axes[idx]
-        for g in sorted(grade_colors.keys()):
-            mask = grades == g
-            ax.scatter(proj[mask, 0], proj[mask, 1],
-                       c=grade_colors[g], label=f'Grade {g}',
-                       s=15, alpha=0.6, edgecolors='none')
+    def make_figure(coloring, color_map, label_map, suptitle, filename):
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
+        axes = np.atleast_2d(axes).flatten()
 
-        title = f'Layer {key}' if isinstance(key, int) else 'All layers concat'
-        ax.set_title(title, fontsize=13)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        if idx == 0:
-            ax.legend(fontsize=9, markerscale=2)
+        for idx, key in enumerate(keys):
+            proj = projections[key]
+            ax = axes[idx]
 
-    for idx in range(len(keys), len(axes)):
-        axes[idx].set_visible(False)
+            for g in sorted(color_map.keys()):
+                mask = coloring == g
+                ax.scatter(proj[mask, 0], proj[mask, 1],
+                           c=color_map[g], label=label_map[g],
+                           s=15, alpha=0.6, edgecolors='none')
 
-    fig.suptitle('DINOv2 CLS Token UMAP — Per Layer', fontsize=15)
-    plt.tight_layout()
-    plt.savefig('cls_umap_per_layer.png', dpi=200, bbox_inches='tight')
-    plt.show()
+            title = f'Layer {key}' if isinstance(key, int) else 'All layers concat'
+            ax.set_title(title, fontsize=13)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if idx == 0:
+                ax.legend(fontsize=9, markerscale=2)
 
-    # --- Cosine distance from normal centroid ---
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows))
-    axes = np.atleast_2d(axes).flatten()
+        for idx in range(len(keys), len(axes)):
+            axes[idx].set_visible(False)
 
-    for idx, key in enumerate(keys):
-        tokens = layer_cls[key]
-        centroid = tokens[normal_mask].mean(axis=0)
-        centroid = centroid / np.linalg.norm(centroid)
-        cos_dist = 1.0 - tokens @ centroid
+        fig.suptitle(suptitle, fontsize=15)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=200, bbox_inches='tight')
+        plt.close(fig)
 
-        ax = axes[idx]
-        for g in sorted(grade_colors.keys()):
-            g_mask = grades == g
-            ax.hist(cos_dist[g_mask], bins=40, alpha=0.5,
-                    color=grade_colors[g], label=f'Grade {g}', density=True)
+    make_figure(
+        coloring=grades,
+        color_map=grade_colors,
+        label_map={g: f'Grade {g}' for g in grade_colors},
+        suptitle='DINOv2 CLS Token UMAP — Per Layer (5 grades)',
+        filename='cls_umap_per_layer.png',
+    )
 
-        title = f'Layer {key}' if isinstance(key, int) else 'All layers concat'
-        ax.set_title(title, fontsize=13)
-        ax.set_xlabel('Cosine distance from normal centroid')
-        ax.set_ylabel('Density')
-        if idx == 0:
-            ax.legend(fontsize=9)
+    make_figure(
+        coloring=binary_grades,
+        color_map=binary_colors,
+        label_map=binary_labels,
+        suptitle='DINOv2 CLS Token UMAP — Per Layer (Normal vs Anomalous)',
+        filename='cls_umap_per_layer_binary.png',
+    )
 
-    for idx in range(len(keys), len(axes)):
-        axes[idx].set_visible(False)
+    # --- One-class classification on CLS tokens (Mahalanobis + kNN) ---
+    if training_cls_tokens is not None:
+        print("Computing CLS one-class scores (Mahalanobis + kNN)...")
+        # last-layer test tokens: index -1 corresponds to the last entry in layers_idx
+        test_cls_last = all_cls_tokens[:, -1, :]   # (N_test, dim)
+        train_cls_np  = np.asarray(training_cls_tokens, dtype=np.float64)
+        _cls_one_class_analysis(
+            test_cls_last, train_cls_np,
+            binary_grades, grades,
+            grade_colors,
+            output_prefix='cls',
+        )
 
-    fig.suptitle('CLS Cosine Distance from Normal Centroid — Per Layer', fontsize=15)
-    plt.tight_layout()
-    plt.savefig('cls_cosine_dist_per_layer.png', dpi=200, bbox_inches='tight')
-   # plt.show()
+
 
 def min_max_norm(x):
     return (x - x.min()) / (x.max() - x.min())
@@ -141,14 +277,17 @@ class Evaluator:
         all_image_paths = list() # NOTE : added
         all_cls_tokens = list() # NOTE : added
     
-        for images, labels, masks, path, full_mask, actual_grade, og_img, og_mask, og_depth in tqdm(self.test_dataloader, desc="Eval"):
+
+        test_start_time = time()
+        for images, labels, masks, path, full_mask, actual_grade, mask_unfiltered, og_img, og_mask, og_depth in tqdm(self.test_dataloader, desc="Eval"):
             # get anomaly map and score
             with torch.no_grad():
                 
 
-                
-                out = model((images.to(self.device), full_mask.to(self.device), og_img.to(self.device), og_mask.to(self.device), og_depth.to(self.device))) # NOTE : added full_mask and depth
             
+                out = model((images.to(self.device), full_mask.to(self.device), mask_unfiltered.to(self.device), og_img.to(self.device), og_mask.to(self.device), og_depth.to(self.device))) # NOTE : added full_mask and depth
+            
+
                 if len(out) == 5: # NOTE : added for patchcore currently
                     anomaly_maps, anomaly_scores, embeddings, memory_bank, cls_tokens = out
                 elif len(out) == 1: # NOTE : currently for SINBAD
@@ -207,13 +346,17 @@ class Evaluator:
           #  all_embeddings = np.asarray(all_embeddings) # NOTE : added
        #     memory_bank = memory_bank.cpu().numpy() # NOTE : added
 
+        test_end_time = time()
+        print(f"Inference time: {test_end_time - test_start_time:.2f} seconds")
+
         all_grades = np.asarray(all_grades) # NOTE : added
         all_actual_grades = np.asarray(all_actual_grades) # NOTE : added
         if len(out) == 5 and cls_tokens is not None: # NOTE : added for patchcore currently
             all_cls_tokens = np.asarray(all_cls_tokens) # NOTE : added
-
-            visualize_cls_tokens(all_cls_tokens, all_actual_grades, layers_idx=[3,6])
-       # exit()
+          #  print(all_cls_tokens.shape) # NOTE : added
+          #  training_cls = model.cls_memory_bank.cpu().numpy() if hasattr(model, 'cls_memory_bank') and model.cls_memory_bank is not None else None
+          #  visualize_cls_tokens(all_cls_tokens, all_actual_grades, layers_idx=[3,6,11], training_cls_tokens=training_cls)
+   
 
       #  if len(out) == 4:
             # Average the embeddings for each image : Given that the embeddings are in the shape (num_images, num_patches_per_image, embedding_dim), we can average the embeddings for each image by taking the mean over the num_patches_per_image dimension.

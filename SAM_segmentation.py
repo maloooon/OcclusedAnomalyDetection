@@ -803,7 +803,6 @@ def is_contained(mask_inner: np.ndarray, mask_outer: np.ndarray, threshold: floa
     
     return fraction_contained >= threshold
 
-
 def _filter_masks_by_darkness(masks, img_lab,img_array, plot_boxplot = False, plot_removed = False):
     """
     Filter masks based on LAB L* (lightness) channel.
@@ -903,7 +902,6 @@ def _filter_masks_by_darkness(masks, img_lab,img_array, plot_boxplot = False, pl
         print(f"  Threshold: Size >= {lower_bound_size}")
     
     return valid_idx
-
 
 # Visualization helper
 def visualize_overlap_map(overlap_map: np.ndarray, title: str = "Overlap Map"):

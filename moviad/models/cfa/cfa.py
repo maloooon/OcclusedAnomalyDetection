@@ -122,10 +122,7 @@ class CFA(nn.Module):
     
         p = self.feature_extractor(x)
 
-        # TODO : doesn't work here.. need to find a fix for dino 
-        # TODO : maybe like this ?, should be done like this 
-        # TODO : everywhere ?? I think it didnt work for some reason
-        if "dinov2" in self.feature_extractor.model_name:
+        if "dino" in self.feature_extractor.model_name:
             p, cls_tokens = p
        # if len(p) == 2:
        #     p, cls_tokens = p
@@ -153,20 +150,24 @@ class CFA(nn.Module):
 
         if self.training:
             return self.soft_boundary(phi_p)
+        
        # else:
-       #     self.scale = p[0].size(2)
-       #     scores = rearrange(dist, 'b (h w) c -> b c h w', h=self.scale).cpu().detach()
+        ##    self.scale = p[0].size(2)
+         #   scores = rearrange(dist, 'b (h w) c -> b c h w', h=self.scale).cpu().detach()
 
-       #     heatmaps = torch.mean(scores, dim=1)
-       #     heatmaps = CFA.upsample(heatmaps, size=x.size(2), mode="bilinear")
-       #     heatmaps = CFA.gaussian_smooth_torch(heatmaps, sigma=4)
-       #     img_scores = CFA.rescale(heatmaps)
-       #     img_scores = scores.reshape(scores.shape[0], -1).max(axis=1).values 
+         #   heatmaps = torch.mean(scores, dim=1)
+         #   heatmaps = CFA.upsample(heatmaps, size=x.size(2), mode="bilinear")
+         #   if heatmaps.dim() == 2: # if batch is of size 1, it gets squeezed away during upsample --> need to unsqueeze in first dimension
+         #       heatmaps = heatmaps.unsqueeze(0)
+         #   heatmaps = CFA.gaussian_smooth_torch(heatmaps, sigma=4)
+         #   img_scores = CFA.rescale(heatmaps)
+         #   img_scores = scores.reshape(scores.shape[0], -1).max(axis=1).values 
 
-        #    if len(heatmaps.shape) == 2:
-        #        return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), img_scores
-        #    else:
-        #        return heatmaps.unsqueeze(dim=1), img_scores
+          #  if len(heatmaps.shape) == 2:
+          #      return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), img_scores
+          #  else:
+          #      return heatmaps.unsqueeze(dim=1), img_scores
+        
 
         else:
             self.scale = p[0].size(2)
@@ -174,7 +175,11 @@ class CFA(nn.Module):
 
             heatmaps = torch.mean(scores, dim=1)
             heatmaps = CFA.upsample(heatmaps, size=x.size(2), mode="bilinear")
+            if heatmaps.dim() == 2: # if batch is of size 1, it gets squeezed away during upsample --> need to unsqueeze in first dimension
+                heatmaps = heatmaps.unsqueeze(0) 
             heatmaps = CFA.gaussian_smooth_torch(heatmaps, sigma=4)
+
+
 
 
             device = heatmaps.device
@@ -185,6 +190,8 @@ class CFA(nn.Module):
                     mask = mask.unsqueeze(1)
 
                 effective_mask = torch.zeros_like(mask, dtype=torch.float32)
+                
+                
 
                 for i in range(mask.shape[0]):
                     sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
@@ -209,8 +216,12 @@ class CFA(nn.Module):
                     ).to(device)
 
                 effective_mask = (effective_mask > 0).float()
+                effective_mask = torch.squeeze(effective_mask, dim=1) # (B, H, W)
                 effective_mask = effective_mask.to(device)
+                curr_heatmaps_shape = heatmaps.shape
                 heatmaps = heatmaps * effective_mask
+       
+                
 
 
             # Filter holes
@@ -221,12 +232,13 @@ class CFA(nn.Module):
                     depth_threshold_percentile=int(thresh_depth),
                     brightness_threshold_percentile=int(thresh_dark)
                 )
+                
 
             # Compute per-image anomaly score
             flat = heatmaps.view(heatmaps.size(0), -1)
 
-          #  anomaly_scores = CFA.rescale(heatmaps)
-          #  anomaly_scores = scores.reshape(anomaly_scores.shape[0], -1).max(axis=1).values
+         #   anomaly_scores = CFA.rescale(heatmaps)
+         #   anomaly_scores = anomaly_scores.reshape(anomaly_scores.shape[0], -1).max(axis=1).values
             
             anomaly_scores = torch.max(flat, dim=1)[0]
 
@@ -241,8 +253,9 @@ class CFA(nn.Module):
             if len(heatmaps.shape) == 2:
                return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), anomaly_scores
             else:
-               # return heatmaps.unsqueeze(dim=1), anomaly_scores
+                return heatmaps.unsqueeze(dim=1), anomaly_scores
                 return heatmaps, anomaly_scores
+        
 
     def soft_boundary(self, phi_p: torch.Tensor) -> float:
         """
