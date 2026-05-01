@@ -18,7 +18,7 @@ from .product_quantizer import ProductQuantizer
 from ...models.patchcore.anomaly_map import AnomalyMapGenerator
 from ...utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.get_sizes import *
-from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid
+from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_protrusion_weight_patchgrid
 
 SEED = 32
 import random
@@ -44,7 +44,9 @@ class PatchCore(nn.Module):
         scoring_mode = 'MAXMEAN_1',
         mask_border_filter_thickness = 0,
         filter_post = 'NONE',
-        cls_token_viz_bool = False
+        cls_token_viz_bool = False,
+        protrusion_damping_radius: int = 0,
+        protrusion_damping_gamma: float = 1,
 
     ) -> None:
 
@@ -67,6 +69,8 @@ class PatchCore(nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.protrusion_damping_radius = protrusion_damping_radius
+        self.protrusion_damping_gamma = protrusion_damping_gamma
 
 
         self.cls_token_viz_bool = cls_token_viz_bool
@@ -125,11 +129,11 @@ class PatchCore(nn.Module):
                 # We need the mask such that we can collect the descriptor values
                 # based on only the raspberry mask area (i.e. we do not care for the black background)
                 input_tensor, mask = input_tensor
-                batch_og, masK_og, depth_og = None
-            if len(input_tensor) == 5:
+                batch_og, masK_og, depth_og = None, None, None
+            if len(input_tensor) == 6:
                 # For evaluation, we need the mask for only looking at the raspberry
                 # and the og values for the hole/darkness filtering
-                input_tensor, mask, batch_og, mask_og , depth_og  = input_tensor
+                input_tensor, mask, mask_unfiltered, batch_og, mask_og , depth_og  = input_tensor
  
     
 
@@ -273,29 +277,33 @@ class PatchCore(nn.Module):
                 ).to(effective_mask.device)
                 effective_mask = effective_mask * (1.0 - hole_mask_patch)
 
+            if self.protrusion_damping_radius > 0 and mask_unfiltered is not None:
+                protrusion_weight = compute_protrusion_weight_patchgrid(
+                    mask, mask_unfiltered,
+                    patch_h=width, patch_w=height,
+                    influence_radius=self.protrusion_damping_radius,
+                    gamma=self.protrusion_damping_gamma,
+                ).to(effective_mask.device)
+                effective_mask = effective_mask * protrusion_weight
+
             effective_mask_flat = effective_mask.reshape(batch_size, -1)
             patch_scores = patch_scores * effective_mask_flat
 
-    
             # compute the anomaly score of the images
             pred_scores = self.compute_anomaly_score(patch_scores, locations, embedding)
-    
+
             # reshape to w,h
             patch_scores = patch_scores.reshape((batch_size, 1, width, height))
-    
+
             # get the anomaly map
             anomaly_maps = self.anomaly_map_generator(patch_scores, image_size = self.input_size)
-
-
-            # TODO : fix .... hole darkness is AFTER pred scores are calculated, so they literally change nothing currently in the scoring 
-           # if 'HOLE_DARKNESS' in self.filter_post:
-           #     thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-           #     anomaly_maps = filter_holes_batched(anomaly_maps, input_tensor, batch_og, mask_og, depth_og, depth_threshold_percentile = int(thresh_depth), brightness_threshold_percentile = int(thresh_dark))
 
     
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
             
                 pred_scores = self.struct_core_instance.score(anomaly_maps, pred_scores)
+
+            
 
 
             # ── CLS-based image-level score ────────────────────────────

@@ -173,7 +173,7 @@ def _center_and_crop(img, mask, target_size=300, pad_value=0, depth_image=None):
     return out_img, out_mask
 
 def create_dataset_imgs(masks, images, save_path=None, ids=None, 
-                        all_gt_masks=None, all_gt_grades=None, img_size=256, spec_supression_bool = False, clean_protrusions_bool = False, filter_holes_bool = False):
+                        all_gt_masks=None, all_gt_grades=None, img_size=256, spec_supression_bool = False, clean_protrusions_bool = False, filter_holes_bool = False, filter_holes_depth_thresh = 30, filter_holes_brightness_thresh = 80):
     """
     Given masks and images, create a dataset of single-object raspberry images.
     
@@ -247,14 +247,25 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
 
             mask_processed_unfiltered = mask_processed.copy()
 
-            if clean_protrusions_bool:
-                masked_img_processed, mask_processed, depth_processed = clean_protrusions(masked_img_processed, mask_processed, depth_processed)
+
+
+            if filter_holes_bool:
+                masked_img_processed, mask_processed, depth_processed = find_holes_fix(masked_img_processed, mask_processed, depth_processed, visualize_bool = False, depth_threshold_percentile=filter_holes_depth_thresh,
+               brightness_threshold_percentile=filter_holes_brightness_thresh,
+               small_hole_max_area=100,
+               surrounding_threshold=0.80,
+               min_hole_area=200,
+               dilation_radius=15,
+               border_exclusion_width = 30)
 
             if spec_supression_bool:
                 masked_img_processed, mask_processed = apply_specular_suppression(masked_img_processed, mask_processed, visualize=False, inpainting = True)
 
-            if filter_holes_bool:
-                masked_img_processed, mask_processed, depth_processed = find_holes_fix(masked_img_processed, mask_processed, depth_processed, visualize_bool = False)
+
+            if clean_protrusions_bool:
+                masked_img_processed, mask_processed, depth_processed = clean_protrusions(masked_img_processed, mask_processed, depth_processed)
+
+
 
             curr_img_processed.append(masked_img_processed)
             curr_masks_processed.append(mask_processed)
@@ -729,14 +740,16 @@ def main():
     IMG_SIZE = 256
     UNBLURRED = False
     SPECULAR_SUPPRESSION = False
-    CLEAN_PROTRUSIONS = False
-    FILTER_HOLES = True
-    SEED = 42
+    CLEAN_PROTRUSIONS = True
+    FILTER_HOLES = False
+    HOLES_DEPTH_THRESH = 40
+    HOLES_BRIGHTNESS_THRESH = 40
+    SEED = 0
  
-    # CHANGE: These are now only used by apply_filters(), not by create_dataset_imgs()
+
     SIZE_FILTERING = False
     SIZE_FILTERING_FACTOR = 1.5
-    DARKNESS_FILTERING = True
+    DARKNESS_FILTERING = True # Fully filters out too dark samples
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
  
@@ -757,6 +770,8 @@ def main():
         filter_parts.append("clean_protrusions")
     if FILTER_HOLES:
         filter_parts.append("filter_holes")
+        filter_parts.append(f"holes_depth_{HOLES_DEPTH_THRESH}")
+        filter_parts.append(f"holes_brightness_{HOLES_BRIGHTNESS_THRESH}")
  
     if filter_parts:
         filter_str = "filtered_" + "_and_".join(filter_parts)
@@ -824,7 +839,8 @@ def main():
         masks, all_imgs, save_path=SAVE_PATH, ids=all_ids,
         all_gt_masks=all_gt_masks, all_gt_grades=all_gt_grades,
         img_size=IMG_SIZE, spec_supression_bool = SPECULAR_SUPPRESSION,
-        clean_protrusions_bool = CLEAN_PROTRUSIONS, filter_holes_bool = FILTER_HOLES
+        clean_protrusions_bool = CLEAN_PROTRUSIONS, filter_holes_bool = FILTER_HOLES,
+        filter_holes_depth_thresh=HOLES_DEPTH_THRESH, filter_holes_brightness_thresh=HOLES_BRIGHTNESS_THRESH
     )
 
     # --- Step 2: Create deterministic split (unchanged logic) ---

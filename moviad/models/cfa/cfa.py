@@ -58,6 +58,8 @@ class CFA(nn.Module):
         super(CFA, self).__init__()
         self.device = device
 
+        self.memory_bank = 0
+
         self.C   = 0
         self.nu = 1e-3
         self.scale = None
@@ -115,10 +117,11 @@ class CFA(nn.Module):
 
         # NOTE : added
         if isinstance(x, tuple):
-            if len(x) == 5:
-                x, mask, batch_og, mask_og, depth_og = x
+            if len(x) == 6:
+                x, mask, mask_unfiltered, batch_og, mask_og, depth_og = x
             if len(x) == 2:
                 x, mask = x
+                mask_unfiltered, batch_og, mask_og, depth_og = None, None, None, None
     
         p = self.feature_extractor(x)
 
@@ -237,8 +240,8 @@ class CFA(nn.Module):
             # Compute per-image anomaly score
             flat = heatmaps.view(heatmaps.size(0), -1)
 
-         #   anomaly_scores = CFA.rescale(heatmaps)
-         #   anomaly_scores = anomaly_scores.reshape(anomaly_scores.shape[0], -1).max(axis=1).values
+          #  anomaly_scores = CFA.rescale(heatmaps)
+          #  anomaly_scores = anomaly_scores.reshape(anomaly_scores.shape[0], -1).max(axis=1).values
             
             anomaly_scores = torch.max(flat, dim=1)[0]
 

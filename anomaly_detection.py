@@ -255,7 +255,7 @@ class SingleRaspberryDataset(Dataset):
 
                 # Compute unfiltered mask before centering:
                 # remove only the pixels that occlusion took from the filtered mask
-                new_mask_unfiltered = self.untouched_masks[idx] & ~(self.masks[idx] & ~new_mask)
+                new_mask_unfiltered = self.masks_unfiltered[idx] & ~(self.masks[idx] & ~new_mask)
 
                 # Save bbox reference from new_mask before centering, then center img+mask
                 new_mask_pre_center = new_mask.copy()
@@ -336,7 +336,7 @@ class SingleRaspberryDataset(Dataset):
                 return img, needed_grade, error_mask.int(), img_path, mask, actual_grade, mask_unfiltered, img, img, img # last 3 do not matter
         else:
             if self.struct_core_collection_bool:
-                return img, mask
+                return img, mask, mask_unfiltered
             else:
                 return img
 
@@ -488,7 +488,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     elif mode == 'sinbad':
         trainer = TrainerSINBAD(model, train_dataloader, test_dataloader, device,save_path=save_path, logger=None)
     if mode not in ('patchcore', 'padim', 'sinbad'):
-        trainer.train(epochs = 30, evaluation_epoch_interval=1)
+        trainer.train(epochs = 50, evaluation_epoch_interval=1)
     else:
         trainer.train()
 
@@ -640,11 +640,11 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     model_load_start_time = time()
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool)
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = 0, protrusion_damping_gamma = 1)
     elif mode == 'cfa':
         model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0, protrusion_damping_gamma = 0.5)
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 5, protrusion_damping_gamma = 1)
     elif mode == 'rd4ad':
         model = RD4AD(backbone, device, input_size = (224,224), struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'fastflow':
@@ -715,7 +715,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 0.34043863
+    opt_threshold = 0.37617567
 
 
     # chek for the visual test
@@ -893,31 +893,73 @@ def detailed_eval(data_path):
 
     return results
 
+
+import math 
+'''
 def saving_criteria(best_metrics, new_metrics):
     # Since this is needed for the AD models that have training
     if new_metrics["img_roc_auc"] > best_metrics["img_roc_auc"]:
         return True
-    else:
-        return False   
+    elif math.isclose(new_metrics["img_roc_auc"], best_metrics["img_roc_auc"]):
+        if (new_metrics["img_f1"] >= best_metrics["img_f1"]) or (new_metrics["img_pr_auc"] >= best_metrics["img_pr_auc"]):
+            print("ROC AUC same, but better F1 OR better PR AUC; saving new model")
+            return True
+     #   elif new_metrics["img_pr_auc"] >= best_metrics["img_pr_auc"]:
+     #       print("ROC AUC same, better PR AUC")
+      #      return True
+    return False
+'''
+
+
+def saving_criteria(best_metrics, new_metrics):
+    # Based on average of img_roc_auc, img_f1 and img_pr_auc ; if this average is better for the new metrics, we save the new model
+    if (new_metrics["img_roc_auc"] + new_metrics["img_f1"] + new_metrics["img_pr_auc"]) / 3 > (best_metrics["img_roc_auc"] + best_metrics["img_f1"] + best_metrics["img_pr_auc"]) / 3:
+        return True
+     
+    return False
 
 
 def main():
 
+
+    # TODO : GANOMALY NO!!!! ANOMALY MAPS !! DONT PUT THAT IN THESIS, no idea if they maybe wrote an approximation or how I managed to actually produce anomaly maps
+    # TODO : FastFlow creates anommaps, but somehow they do not match perfect ; can use that also as an argument (same for GANomaly) why we didn't pursue those, simply
+    # TODO : because we want to also manipulate based on anomaly maps and understand where problems occur and follow up on them, i.e. we want no blackbox
+
+
+    # TODO : FastFlow in paper describd that they also tested with vision transformer, so maybe helpful to test with DINOv2 to see what happens
+
+
+    # TODO : try synthetic occlusion rotation/scaling ? 
+
+    # TODO : GANomaly --> seems to only find little defects and not overall defects (i.e. never the white-ish parts of a bad raspberry, finds a lot of the white reflection drupelets), i.e. not a good model
+    # TODO : rd4ad/fastflow --> seems to struggle with boundaries of occluded raspberries, a lot of anomalies foudn there
+    # TODO : add why chosen models were stfpm and patchcore in the end (besides simply performance)
+
+    # TODO : possibly try data augmentation of raspberries with holes so performance is stronger on these ; but we would need to find all samples with holes etc...
+
+    # TODO : try stfpm filtered darkness and then post filtering holes (so not in filter_pre, need to redo the dataset creation since we need the mask_unfiltered to be in it)
+    # TODO : and then in stfpm code do what I added what could directly work to do the new filtering step (i.e. surrounding areas of holes filtered out) to see if it works
+    # TODO : FIRST !! for this adjust in filters moviad the hole finding function to the new one in image manipulation since it works much better now
+
     # TODO : best score I think was post hole filtering ,not pre, with stfpm augment, filtere darkness, filter post hole darkness ; main problem being non-anomalies that were caught bc of holes!
+    # TODO : so we want to filter these out : this can lead to worse scores down the line, but we should accept them bc we also dont want any classifications that are correct, but bc of hole areas only
 
     # TODO : NOTE THAT POST FILTERS are NOT in the training loop, i.e. results based on FILTER_POST we ONLY get by running test_model !!! ; only for patchcore, stfpm now in train loop
-    # TODO : fix yolo dataset creation ...
 
-    MODEL_MODE = 'stfpm' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
+
+    MODEL_MODE = 'patchcore' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
     SYN_AUG_BOOL = True # whether to use synthetic occlusions during training
-    SYN_AUG_MODE = 'augment' # 'replace' or 'augment'
+    SYN_AUG_MODE = 'replace' # 'replace' or 'augment'
 
     # NOTE : this only works with patchcore + dinov2 
     CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    FILTER_PRE = 'FILTERED_DARKNESS_80_0.3_AND_FILTER_HOLES_SEED_42_GT_256' # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    FILTER_PRE = 'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
+  
+    FILTER_PRE = FILTER_PRE.upper()
     # Get the last element in filter_pre
     last_element = FILTER_PRE.split('_')[-1]
     if last_element != 'variable':
@@ -925,7 +967,7 @@ def main():
     else:
         pass_og_bool = False
 
-    FILTER_POST = 'NONE' # HOLE_DARKNESS_15_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details
+    FILTER_POST = 'NONE' # HOLE_DARKNESS_15_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details ; DARKNESS_k : filter out dark areas based on darkness of raspberry, k refers to threshold for darkness ; see utilities/filters for more details ; NONE if no post filtering
     SCORING = 'MAXMEAN_1' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
 
 
@@ -944,20 +986,20 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-    backbone = "wide_resnet50_2" 
-   # backbone = "dinov2_vitb14"
+  #  backbone = "wide_resnet50_2" 
+    backbone = "dinov2_vitb14"
    # backbone = 'mobilenet_v2'
    # backbone = "dinov3_vitb16"
   #  ad_layers = ["features.4", "features.7", "features.10"] 
    # ad_layers = ["layer4"]
   #  ad_layers = ["features.10"] # SINBAD tests
-    ad_layers = ["layer2", "layer3"]
+  #  ad_layers = ["layer2", "layer3"]
     
-   # ad_layers = [3,6] 
+    ad_layers = [3,6] 
   #  if CLS_TOKEN_VIZ_BOOL:
   #      ad_layers.append(11) # extracting also CLS token for visualizations
     end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
-    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}"
+    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{SYN_AUG_MODE}_" if SYN_AUG_BOOL else f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_no_aug_"
 
     custom_weights_path = None
    # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout_{'_'.join(ad_layers)}.pt"
@@ -966,6 +1008,7 @@ def main():
 
    # pretrain_backbone_cutout(dataset_path, device, backbone, save_path = custom_weights_path, unfreeze_from=4, epochs=50, lr=1e-4, batch_size=32, n_holes=1, hole_size_range=(32, 64), target_path = target_path)
 
+  
     train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
 
     # Check if visual test path exists and clear it out if it already exists
@@ -980,8 +1023,8 @@ def main():
 
 
     
-    test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
-    detailed_eval(visual_test_path)
+ #   test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
+ #   detailed_eval(visual_test_path)
 
 
 if __name__ == "__main__":

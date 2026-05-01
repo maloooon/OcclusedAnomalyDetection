@@ -6,7 +6,7 @@ import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
-from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions
+from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_darkness_mask
 from time import time
 
 SEED = 32
@@ -58,6 +58,9 @@ class STFPM(torch.nn.Module):
                 batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch # NOTE : added mask_unfiltered
             if len(batch) == 2:
                 batch, mask = batch
+                batch_og, mask_og, depth_og = None, None, None
+            if len(batch) == 3:
+                batch, mask, mask_unfiltered = batch
                 batch_og, mask_og, depth_og = None, None, None
                
 
@@ -255,15 +258,26 @@ class STFPM(torch.nn.Module):
             # Zero out everything outside the effective mask
            # score_maps = score_maps * effective_mask
      
-       # if 'HOLE_DARKNESS' in self.filter_post:
-       #     thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-        #    hole_mask_patch = compute_hole_mask_patchgrid(
-        #        batch_og, mask_og, depth_og,
-        #        patch_h=batch.shape[2], patch_w=batch.shape[3],
-        #        depth_threshold_percentile=int(thresh_depth),
-        #        brightness_threshold_percentile=int(thresh_dark),
-        #    ).to(effective_mask.device)
-        #    effective_mask = effective_mask * (1.0 - hole_mask_patch)
+        post_mask_filtered = None
+        if 'HOLE_DARKNESS' in self.filter_post:
+            thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+            post_mask_filtered = filter_holes_batched(
+                batch_og, mask_og, depth_og,
+                depth_threshold_percentile=int(thresh_depth),
+                brightness_threshold_percentile=int(thresh_dark),
+                dilation_radius = 5
+            ).to(effective_mask.device)
+           # effective_mask = effective_mask * (1.0 - hole_mask_patch)
+
+        if 'ONLY_DARKNESS' in self.filter_post:
+            thresh_dark = self.filter_post.split('_')[1]
+            dark_mask = compute_darkness_mask(batch_og, mask_og, brightness_threshold_percentile=int(thresh_dark)).to(effective_mask.device)
+            # union of dark mask and hole mask
+            if post_mask_filtered is not None:
+                post_mask_filtered = torch.clamp(post_mask_filtered + dark_mask, 0, 1)
+            else:
+                post_mask_filtered = dark_mask
+            
 
        # effective_mask_flat = effective_mask.reshape(batch_size, -1)
         score_maps = score_maps * effective_mask
@@ -274,7 +288,9 @@ class STFPM(torch.nn.Module):
                 score_maps, mask, mask_unfiltered,
                 influence_radius=self.protrusion_damping_radius,
                 gamma=self.protrusion_damping_gamma,
+                removed_mask = post_mask_filtered if post_mask_filtered is not None else None
             )
+        
 
         # Filter holes before computing anomaly scores
       #  if 'HOLE_DARKNESS' in self.filter_post:

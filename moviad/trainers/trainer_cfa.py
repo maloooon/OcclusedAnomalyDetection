@@ -65,6 +65,8 @@ class TrainerCFA(Trainer):
             evaluation_epoch_interval: optional, number of epochs between evaluations
         """
 
+        self.model.initialize_memory_bank(self.train_dataloader)
+
         params = [{'params': self.model.parameters()}]
         learning_rate = 1e-3
         weight_decay = 5e-4

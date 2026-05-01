@@ -80,6 +80,14 @@ def apply_cutout(image, mask, n_holes=3, hole_size_range=(32, 64)):
 
     return masked_image, holes
 
+def morphological_opening(image, mask, kernel_size = 50):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    mask = mask.astype(np.uint8)
+    mask_opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    result = image.copy()
+    result[mask_opened == 0] = 0
+    cv2.imwrite("opened_image.png", result)
+
 def find_contour(image,mask):
 
     mask_uint8 = mask.astype(np.uint8)
@@ -108,6 +116,9 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True):
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
     dilated = cv2.dilate(filtered, kernel, iterations=1) & (mask > 0).astype(np.uint8) * 255
+    
+
+   
 
     if inpainting:
         result = cv2.inpaint(image, dilated, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
@@ -118,6 +129,13 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True):
         result[filtered > 0] = 0
        # result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
         result_title = "Zeroed out"
+    
+    mask[dilated > 0] = 0
+
+    # Visualize filtered mask
+   # mask = mask.astype(np.uint8) * 255 # NOTE : need this ??? 
+   # cv2.imwrite("specular_suppression_mask.png", mask)
+   # exit()
 
     if visualize:
         fig, axes = plt.subplots(1, 4, figsize=(16, 4))
@@ -263,13 +281,16 @@ def filter_holes_batched(score_maps, batch, mask, depth,
     return score_maps
 
 def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
-               depth_threshold_percentile=50,
-               brightness_threshold_percentile=20,
+               depth_threshold_percentile=15,
+               brightness_threshold_percentile=40,
                small_hole_max_area=100,
-               surrounding_threshold=0.95,
-               min_hole_area=100,
-               dilation_radius=8,
+               surrounding_threshold=0.80,
+               min_hole_area=200,
+               dilation_radius=15,
+               border_exclusion_width=30,
                visualize_bool=False):
+
+    # TODO : surrounding_threshold is now obsolete, can be taken out of the logic I believe (since we have border_exclusion_width)
     """
     Combined depth + brightness thresholding to find hole regions.
     Only pixels that are both deep AND dark are considered holes.
@@ -303,6 +324,12 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
         dilation_radius: if > 0, each surviving hole component is dilated by
                          this many pixels in all directions, constrained to
                          the raspberry mask (default 0 = no dilation)
+        border_exclusion_width: if > 0, a ring of this many pixels measured
+                                inward from the raspberry contour is excluded
+                                from hole detection before CCA runs. This
+                                prevents shadow/darkness at the raspberry edge
+                                from being flagged as holes or bridging to
+                                real interior holes (default 10).
 
     Returns:
         image_cleaned: image with hole pixels zeroed out
@@ -328,6 +355,20 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
 
     # Raw hole mask: deep AND dark
     raw_hole_mask = (deep_mask & dark_mask).astype(np.uint8)
+
+    # Border exclusion: erase hole detections within `border_exclusion_width`
+    # pixels of the raspberry contour. Darkness near the edge is typically
+    # shadow/curvature, not a hole; removing it also breaks any connectivity
+    # bridge between edge artifacts and real interior holes before CCA runs.
+    border_ring = np.zeros_like(binary_mask, dtype=bool)
+    if border_exclusion_width > 0:
+        excl_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * border_exclusion_width + 1, 2 * border_exclusion_width + 1),
+        )
+        eroded_mask = cv2.erode(binary_mask, excl_kernel)
+        border_ring = (binary_mask > 0) & (eroded_mask == 0)
+        raw_hole_mask[border_ring] = 0
 
     # CCA-based recovery: restore components that are not sufficiently
     # surrounded by non-hole raspberry pixels (they are edge artifacts).
@@ -438,7 +479,7 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
         overlay_bright_marked = overlay_bright.copy()
         overlay_bright_marked[dark_mask] = [255, 0, 0]
 
-        # raw hole before CCA recovery
+        # raw hole after border exclusion, before CCA recovery
         overlay_raw = depth_colored.copy()
         overlay_raw[raw_hole_mask > 0] = [255, 0, 0]
 
@@ -446,7 +487,11 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
         overlay_final = depth_colored.copy()
         overlay_final[hole_mask > 0] = [255, 0, 0]
 
-        fig, axes = plt.subplots(1, 7, figsize=(35, 5))
+        # border exclusion ring (green overlay on original image)
+        overlay_border = image.copy()
+        overlay_border[border_ring] = [0, 200, 0]
+
+        fig, axes = plt.subplots(1, 8, figsize=(40, 5))
 
         axes[0].imshow(image)
         axes[0].set_title("Original")
@@ -464,21 +509,27 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
         axes[3].set_title(f"Dark ({brightness_threshold_percentile}th pct)")
         axes[3].axis('off')
 
-        axes[4].imshow(overlay_raw)
-        axes[4].set_title(f"Raw holes ({raw_hole_mask.sum()} px)")
+        axes[4].imshow(overlay_border)
+        axes[4].set_title(f"Border excl. ring ({border_exclusion_width}px)")
         axes[4].axis('off')
 
-        axes[5].imshow(overlay_final)
-        axes[5].set_title(f"After CCA+dilation ({(hole_mask > 0).sum()} px)")
+        axes[5].imshow(overlay_raw)
+        axes[5].set_title(f"Raw holes after excl. ({raw_hole_mask.sum()} px)")
         axes[5].axis('off')
 
-        axes[6].imshow(image_cleaned)
-        axes[6].set_title("Cleaned")
+        axes[6].imshow(overlay_final)
+        axes[6].set_title(f"After CCA+dilation ({(hole_mask > 0).sum()} px)")
         axes[6].axis('off')
 
+        axes[7].imshow(image_cleaned)
+        axes[7].set_title("Cleaned")
+        axes[7].axis('off')
+
         plt.tight_layout()
-       # plt.savefig(os.path.join(str(save_folder), filename), dpi=100, bbox_inches='tight')
-        plt.savefig("hole_detection_visualization.png", dpi=100, bbox_inches='tight')
+        # Only save if new mask is different from raw hole mask (i.e. some holes were actually removed)
+      #  if (hole_mask > 0).sum() > 0:
+        plt.savefig(os.path.join(str(save_folder), filename), dpi=100, bbox_inches='tight')
+        #plt.savefig("hole_detection_visualization.png", dpi=100, bbox_inches='tight')
         plt.close()
 
     return image_cleaned, mask_cleaned, depth_cleaned
@@ -608,6 +659,52 @@ def find_holes(image, mask, depth, save_folder = None, filename = None,
 
     return image_cleaned, mask_cleaned, depth_cleaned
 
+def filter_darkness(image, mask, brightness_threshold_percentile=30, visualize=False):
+    """
+    Removes dark regions from the segmentation mask; image is returned unchanged.
+
+    Args:
+        image (np.ndarray): HxWx3 uint8 RGB image.
+        mask (np.ndarray): HxW binary mask (>0 = foreground).
+        brightness_threshold_percentile (int): Percentile of V-channel brightness
+            within the mask below which pixels are considered dark and removed.
+        visualize (bool): If True, saves a side-by-side figure to
+            filter_darkness_visualization.png.
+
+    Returns:
+        image (np.ndarray): Unchanged input image.
+        mask_filtered (np.ndarray): HxW uint8 mask with dark regions removed.
+    """
+    binary_mask = (mask > 0)
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    brightness = hsv[:, :, 2].astype(np.float32)
+    masked_brightness = brightness[binary_mask]
+    bright_thresh = np.percentile(masked_brightness, brightness_threshold_percentile)
+    dark_mask = ((brightness <= bright_thresh) & binary_mask).astype(np.uint8)
+
+    mask_filtered = mask.copy()
+    mask_filtered[dark_mask > 0] = 0
+
+    if visualize:
+        dark_overlay = cv2.cvtColor(image, cv2.COLOR_RGB2BGR).copy()
+        dark_overlay[dark_mask > 0] = [0, 0, 255]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ax, img, title in zip(axes,
+            [image,
+             dark_overlay,
+             mask_filtered],
+            ["Original", "Dark regions (red)", "Filtered mask"]):
+            ax.imshow(img, cmap='gray' if img.ndim == 2 else None)
+            ax.set_title(title)
+            ax.axis('off')
+        plt.tight_layout()
+        plt.savefig("filter_darkness_visualization.png", dpi=100, bbox_inches='tight')
+        plt.close()
+
+    return image, mask_filtered
+
+
 def overlay_mask_on_image(image, mask):
     # Create a red mask
     red_mask = np.zeros_like(image)
@@ -623,7 +720,7 @@ def overlay_mask_on_image(image, mask):
 def main():
 
     # Load the dataset (anomalous and non-anomalous samples)
-    dataset_path = Path("../../nvme1/dataset_single_objects/GT/filtered_darkness_80_0.3_seed_42_256/processed")
+    dataset_path = Path("../../nvme1/dataset_single_objects/GT/filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_0_gt_256/processed")
     normal_path = dataset_path / 'normal' / 'normal_samples.pkl'
     anomalous_path = dataset_path / 'anomalous' / 'anomalous_samples.pkl'
 
@@ -659,7 +756,7 @@ def main():
    # path_normal_depth.mkdir(parents=True, exist_ok=True)
    # path_anomalous_depth.mkdir(parents=True, exist_ok=True)
 
-    path_tests = dataset_path / 'normal' / 'tests'
+    path_tests = dataset_path / 'anomalous' / 'tests'
     import shutil
     if path_tests.exists():
         shutil.rmtree(path_tests)
@@ -668,22 +765,22 @@ def main():
     
 
     
-    for i in range(len(normal_data)):
+    for i in range(len(anomalous_data)):
 
-        normal_sample = normal_data[i]['image']
-        normal_mask = normal_data[i]['mask']
-        normal_depth = normal_data[i]['depth']
-        path = normal_data[i]['img_path']
+        anomalous_sample = anomalous_data[i]['image']
+        anomalous_mask = anomalous_data[i]['mask']
+        anomalous_depth = anomalous_data[i]['depth']
+        path = anomalous_data[i]['img_path']
         stem_path = (Path(path)).stem + '.png'
 
-        if stem_path == "img004_obj15_grade2.png": #"": #"img002_obj19_grade2.png": :
+      #  if stem_path == "img054_obj10_grade4.png": #"": #"img002_obj19_grade2.png": :
     
 
             # Convert sample to rgb
             
-            normal_sample = cv2.cvtColor(normal_sample, cv2.COLOR_BGR2RGB)
+        #    anomalous_sample = cv2.cvtColor(anomalous_sample, cv2.COLOR_BGR2RGB)
             # Visualize normal img
-            cv2.imwrite("original_normal_image.png", normal_sample)
+        #    cv2.imwrite("original_normal_image.png", anomalous_sample)
 
            # find_contour(normal_sample, normal_mask)
 
@@ -697,11 +794,13 @@ def main():
          #   find_holes(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
            # find_contour(normal_sample, normal_mask)
            # apply_cutout(normal_sample, normal_mask)
-          #  apply_specular_suppression(normal_sample, normal_mask, visualize=True, inpainting=True)
+           # apply_specular_suppression(anomalous_sample, anomalous_mask, visualize=True, inpainting=True)
+           # filter_darkness(anomalous_sample, anomalous_mask, brightness_threshold_percentile=30, visualize=True)
+         #   morphological_opening(anomalous_sample, anomalous_mask, kernel_size=15)
            
-            find_holes_fix(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
+        find_holes_fix(anomalous_sample, anomalous_mask, anomalous_depth, path_tests, stem_path, visualize_bool = True, depth_threshold_percentile = 40, brightness_threshold_percentile = 40)
           #  clean_protrusions(normal_sample, normal_mask, normal_depth)
-            break
+         #   break
 
 
 
