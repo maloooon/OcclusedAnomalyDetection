@@ -599,7 +599,7 @@ class SyntheticOcclusion:
 
 
         Workflow : 
-        1. Select two or moreraspberry images and their respective masks according to a sampling strategy (uniform across all raspberry imgs or only selecting from the N largest (in mask size)) ;
+        1. Select two or more raspberry images and their respective masks according to a sampling strategy (uniform across all raspberry imgs or only selecting from the N largest (in mask size)) ;
             we call the "source raspberry" the raspberry that is being pasted and the "target raspberry" the raspberry that is being pasted on. There is only one initial target raspberry, but there
             can be multiple source raspberries
         Repeat k-1 times (i.e. for each source raspberry) : 
@@ -635,6 +635,9 @@ class SyntheticOcclusion:
 
         original_target_size = np.sum(np.asarray(target_mask, dtype=bool))
 
+        snapshots_img = [np.asarray(target_img, dtype=np.uint8).copy()]
+        snapshots_mask = [np.asarray(target_mask, dtype=bool).copy()]
+
         for j in range(k):
             source_img = self.images[chosen_idx[j + 1]].copy()
             source_mask = self.masks[chosen_idx[j + 1]].copy()
@@ -647,10 +650,16 @@ class SyntheticOcclusion:
                 wanted_size_range=wanted_size_range,
                 randomize_scale_bool=randomize_scale_bool,
                 randomize_rotation_bool=randomize_rotation_bool,
-                visualize_bool=visualize_bool and (j == k - 1),
+                visualize_bool=False,
                 reassign_source_target_bool=reassign_source_target_bool,
                 original_target_size=original_target_size,
             )
+
+            snapshots_img.append(np.asarray(target_img, dtype=np.uint8).copy())
+            snapshots_mask.append(np.asarray(target_mask, dtype=bool).copy())
+
+        if visualize_bool:
+            self._visualize_multi_paste(snapshots_img, snapshots_mask, original_target_size, wanted_size_range)
 
         # Get occluded raspberry image
         target_img = np.asarray(target_img, dtype=np.uint8)
@@ -1231,6 +1240,66 @@ class SyntheticOcclusion:
       #      f"Returning original image.")
         return target_img, target_mask
 
+    def _visualize_multi_paste(self, snapshots_img, snapshots_mask, original_target_size, wanted_size_range=None):
+        """
+        Two-row visualization for multi_raspberry_occlusion.
+
+        Upper row: image state at each step (original → after 1st occlusion → ... → final).
+        Lower row: corresponding binary masks.
+        The last column shows pixel count and percentage remaining vs the original,
+        and whether the result falls within wanted_size_range.
+        """
+        n = len(snapshots_img)
+
+        fig, axes = plt.subplots(2, n, figsize=(5 * n, 10))
+        if n == 1:
+            axes = axes.reshape(2, 1)
+
+        final_mask = np.asarray(snapshots_mask[-1], dtype=bool)
+        final_visible = int(np.sum(final_mask))
+        final_pct = final_visible / original_target_size * 100 if original_target_size > 0 else 0.0
+
+        for col in range(n):
+            img = np.asarray(snapshots_img[col], dtype=np.uint8)
+            mask = np.asarray(snapshots_mask[col], dtype=bool)
+            visible_px = int(np.sum(mask))
+            pct = visible_px / original_target_size * 100 if original_target_size > 0 else 0.0
+
+            axes[0, col].imshow(img)
+            axes[1, col].imshow(mask, cmap='gray')
+
+            if col == 0:
+                axes[0, col].set_title(f'Original\n{original_target_size} px', fontsize=10)
+                axes[1, col].set_title(f'Original mask\n{original_target_size} px', fontsize=10)
+            elif col == n - 1:
+                range_str = ''
+                if wanted_size_range is not None:
+                    lo, hi = wanted_size_range[0] * 100, wanted_size_range[1] * 100
+                    in_range = lo <= final_pct <= hi
+                    range_str = f'\nTarget range: {lo:.0f}–{hi:.0f}%  {"✓" if in_range else "✗"}'
+                axes[0, col].set_title(
+                    f'After occlusion #{col}\n'
+                    f'{final_visible} / {original_target_size} px\n'
+                    f'{final_pct:.1f}% remaining{range_str}',
+                    fontsize=10
+                )
+                axes[1, col].set_title(
+                    f'Final mask\n'
+                    f'{final_visible} px remaining\n'
+                    f'({final_pct:.1f}%)',
+                    fontsize=10
+                )
+            else:
+                axes[0, col].set_title(f'After occlusion #{col}\n{visible_px} px ({pct:.1f}%)', fontsize=10)
+                axes[1, col].set_title(f'Mask after occlusion #{col}\n{visible_px} px', fontsize=10)
+
+            axes[0, col].axis('off')
+            axes[1, col].axis('off')
+
+        plt.tight_layout()
+        plt.savefig('multi_occlusion_visualization.png')
+        plt.close()
+
     def _visualize_paste(self, target_img, target_mask, source_img, source_mask,
                         transformed_source_img, transformed_source_mask,
                         result_img, result_mask, offset_y, offset_x):
@@ -1350,12 +1419,12 @@ def main():
 
     BONNET_SIZE = (961, 644)  # Width, Height taken from bonnet of img_001
     new_img, new_mask, grade_mask = synthetic_occlusion.multi_raspberry_occlusion(
-        wanted_size_range=(0.4,0.7),
+        wanted_size_range=(0.1,0.3),
         randomize_scale_bool=(False, 0.2, 0.8),
         randomize_rotation_bool=(False, -180,180),
         visualize_bool=True,
         reassign_source_target_bool = True,
-        sampling_mode= ('N_largest', 20),
+        sampling_mode= ('N_largest', 50),
         k = 2)
 
     new_img = np.asarray(new_img, dtype=np.uint8)

@@ -98,13 +98,14 @@ def find_contour(image,mask):
 
     cv2.imwrite("contour.png", contour_mask)
 
-def apply_specular_suppression(image, mask, visualize=True, inpainting=True):
+def apply_specular_suppression(image, mask, visualize=True, inpainting=True,
+                               save_all=False, save_folder=None, filename=None):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV) # NOTE:  might be RGB2HSV 
     S, V = hsv[:, :, 1], hsv[:, :, 2]
     
     s_thresh = 100
-    v_thresh = 220
-    max_blob_area = 150
+    v_thresh = 210
+    max_blob_area = 200
 
     raw_highlights = ((S < s_thresh) & (V > v_thresh) & (mask > 0)).astype(np.uint8) * 255
 
@@ -114,7 +115,7 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True):
         if stats[i, cv2.CC_STAT_AREA] <= max_blob_area:
             filtered[labels == i] = 255
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10,10))
     dilated = cv2.dilate(filtered, kernel, iterations=1) & (mask > 0).astype(np.uint8) * 255
     
 
@@ -140,7 +141,7 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True):
     if visualize:
         fig, axes = plt.subplots(1, 4, figsize=(16, 4))
         for ax, img, title in zip(axes,
-            [cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+            [image,
              raw_highlights,
              filtered,
              result],
@@ -148,7 +149,10 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True):
             ax.imshow(img, cmap='gray' if img.ndim == 2 else None)
             ax.set_title(title); ax.axis('off')
         plt.tight_layout()
-        plt.savefig("specular_suppression_visualization.png", dpi=100, bbox_inches='tight')
+        if save_all:
+            plt.savefig(os.path.join(str(save_folder), filename), dpi=100, bbox_inches='tight')
+        else:
+            plt.savefig("specular_suppression_visualization.png", dpi=100, bbox_inches='tight')
 
     return result, mask
 
@@ -174,9 +178,10 @@ def clean_protrusions(img, mask, depth, kernel_size=5):
     # drop any small fragments created by the opening
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
     if num_labels <= 1:
-        clean_depth = depth.copy()
-        clean_depth[opened == 0] = 0
-        return img, opened, clean_depth
+        # TODO: check
+      #  clean_depth = depth.copy()
+      #  clean_depth[opened == 0] = 0
+        return img, mask, depth # opened, clean_depth
 
     largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
     keep = labels == largest
@@ -329,7 +334,7 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
                                 from hole detection before CCA runs. This
                                 prevents shadow/darkness at the raspberry edge
                                 from being flagged as holes or bridging to
-                                real interior holes (default 10).
+                                real interior holes (default 30).
 
     Returns:
         image_cleaned: image with hole pixels zeroed out
@@ -720,7 +725,8 @@ def overlay_mask_on_image(image, mask):
 def main():
 
     # Load the dataset (anomalous and non-anomalous samples)
-    dataset_path = Path("../../nvme1/dataset_single_objects/GT/filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_0_gt_256/processed")
+    dataset_path = Path("../../nvme1/dataset_single_objects/GT/filtered_darkness_80_0.3_seed_42_gt_256/processed")
+    
     normal_path = dataset_path / 'normal' / 'normal_samples.pkl'
     anomalous_path = dataset_path / 'anomalous' / 'anomalous_samples.pkl'
 
@@ -773,14 +779,17 @@ def main():
         path = anomalous_data[i]['img_path']
         stem_path = (Path(path)).stem + '.png'
 
-      #  if stem_path == "img054_obj10_grade4.png": #"": #"img002_obj19_grade2.png": :
+       # if stem_path == "img076_obj8_grade5.png": #"": #"img002_obj19_grade2.png": :
     
 
             # Convert sample to rgb
             
         #    anomalous_sample = cv2.cvtColor(anomalous_sample, cv2.COLOR_BGR2RGB)
-            # Visualize normal img
-        #    cv2.imwrite("original_normal_image.png", anomalous_sample)
+            # Visualize normal img with white background
+          #  anomalous_sample_white_bg = anomalous_sample.copy()
+          #  anomalous_sample_white_bg[anomalous_mask == 0] = [255, 255, 255]
+          #  anomalous_sample_white_bg = cv2.cvtColor(anomalous_sample_white_bg, cv2.COLOR_BGR2RGB)
+          #  cv2.imwrite("original_normal_image.png", anomalous_sample_white_bg)
 
            # find_contour(normal_sample, normal_mask)
 
@@ -794,11 +803,11 @@ def main():
          #   find_holes(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
            # find_contour(normal_sample, normal_mask)
            # apply_cutout(normal_sample, normal_mask)
-           # apply_specular_suppression(anomalous_sample, anomalous_mask, visualize=True, inpainting=True)
+        apply_specular_suppression(anomalous_sample, anomalous_mask, visualize=True, inpainting=True, save_all = True, save_folder = path_tests, filename = stem_path)
            # filter_darkness(anomalous_sample, anomalous_mask, brightness_threshold_percentile=30, visualize=True)
          #   morphological_opening(anomalous_sample, anomalous_mask, kernel_size=15)
            
-        find_holes_fix(anomalous_sample, anomalous_mask, anomalous_depth, path_tests, stem_path, visualize_bool = True, depth_threshold_percentile = 40, brightness_threshold_percentile = 40)
+      #  find_holes_fix(anomalous_sample, anomalous_mask, anomalous_depth, path_tests, stem_path, visualize_bool = True, depth_threshold_percentile = 40, brightness_threshold_percentile = 40)
           #  clean_protrusions(normal_sample, normal_mask, normal_depth)
          #   break
 

@@ -332,7 +332,11 @@ class Evaluator:
                 # add predicted masks and img anomaly scores (check for numpy arrays or tensors)
                 if isinstance(anomaly_maps, torch.Tensor):
                     pred_masks.extend(anomaly_maps.cpu().numpy())
-                    pred_img_scores.extend(anomaly_scores.cpu().numpy())
+                    if len(anomaly_scores.size()) != 0:
+                        pred_img_scores.extend(anomaly_scores.cpu().numpy())
+                    else:
+                        # since possible that we get a torch.size([]) for the anomaly score, we need to convert it to a numpy array and then get the item (.extend doesn't work directly here)
+                        pred_img_scores.append(anomaly_scores.item())
                 else:
                     pred_masks.extend(anomaly_maps)
                     pred_img_scores.extend(anomaly_scores)

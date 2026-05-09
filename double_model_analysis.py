@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Dict, Tuple
 from dataclasses import dataclass
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
@@ -87,10 +89,90 @@ def _compute_metrics(true_labels: list, pred_labels: list) -> dict:
     }
  
  
-def compare_predictions(folder_a: str, folder_b: str, verbose: bool = True) -> dict:
+def _save_disagreement_figures(
+    samples: list,
+    folder_a: str,
+    folder_b: str,
+    out_dir: str = ".",
+) -> None:
+    """
+    Save two figures:
+      - <name_a>.png : images from folder_a that model A got wrong but model B got right
+      - <name_b>.png : images from folder_b that model B got wrong but model A got right
+    Images are loaded directly from the respective prediction folders.
+    """
+    name_a = Path(folder_a).name
+    name_b = Path(folder_b).name
+
+    def _build_fname_map(folder: str) -> Dict[str, str]:
+        fmap = {}
+        for fname in os.listdir(folder):
+            m = _FNAME_RE.match(fname)
+            if m:
+                fmap[m.group("sample_id")] = os.path.join(folder, fname)
+        return fmap
+
+    fmap_a = _build_fname_map(folder_a)
+    fmap_b = _build_fname_map(folder_b)
+
+    a_wrong_b_right = [s for s in samples if s.pred_a != s.true_label and s.pred_b == s.true_label]
+    b_wrong_a_right = [s for s in samples if s.pred_b != s.true_label and s.pred_a == s.true_label]
+
+    def _make_figure(wrong_samples: list, fmap: Dict[str, str], model_name: str) -> None:
+        n = len(wrong_samples)
+        if n == 0:
+            print(f"  No images where {model_name} is wrong and the other model is correct.")
+            return
+
+        ncols = min(n, 5)
+        nrows = (n + ncols - 1) // ncols
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows + 1), squeeze=False)
+        fig.suptitle(model_name, fontsize=13, fontweight="bold")
+
+        for i, s in enumerate(wrong_samples):
+            r, c = divmod(i, ncols)
+            ax = axes[r][c]
+            fpath = fmap.get(s.sample_id)
+            if fpath and os.path.exists(fpath):
+                ax.imshow(mpimg.imread(fpath))
+            else:
+                ax.text(0.5, 0.5, "image\nnot found", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=8)
+            ax.set_title(
+                f"{s.sample_id}\ntrue={s.true_label}  grade={s.grade}",
+                fontsize=7,
+            )
+            ax.axis("off")
+
+        for i in range(n, nrows * ncols):
+            r, c = divmod(i, ncols)
+            axes[r][c].axis("off")
+
+        plt.tight_layout()
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"disagree_{model_name}.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {out_path}")
+
+    print(f"\n--- Disagreement figures ---")
+    print(f"  {name_a} wrong, {name_b} correct: {len(a_wrong_b_right)} images")
+    _make_figure(a_wrong_b_right, fmap_a, name_a)
+
+    print(f"  {name_b} wrong, {name_a} correct: {len(b_wrong_a_right)} images")
+    _make_figure(b_wrong_a_right, fmap_b, name_b)
+
+
+def compare_predictions(folder_a: str, folder_b: str, verbose: bool = True,
+                        save_figures: bool = False, figures_out_dir: str = ".") -> dict:
     """
     Compare predictions from two model folders.
- 
+
+    Args:
+        save_figures:    If True, save two disagreement figures (one per model).
+        figures_out_dir: Directory to write the figures into.
+
     Returns a dict with:
       - model_a / model_b: individual model metrics
       - intersection_AND / union_OR: ensemble metrics
@@ -156,7 +238,10 @@ def compare_predictions(folder_a: str, folder_b: str, verbose: bool = True) -> d
  
     if verbose:
         _print_report(results, folder_a, folder_b)
- 
+
+    if save_figures:
+        _save_disagreement_figures(samples, folder_a, folder_b, out_dir=figures_out_dir)
+
     return results
  
  
@@ -385,13 +470,77 @@ def score_fusion(folder_a: str, folder_b: str, n_folds: int = 5, seed: int = 42,
  
  
 
- 
+
+def inspect_errors(folder: str, ncols: int = 6, out_dir: str = None) -> None:
+    """Display and save false positives and false negatives from a prediction folder, sorted by score ascending."""
+    if out_dir is None:
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "error_analysis")
+
+    fps, fns = [], []
+    for fname in os.listdir(folder):
+        m = _FNAME_RE.match(fname)
+        if m is None:
+            continue
+        true = int(m.group("true"))
+        pred = int(m.group("pred"))
+        score = float(m.group("score"))
+        sid = m.group("sample_id")
+        fpath = os.path.join(folder, fname)
+        if true == 0 and pred == 1:
+            fps.append((score, sid, fpath))
+        elif true == 1 and pred == 0:
+            fns.append((score, sid, fpath))
+
+    fps.sort(key=lambda x: x[0])
+    fns.sort(key=lambda x: x[0])
+    print(f"False positives: {len(fps)},  False negatives: {len(fns)}")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _make_figure(items: list, title: str, fname: str) -> None:
+        n = len(items)
+        if n == 0:
+            print(f"  No {title}.")
+            return
+        nc = min(n, ncols)
+        nr = (n + nc - 1) // nc
+        fig, axes = plt.subplots(nr, nc, figsize=(3 * nc, 3 * nr + 0.8), squeeze=False)
+        fig.suptitle(f"{title}  (n={n})", fontsize=12, fontweight="bold")
+        for i, (score, sid, fpath) in enumerate(items):
+            r, c = divmod(i, nc)
+            ax = axes[r][c]
+            ax.imshow(mpimg.imread(fpath))
+            ax.set_title(f"{sid}\nscore={score:.4f}", fontsize=6)
+            ax.axis("off")
+        for i in range(n, nr * nc):
+            r, c = divmod(i, nc)
+            axes[r][c].axis("off")
+        plt.tight_layout()
+        out_path = os.path.join(out_dir, fname)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {out_path}")
+        plt.show()
+        plt.close(fig)
+
+    # Get stem of folder
+    folder_stem = os.path.basename(os.path.normpath(folder))
+
+    _make_figure(fps, "False Positives  (true=normal, pred=anomalous)", f"false_positives_{folder_stem}.png")
+    _make_figure(fns, "False Negatives  (true=anomalous, pred=normal)", f"false_negatives_{folder_stem}.png")
+
+
 if __name__ == "__main__":
   #  compare_predictions(
+  #      folder_a="../../nvme1/visual_test/stfpm_wide_resnet50_2_data_FILTERED_DARKNESS_80_0.3_AND_CLEAN_PROTRUSIONS_SEED_0_GT_256_STRUCTCORE_test_set_NONE_replace/",
+  #      folder_b="../../nvme1/visual_test/stfpm_wide_resnet50_2_data_FILTERED_DARKNESS_80_0.3_AND_CLEAN_PROTRUSIONS_SEED_0_GT_256_MAXMEAN_1_test_set_NONE_replace/",
+  #      save_figures=True,
+  #      figures_out_dir="disagreement_figures/"
+  #  )
+
+    inspect_errors(
+        folder="../../nvme1/visual_test/stfpm_wide_resnet50_2_data_FILTERED_DARKNESS_80_0.3_AND_CLEAN_PROTRUSIONS_SEED_42_GT_256_MAXMEAN_1_test_set_HOLE_DARKNESS_40_40_replace/"
+    )
+  #  score_fusion(
   #      folder_a="../../disk/visual_test/patchcore_dinov2_vitb14_data_FULL_NO_FILTERS_SEED_0_256_MAXMEAN_1_test_set_NONE/",
   #      folder_b="../../disk/visual_test/sinbad_dinov2_vitb14_data_FULL_NO_FILTERS_SEED_0_256_MAXMEAN_1_test_set_NONE/",
   #  )
-    score_fusion(
-        folder_a="../../disk/visual_test/patchcore_dinov2_vitb14_data_FULL_NO_FILTERS_SEED_0_256_MAXMEAN_1_test_set_NONE/",
-        folder_b="../../disk/visual_test/sinbad_dinov2_vitb14_data_FULL_NO_FILTERS_SEED_0_256_MAXMEAN_1_test_set_NONE/",
-    )

@@ -5,9 +5,6 @@ from torchvision.transforms import GaussianBlur
 import torch.nn.functional as F
 import numpy as np
 
-from moviad.models.components.rd4ad.resnet import resnet18
-from moviad.models.components.rd4ad.deresnet import de_resnet18
-
 SEED = 32
 import random
 random.seed(SEED)
@@ -16,6 +13,20 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+
+from moviad.models.components.rd4ad import resnet as _enc
+from moviad.models.components.rd4ad import deresnet as _dec
+
+BACKBONE_MAP = {
+    "resnet18":         (_enc.resnet18,         _dec.de_resnet18),
+    "resnet34":         (_enc.resnet34,         _dec.de_resnet34),
+    "resnet50":         (_enc.resnet50,         _dec.de_resnet50),
+    "resnet101":        (_enc.resnet101,        _dec.resnet101),
+    "resnet152":        (_enc.resnet152,        _dec.resnet152),
+    "wide_resnet50_2":  (_enc.wide_resnet50_2,  _dec.de_wide_resnet50_2),
+    "wide_resnet101_2": (_enc.wide_resnet101_2, _dec.de_wide_resnet101_2),
+}
 
 class RD4AD(torch.nn.Module):
 
@@ -36,8 +47,17 @@ class RD4AD(torch.nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
-        self.encoder, self.bn = resnet18(pretrained=True)
-        self.decoder = de_resnet18(pretrained=False)
+       # self.encoder, self.bn = resnet18(pretrained=True)
+       # self.decoder = de_resnet18(pretrained=False)
+
+        if backbone_name not in BACKBONE_MAP:
+            raise ValueError(
+                f"Unsupported backbone '{backbone_name}' for RD4AD. "
+                f"Supported backbones: {list(BACKBONE_MAP)}"
+            )
+        encoder_fn, decoder_fn = BACKBONE_MAP[backbone_name]
+        self.encoder, self.bn = encoder_fn(pretrained=True)
+        self.decoder = decoder_fn(pretrained=False)
 
 
 
@@ -66,15 +86,18 @@ class RD4AD(torch.nn.Module):
         """
 
         if (isinstance(batch, tuple)):
-            if len(batch) == 5:
-                batch, mask, batch_og, mask_og, depth_og = batch
+            if len(batch) == 6:
+                batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch
             if len(batch) == 2:
                 batch, mask = batch
+                batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
+            if len(batch) == 3:
+                batch, mask, mask_unfiltered = batch
                 batch_og, mask_og, depth_og = None, None, None
 
         enc_batch = self.encoder(batch)
         # For DinoV2 also return cls token
-        if len(enc_batch) == 2:
+        if "dino" in self.backbone_name:
             enc_batch, cls_token = enc_batch
         bn_batch = self.bn(enc_batch)
         dec_batch = self.decoder(bn_batch)

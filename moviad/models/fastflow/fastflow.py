@@ -665,10 +665,13 @@ class CompleteFastFlowModel(nn.Module):
     def forward(self,input_tensor):
 
         if isinstance(input_tensor, tuple):
-            if len(input_tensor) == 5:
-                input_tensor, mask, batch_og, mask_og, depth_og = input_tensor
+            if len(input_tensor) == 6:
+                input_tensor, mask, mask_unfiltered, batch_og, mask_og, depth_og = input_tensor
             if len(input_tensor) == 2:
                 input_tensor, mask = input_tensor
+                batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
+            if len(input_tensor) == 3:
+                input_tensor, mask, mask_unfiltered = input_tensor
                 batch_og, mask_og, depth_og = None, None, None
 
         if isinstance(self.feature_extractor, VisionTransformer):
@@ -677,7 +680,7 @@ class CompleteFastFlowModel(nn.Module):
         elif isinstance(self.feature_extractor, Cait):
             # print("get_cait_features")
             features = self._get_cait_features(input_tensor)
-        elif "dinov2" in self.backbone_name:
+        elif "dino" in self.backbone_name:
             features, cls_tokens = self._get_cnn_features(input_tensor)
         else:
             # print("get_cnn_features")

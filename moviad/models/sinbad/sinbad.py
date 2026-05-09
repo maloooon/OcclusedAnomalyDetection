@@ -260,8 +260,12 @@ class SINBAD(nn.Module):
         if isinstance(input_tensor, tuple):
             if len(input_tensor) == 2:
                 input_tensor, mask = input_tensor
-            elif len(input_tensor) == 5:
-                input_tensor, mask, batch_og, mask_og, depth_og = input_tensor
+                batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
+            elif len(input_tensor) == 3:
+                input_tensor, mask, mask_unfiltered = input_tensor
+                batch_og, mask_og, depth_og = None, None, None
+            elif len(input_tensor) == 6:
+                input_tensor, mask, mask_unfiltered, batch_og, mask_og, depth_og = input_tensor
 
         # Extract features
         with torch.no_grad():

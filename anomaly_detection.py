@@ -53,6 +53,7 @@ from tqdm import tqdm
 from PIL import Image
 import pickle
 import random
+import math 
 
 import cv2 
 
@@ -66,7 +67,9 @@ from moviad.utilities.struct_core import StructCore
 
 from image_manipulation import find_holes
 
-from ss_cutout import CutoutReconstructionModel, apply_cutout, train_cutout_reconstruction
+from ss_cutout import (CutoutReconstructionModel, apply_cutout,
+                       train_cutout_reconstruction, create_cutout_model,
+                       DINOV2_EMBED_DIMS)
 
 
 
@@ -343,26 +346,47 @@ class SingleRaspberryDataset(Dataset):
 def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
                              unfreeze_from=10, epochs=30, lr=1e-4,
                              batch_size=32, n_holes=3, hole_size_range=(32, 64),
-                             target_path='full_no_filters'):
+                             target_path='full_no_filters',
+                             unfreeze_last_n_blocks=2,
+                             lora_rank=0, lora_alpha=None,
+                             lora_targets=('qkv', 'proj', 'fc1', 'fc2')):
+    """
+    Self-supervised cutout pre-training for backbone fine-tuning.
 
+    Supported backbones:
+      'mobilenet_v2'          — unfreeze_from controls which features.* block onwards is trained
+      'wide_resnet50_2'       — unfreeze_from controls which of the 4 encoder stages is trained
+                                (0=stem, 1=layer1, 2=layer2, 3=layer3; default 3 = only layer3)
+      'dinov2_vit{s,b,l,g}14' — unfreeze_last_n_blocks controls how many ViT blocks are trained
+                                 (unfreeze_from is ignored for DINOv2)
 
-    assert backbone == 'mobilenet_v2', "Currently only implemented for MobileNetv2"
+    After training, encoder weights are saved to save_path in the torchvision key format
+    so that CustomFeatureExtractor can load them via custom_weights_path with strict=False.
+    For DINOv2, see the note in DINOv2CutoutReconstructionModel.save_encoder_weights().
+    """
 
     train_set_path = dataset_path / Path(f'{target_path}/processed')
-
-
 
     train_dataset = SingleRaspberryDataset(
         train_set_path, split='train',
         synthetic_augmentation=False,
         AD_model='patchcore',
         backbone_model=backbone,
-        struct_core_collection_bool=True,  # such that we return (img, mask)
+        struct_core_collection_bool=True,  # returns (img, mask) pairs
     )
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    model = CutoutReconstructionModel(unfreeze_from=unfreeze_from, device = device)
+    # Select the right model class based on backbone type.
+    # DINOv2 uses unfreeze_last_n_blocks / LoRA params; CNN backbones use unfreeze_from.
+    if backbone in DINOV2_EMBED_DIMS:
+        model = create_cutout_model(backbone, device,
+                                    unfreeze_last_n_blocks=unfreeze_last_n_blocks,
+                                    lora_rank=lora_rank, lora_alpha=lora_alpha,
+                                    lora_targets=lora_targets)
+    else:
+        model = create_cutout_model(backbone, device, unfreeze_from=unfreeze_from)
+
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=lr
     )
@@ -370,20 +394,19 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    print(f"Cutout pretraining: {epochs} epochs, unfreeze from features.{unfreeze_from}")
+    print(f"Cutout pretraining [{backbone}]: {epochs} epochs")
     print(f"Trainable: {trainable:,} | Frozen: {frozen:,}")
 
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    trained_model = train_cutout_reconstruction(
+        model, train_dataloader, device,
+        epochs=epochs, lr=lr,
+        optimizer=optimizer, criterion=criterion,
+        n_holes=n_holes, hole_size_range=hole_size_range,
     )
-    criterion = torch.nn.MSELoss(reduction='none')
 
-    trained_model = train_cutout_reconstruction(model, train_dataloader, device, epochs=epochs, lr=lr, optimizer=optimizer, criterion=criterion)
-
-    # Save encoder weights only, mapped to torchvision naming
-    encoder_state = {f'features.{k}': v for k, v in trained_model.encoder.state_dict().items()}
-    torch.save(encoder_state, save_path)
-    print(f"Saved fine-tuned encoder to {save_path}")
+    # Each model class knows its own key-mapping format for the save.
+    trained_model.save_encoder_weights(save_path)
+    print(f"Saved fine-tuned {backbone} encoder to {save_path}")
 
     del model, optimizer, train_dataloader, train_dataset
     torch.cuda.empty_cache()
@@ -435,7 +458,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     elif mode == 'cfa':
         model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0)
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0, protrusion_damping_gamma = 0)
   #  if mode == 'patchcore':
    #     model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, cls_token_scoring_bool = False) # NOTE : adjust to keep testing
     #elif mode == 'cfa':
@@ -513,13 +536,12 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     torch.cuda.empty_cache()
     gc.collect()
 
-def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters'):
+def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', top_k_ratio = 0.01, filter_post = 'NONE', mask_border_filter_thickness = 0, protrusion_damping_radius = 0, protrusion_damping_gamma = 0):
     """
     After creating the memory bank/ training a model, collect descriptors for StructCore based on training data
-    NOTE : Currently only implemented for PatchCore
     """
 
-    struct_core = StructCore()
+    struct_core = StructCore(top_k_ratio = top_k_ratio)
 
 
     # initialize the feature extractor
@@ -538,12 +560,13 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
         train_dataset = torch.utils.data.Subset(train_dataset, range(max_dataset_size))
     print(f"Length train dataset: {len(train_dataset)}")
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
-
+    
+    # NOTE :added filter post etc. not tested ; but needed I think, such that STFPM collects on the correct post filters!
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500)
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student)
+        model = STFPM(teacher, student,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
 
     
 
@@ -602,13 +625,13 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
 
     return struct_core
 
-def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, pass_og_bool = False, custom_weights_path = None, cls_token_viz_bool = False):
+def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, pass_og_bool = False, custom_weights_path = None, cls_token_viz_bool = False, top_k_ratio = 0.01, protrusion_damping_radius = 0, protrusion_damping_gamma = 0):
     
 
     
     if scoring_mode == 'STRUCTCORE':
         print("StructCore collection ...")
-        struct_core = struct_core_collection(dataset_path, backbone, ad_layers, model_checkpoint_path, device, max_dataset_size, mode, target_path)
+        struct_core = struct_core_collection(dataset_path, backbone, ad_layers, model_checkpoint_path, device, max_dataset_size, mode, target_path, top_k_ratio = top_k_ratio, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
         print("StructCore collection done")
 
         
@@ -640,11 +663,11 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     model_load_start_time = time()
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = 0, protrusion_damping_gamma = 1)
+        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
     elif mode == 'cfa':
         model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 5, protrusion_damping_gamma = 1)
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
     elif mode == 'rd4ad':
         model = RD4AD(backbone, device, input_size = (224,224), struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'fastflow':
@@ -715,7 +738,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 0.37617567
+    opt_threshold = 0.35435453
 
 
     # chek for the visual test
@@ -894,7 +917,6 @@ def detailed_eval(data_path):
     return results
 
 
-import math 
 '''
 def saving_criteria(best_metrics, new_metrics):
     # Since this is needed for the AD models that have training
@@ -920,6 +942,13 @@ def saving_criteria(best_metrics, new_metrics):
 
 
 def main():
+
+    # TODO : try StructCore with topkmean higher percentage (i.e. we look at more of the highest scores)
+
+    # TODO : think that specular suppression (i.e. removing drupelets) is hurting the model... need to understand why
+
+    # TODO : try RD4AD implement that we can use backbone for better testing ? ; I think for RD4AD it is exactly as in the paper implemented, so need to exlain it like that aswell!! i.e. that we ALWAYS use layers1,2,3 from WRN-50-2 and the architecture of layer4 as the OCBE block...
+    # TODO : could adjust simplenet to just take max of anomaly map and then adapt mask filtering in theory ; apparently paper showed that in the unsupervised setting, no difference
 
 
     # TODO : GANOMALY NO!!!! ANOMALY MAPS !! DONT PUT THAT IN THESIS, no idea if they maybe wrote an approximation or how I managed to actually produce anomaly maps
@@ -948,15 +977,22 @@ def main():
     # TODO : NOTE THAT POST FILTERS are NOT in the training loop, i.e. results based on FILTER_POST we ONLY get by running test_model !!! ; only for patchcore, stfpm now in train loop
 
 
-    MODEL_MODE = 'patchcore' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
-    SYN_AUG_BOOL = True # whether to use synthetic occlusions during training
+
+
+
+    # TODO : maybe clean protrusions followed by smoothing in those areas (since they can be sharp and I think anomalies are detected there, double check)
+    # TODO : fix the filter holes, it bumps performance already (on STFPM) but need to understand why it doesn't find all holes
+    
+
+    MODEL_MODE = 'stfpm' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
+    SYN_AUG_BOOL = False # whether to use synthetic occlusions during training
     SYN_AUG_MODE = 'replace' # 'replace' or 'augment'
 
     # NOTE : this only works with patchcore + dinov2 
     CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    FILTER_PRE = 'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    FILTER_PRE = 'filtered_darkness_80_0.3_and_clean_protrusions_seed_42_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
   
     FILTER_PRE = FILTER_PRE.upper()
@@ -967,8 +1003,10 @@ def main():
     else:
         pass_og_bool = False
 
-    FILTER_POST = 'NONE' # HOLE_DARKNESS_15_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details ; DARKNESS_k : filter out dark areas based on darkness of raspberry, k refers to threshold for darkness ; see utilities/filters for more details ; NONE if no post filtering
-    SCORING = 'MAXMEAN_1' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
+    FILTER_POST = 'NONE' # HOLE_DARKNESS_40_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details ; DARKNESS_k : filter out dark areas based on darkness of raspberry, k refers to threshold for darkness ; see utilities/filters for more details ; DRUPELETS for removing specular highlights ; NONE if no post filtering
+    SCORING = 'STRUCTCORE' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
+
+    TOP_K_RATIO_STRUCTCORE = 0.04
 
 
     dataset_path = Path('../../nvme1/dataset_single_objects/GT/') 
@@ -986,30 +1024,35 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-  #  backbone = "wide_resnet50_2" 
-    backbone = "dinov2_vitb14"
+    backbone = "wide_resnet50_2" 
+   # backbone = "dinov2_vitb14"
    # backbone = 'mobilenet_v2'
    # backbone = "dinov3_vitb16"
   #  ad_layers = ["features.4", "features.7", "features.10"] 
    # ad_layers = ["layer4"]
   #  ad_layers = ["features.10"] # SINBAD tests
-  #  ad_layers = ["layer2", "layer3"]
+    ad_layers = ["layer2", "layer3"]
     
-    ad_layers = [3,6] 
+  #  ad_layers = [11] 
   #  if CLS_TOKEN_VIZ_BOOL:
   #      ad_layers.append(11) # extracting also CLS token for visualizations
     end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
     save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{SYN_AUG_MODE}_" if SYN_AUG_BOOL else f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_no_aug_"
 
     custom_weights_path = None
-   # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout_{'_'.join(ad_layers)}.pt"
+   # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout_{'_'.join([str(layer) for layer in ad_layers])}.pt"
    # if not os.path.exists(custom_weights_path):
    #     raise FileNotFoundError(f"Custom weights not found at {custom_weights_path}. Please run pretrain_backbone_cutout first to generate these weights.")
 
-   # pretrain_backbone_cutout(dataset_path, device, backbone, save_path = custom_weights_path, unfreeze_from=4, epochs=50, lr=1e-4, batch_size=32, n_holes=1, hole_size_range=(32, 64), target_path = target_path)
+
+    # unfreeze_from : mobilenet/wrn-50-2, unfreeze_last_n_blocks : vit, for vit we unfreeze the last n blocks, for mobilenet/wrn we unfreeze from the layer specified by unfreeze_from (e.g. 4 means unfreeze from layer4 and then also layer4 itself)
+   # pretrain_backbone_cutout(dataset_path, device, backbone, save_path=custom_weights_path,
+   #                         unfreeze_from=4, epochs=10, lr=1e-3, batch_size=32,
+   #                         n_holes=1, hole_size_range=(32, 64), target_path=target_path, unfreeze_last_n_blocks=1, lora_rank = 4, lora_alpha = 4)
+
 
   
-    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
+   # train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
 
     # Check if visual test path exists and clear it out if it already exists
     if SYN_AUG_BOOL:
@@ -1023,8 +1066,15 @@ def main():
 
 
     
- #   test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
- #   detailed_eval(visual_test_path)
+    test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE,
+     target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, 
+     filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, 
+     custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, top_k_ratio = TOP_K_RATIO_STRUCTCORE,
+    protrusion_damping_radius = 0, protrusion_damping_gamma = 1)
+    #detailed_eval(visual_test_path)
+
+    # TODO : YES! SEEMS LIKE HIGHER top_k_ratio leads to STRUCTCORE GIVING BETTER RESULTS!!!! ; 0.04 boosts by like 0.8% in  AUROC, 2% in F1, 0.4% in PR ! 'filtered_darkness_80_0.3_and_clean_protrusions_seed_42_gt_256', no augmentation !! 
+    # TODO : currently showed better results in one case, need to test over more cases (on STFPM it worked!) ; then possibly also think whether we can adapt StructCore somehow for our use case?
 
 
 if __name__ == "__main__":

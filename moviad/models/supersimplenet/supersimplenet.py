@@ -115,9 +115,18 @@ class SuperSimpleNet(nn.Module):
             training: anomaly map, score and GT masks and labels
         """
 
-        # NOTE : always added in every forward of every model (since in PatchCore we need masks for some post-processing)
+    
         if isinstance(images, tuple):
-            images, masks, _, _ , _ = images
+            if len(images) == 2:
+                images, masks = images
+                mask_unfiltered, batch_og, mask_og, depth_og = None, None, None, None
+            elif len(images) == 3:
+                images, masks, masks_unfiltered = images
+                batch_og, mask_og, depth_og = None, None, None
+            elif len(images) == 6:
+                images, masks, masks_unfiltered, batch_og, mask_og, depth_og = images
+
+           # images, masks, _, _ , _ = images
 
         output_size = images.shape[-2:]
 
@@ -141,6 +150,7 @@ class SuperSimpleNet(nn.Module):
 
         anomaly_map, anomaly_score = self.segdec(adapted)
         anomaly_map = self.anomaly_map_generator(anomaly_map, final_size=output_size)
+
 
         return anomaly_map, anomaly_score
 

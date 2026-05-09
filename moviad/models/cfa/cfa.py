@@ -122,6 +122,9 @@ class CFA(nn.Module):
             if len(x) == 2:
                 x, mask = x
                 mask_unfiltered, batch_og, mask_og, depth_og = None, None, None, None
+            if len(x) == 3:
+                x, mask, mask_unfiltered = x
+                batch_og, mask_og, depth_og = None, None, None
     
         p = self.feature_extractor(x)
 

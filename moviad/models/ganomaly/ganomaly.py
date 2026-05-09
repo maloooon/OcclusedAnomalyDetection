@@ -544,10 +544,14 @@ class Ganomaly(nn.Module):
         """
 
         if (isinstance(batch, tuple)):
-            if len(batch) == 5:
-                batch, mask, batch_og, mask_og, depth_og = batch
+            if len(batch) == 6:
+                batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch
             if len(batch) == 2:
                 batch, mask = batch
+                batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
+            if len(batch) == 3:
+                batch, mask, mask_unfiltered = batch
+                batch_og, mask_og, depth_og = None, None, None
 
         padded_batch = Ganomaly.pad_nextpow2(batch)
         fake, latent_i, latent_o = self.generator(padded_batch)

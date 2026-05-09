@@ -128,6 +128,83 @@ def filter_holes_batched(batch_og, mask_og, depth_og,
     return torch.from_numpy(np.stack(hole_masks)).unsqueeze(1).float()  # (B, 1, H_og, W_og)
 
 
+def filter_specular_drupelets_batched(
+    batch_og,
+    mask_og,
+    s_threshold: int = 100,
+    v_threshold: int = 210,
+    max_blob_area: int = 200,
+    dilation_radius: int = 5,
+) -> torch.Tensor:
+    """
+    Detect specular drupelet highlights at original resolution using saturation +
+    value thresholding, CCA-based size filtering, and optional dilation.
+
+    Only connected components with area <= max_blob_area are kept (small highlights
+    correspond to individual drupelets), then optionally dilated within the mask.
+
+    Args:
+        batch_og: torch.Tensor (B, 3, H_og, W_og) or list of arrays, original RGB images
+        mask_og: torch.Tensor (B, 1, H_og, W_og) or list of arrays, segmentation masks
+        s_threshold: pixels with S < s_threshold are low-saturation (specular candidate)
+        v_threshold: pixels with V > v_threshold are bright (specular candidate)
+        max_blob_area: only components with area <= this are kept as drupelets
+        dilation_radius: expand surviving regions outward by this many pixels,
+            constrained to the raspberry mask; 0 disables dilation
+
+    Returns:
+        torch.Tensor (B, 1, H_og, W_og) float, 1 = specular drupelet pixel
+    """
+    B = len(batch_og) if isinstance(batch_og, list) else batch_og.shape[0]
+    specular_masks = []
+
+    for i in range(B):
+        img = batch_og[i]
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu().numpy()
+        if img.ndim == 3 and img.shape[0] in (1, 3):
+            img = np.transpose(img, (1, 2, 0))
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+
+        m = mask_og[i]
+        if isinstance(m, torch.Tensor):
+            m = m.detach().cpu().numpy()
+        if m.ndim == 3:
+            m = m.squeeze(0)
+        binary_mask = (m > 0).astype(np.uint8)
+
+        og_h, og_w = binary_mask.shape
+
+        if binary_mask.sum() == 0:
+            specular_masks.append(np.zeros((og_h, og_w), dtype=np.float32))
+            continue
+
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        S = hsv[:, :, 1].astype(np.float32)
+        V = hsv[:, :, 2].astype(np.float32)
+
+        raw_highlights = ((S < s_threshold) & (V > v_threshold) & (binary_mask > 0)).astype(np.uint8)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_highlights, connectivity=8)
+        filtered = np.zeros_like(raw_highlights)
+        for j in range(1, num_labels):
+            if stats[j, cv2.CC_STAT_AREA] <= max_blob_area:
+                filtered[labels == j] = 1
+
+        if dilation_radius > 0:
+            dil_size = 2 * dilation_radius + 1
+            dil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_size, dil_size))
+            expanded = cv2.dilate(filtered, dil_kernel).astype(bool)
+            filtered = (expanded & (binary_mask > 0)).astype(np.uint8)
+
+        specular_masks.append(filtered.astype(np.float32))
+
+    return torch.from_numpy(np.stack(specular_masks)).unsqueeze(1).float()  # (B, 1, H_og, W_og)
+
+
 def compute_hole_mask_patchgrid(
     batch_og, mask_og, depth_og,
     patch_h, patch_w,
@@ -344,7 +421,7 @@ def suppress_removed_mask_regions(
                           <1 = stronger suppression further out;
                           >1 = more abrupt recovery to full score.
         removed_mask:     (B, 1, H, W) pre-computed binary mask of the region to
-                          suppress. When given, mask/mask_unfiltered are ignored.
+                          suppress. When given, unioned with the mask-diff region derived from mask / mask_unfiltered.
 
     Returns:
         score_maps modified in-place.

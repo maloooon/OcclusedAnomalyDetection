@@ -6,7 +6,7 @@ import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
-from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_darkness_mask
+from ...utilities.filters import filter_holes_batched, filter_specular_drupelets_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_darkness_mask
 from time import time
 
 SEED = 32
@@ -265,9 +265,10 @@ class STFPM(torch.nn.Module):
                 batch_og, mask_og, depth_og,
                 depth_threshold_percentile=int(thresh_depth),
                 brightness_threshold_percentile=int(thresh_dark),
-                dilation_radius = 5
+                dilation_radius = 0
             ).to(effective_mask.device)
            # effective_mask = effective_mask * (1.0 - hole_mask_patch)
+
 
         if 'ONLY_DARKNESS' in self.filter_post:
             thresh_dark = self.filter_post.split('_')[1]
@@ -277,13 +278,19 @@ class STFPM(torch.nn.Module):
                 post_mask_filtered = torch.clamp(post_mask_filtered + dark_mask, 0, 1)
             else:
                 post_mask_filtered = dark_mask
-            
+
+        if 'DRUPELETS' in self.filter_post:
+            specular_mask = filter_specular_drupelets_batched(batch_og, mask_og).to(effective_mask.device)
+            if post_mask_filtered is not None:
+                post_mask_filtered = torch.clamp(post_mask_filtered + specular_mask, 0, 1)
+            else:
+                post_mask_filtered = specular_mask
 
        # effective_mask_flat = effective_mask.reshape(batch_size, -1)
         score_maps = score_maps * effective_mask
 
 
-        if self.protrusion_damping_radius > 0 and mask_unfiltered is not None:
+        if self.protrusion_damping_gamma > 0:
             score_maps = suppress_removed_mask_regions(
                 score_maps, mask, mask_unfiltered,
                 influence_radius=self.protrusion_damping_radius,

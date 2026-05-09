@@ -739,12 +739,12 @@ def main():
     # --- Config ---
     IMG_SIZE = 256
     UNBLURRED = False
-    SPECULAR_SUPPRESSION = False
+    SPECULAR_SUPPRESSION = True
     CLEAN_PROTRUSIONS = True
     FILTER_HOLES = False
     HOLES_DEPTH_THRESH = 40
     HOLES_BRIGHTNESS_THRESH = 40
-    SEED = 0
+    SEED = 1
  
 
     SIZE_FILTERING = False
@@ -831,7 +831,6 @@ def main():
 
 
     # --- Step 1: Create full unfiltered dataset ---
-    # CHANGE: No filtering params passed. This is always the complete dataset.
 
     masks = all_gt_masks if CREATE_BASED_ON == 'gt' else all_pred_masks
 

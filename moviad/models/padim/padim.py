@@ -171,10 +171,14 @@ class Padim(nn.Module):
     def forward(self, x):
 
         if isinstance(x, tuple):
-            if len(x) == 5:
-                x, mask, batch_og, mask_og, depth_og = x
+            if len(x) == 6:
+                x, mask, mask_unfiltered, batch_og, mask_og, depth_og = x
             if len(x) == 2:
                 x, mask = x
+                mask_unfiltered, batch_og, mask_og, depth_og = None, None, None, None
+            if len(x) == 3:
+                x, mask, mask_unfiltered = x
+                batch_og, mask_og, depth_og = None, None, None
  
 
         # 1. extract feature maps and get the raw layer outputs (conv. feature maps)
@@ -252,13 +256,13 @@ class Padim(nn.Module):
             effective_mask = (effective_mask > 0).float()
             score_map_t = score_map_t * effective_mask
 
-        if 'HOLE_DARKNESS' in self.filter_post:
-            thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-            score_map_t = filter_holes_batched(
-                score_map_t, batch, batch_og, mask_og, depth_og,
-                depth_threshold_percentile=int(thresh_depth),
-                brightness_threshold_percentile=int(thresh_dark)
-            )
+      #  if 'HOLE_DARKNESS' in self.filter_post:
+      #      thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
+      #      score_map_t = filter_holes_batched(
+       #         score_map_t, batch, batch_og, mask_og, depth_og,
+       #         depth_threshold_percentile=int(thresh_depth),
+       #         brightness_threshold_percentile=int(thresh_dark)
+       #     )
 
         flat = score_map_t.view(score_map_t.size(0), -1)
         anomaly_scores = torch.max(flat, dim=1)[0]
