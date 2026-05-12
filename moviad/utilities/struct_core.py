@@ -117,7 +117,8 @@ class StructCore:
         tv = (diff_h + diff_w) / N                                     # (B,)
 
         # Stack into a single descriptor per image: (B, 3)
-        return torch.stack([sigma, topk_mean, tv], dim=1)
+        #sigma, topk_mean, tv
+        return torch.stack([topk_mean], dim=1)
 
     def accumulate(self, anomaly_map: Tensor, base_score: Tensor) -> None:
         """

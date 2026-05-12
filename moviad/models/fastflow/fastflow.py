@@ -681,6 +681,7 @@ class CompleteFastFlowModel(nn.Module):
             # print("get_cait_features")
             features = self._get_cait_features(input_tensor)
         elif "dino" in self.backbone_name:
+            # Uses internally custom_feature_extractor_trimmed, which we adjusted for dino
             features, cls_tokens = self._get_cnn_features(input_tensor)
         else:
             # print("get_cnn_features")
@@ -690,11 +691,25 @@ class CompleteFastFlowModel(nn.Module):
 
         if not self.training:
             anomaly_maps = self.anomaly_map_generator(hidden_variables)
-            return_val = (
-                anomaly_maps, 
-                anomaly_maps.view(anomaly_maps.shape[0],-1).max(dim=1).values
-            )
+            anomaly_scores = anomaly_maps.view(anomaly_maps.shape[0],-1).max(dim=1).values
+
+
+            if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+                anomaly_scores = self.struct_core_instance.score(anomaly_maps, anomaly_scores)
+            else:
+                k = float(self.scoring_mode.split('_')[-1])
+                max_scores = anomaly_scores
+                mean_scores = torch.mean(flat, dim=1)
+                anomaly_scores = k * max_scores + (1 - k) * mean_scores
+
+            return_val = (anomaly_maps, anomaly_scores)
             return return_val
+
+          #  return_val = (
+          #      anomaly_maps, 
+          #      anomaly_maps.view(anomaly_maps.shape[0],-1).max(dim=1).values
+          #  )
+          #  return return_val
 
         '''
         if not self.training:

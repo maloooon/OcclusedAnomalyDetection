@@ -230,6 +230,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
         curr_masks_unfiltered = []
         curr_depth_raw = []
         curr_depth_processed = []
+        curr_hole_booleans = []
 
         for j, mask in enumerate(img_masks):
             masked_img = img.copy()
@@ -258,6 +259,19 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                dilation_radius=15,
                border_exclusion_width = 30)
 
+
+            # This only returns a boolean whether we detected any holes or not, using this for hole training augmentation purposes
+            img_hole_boolean = find_holes_fix(masked_img_processed, mask_processed, depth_processed, visualize_bool = False, depth_threshold_percentile=filter_holes_depth_thresh,
+            brightness_threshold_percentile=filter_holes_brightness_thresh,
+            small_hole_max_area=100,
+            surrounding_threshold=0.80,
+            min_hole_area=200,
+            dilation_radius=15,
+            border_exclusion_width = 30,
+            return_boolean = True)
+
+            curr_hole_booleans.append(img_hole_boolean)
+
             if spec_supression_bool:
                 masked_img_processed, mask_processed = apply_specular_suppression(masked_img_processed, mask_processed, visualize=False, inpainting = True)
 
@@ -275,14 +289,15 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
         if ids is not None and grades_matched:
             dataset.append((curr_img_raw, curr_img_processed, curr_masks_raw,
                           curr_masks_processed, curr_masks_unfiltered, curr_depth_raw, curr_depth_processed,
-                          ids[idx], grades_matched[idx]))
+                          curr_hole_booleans, ids[idx], grades_matched[idx]))
         elif ids is not None:
             dataset.append((curr_img_raw, curr_img_processed, curr_masks_raw,
                           curr_masks_processed, curr_masks_unfiltered, curr_depth_raw, curr_depth_processed,
-                          ids[idx]))
+                          curr_hole_booleans, ids[idx]))
         else:
             dataset.extend(list(zip(curr_img_raw, curr_img_processed, curr_masks_raw,
-                                   curr_masks_processed, curr_masks_unfiltered, curr_depth_raw, curr_depth_processed)))
+                                   curr_masks_processed, curr_masks_unfiltered, curr_depth_raw, curr_depth_processed,
+                                   curr_hole_booleans)))
 
     # --- Saving logic (unchanged structure, but no filtering branches) ---
     if save_path is not None:
@@ -306,7 +321,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
 
         for i, item in enumerate(dataset):
             if ids is not None and grades_matched:
-                imgs_raw, imgs_processed, masks_raw, masks_processed, masks_unfiltered, depths_raw, depths_processed, img_id, img_grades = item
+                imgs_raw, imgs_processed, masks_raw, masks_processed, masks_unfiltered, depths_raw, depths_processed, hole_booleans, img_id, img_grades = item
                 
                 raw_img_folder = os.path.join(raw_path, img_id)
                 processed_img_folder = os.path.join(processed_path, img_id)
@@ -347,6 +362,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                         'mask_unfiltered': masks_unfiltered[j],
                         'image': curr_img_processed,
                         'depth': curr_depth_processed,
+                        'has_hole': hole_booleans[j],
                     })
 
                 raw_data_dict = {
@@ -365,7 +381,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                 np.savez_compressed(os.path.join(processed_img_folder, f'processed_{img_id}_data.npz'), **processed_data_dict)
 
             elif ids is not None:
-                imgs_raw, imgs_processed, masks_raw, masks_processed, masks_unfiltered, depths_raw, depths_processed, img_id = item
+                imgs_raw, imgs_processed, masks_raw, masks_processed, masks_unfiltered, depths_raw, depths_processed, hole_booleans, img_id = item
                 
                 raw_img_folder = os.path.join(raw_path, img_id)
                 processed_img_folder = os.path.join(processed_path, img_id)
@@ -393,7 +409,8 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                         'mask': masks_processed[j],
                         'mask_unfiltered': masks_unfiltered[j],
                         'image': img_processed,
-                        'depth': depth_processed,  # BUGFIX: was `curr_depth_processed` (undefined in this branch)
+                        'depth': depth_processed,  
+                        'has_hole': hole_booleans[j],
                     })
 
                 raw_data_dict = {
@@ -410,7 +427,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                 np.savez_compressed(os.path.join(processed_img_folder, f'processed_{img_id}_data.npz'), **processed_data_dict)
 
             else:
-                imgs_raw, imgs_processed, masks_raw, masks_processed, masks_unfiltered, depths_raw, depths_processed = item
+                imgs_raw, imgs_processed, masks_raw, masks_processed, masks_unfiltered, depths_raw, depths_processed, hole_booleans = item
                 
                 raw_img_folder = os.path.join(raw_path, f"img_{i}")
                 processed_img_folder = os.path.join(processed_path, f"img_{i}")
@@ -439,6 +456,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                         'mask_unfiltered': masks_unfiltered[j],
                         'image': img_processed,
                         'depth': depth_processed,
+                        'has_hole': hole_booleans,
                     })
 
                 raw_data_dict = {
@@ -739,12 +757,12 @@ def main():
     # --- Config ---
     IMG_SIZE = 256
     UNBLURRED = False
-    SPECULAR_SUPPRESSION = True
+    SPECULAR_SUPPRESSION = False
     CLEAN_PROTRUSIONS = True
     FILTER_HOLES = False
     HOLES_DEPTH_THRESH = 40
     HOLES_BRIGHTNESS_THRESH = 40
-    SEED = 1
+    SEED = 0
  
 
     SIZE_FILTERING = False

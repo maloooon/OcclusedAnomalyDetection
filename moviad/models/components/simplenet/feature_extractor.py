@@ -21,7 +21,7 @@ class UpscalingFeatureExtractor(nn.Module):
             padding=patch_size // 2,
         )
 
-    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_tensor: torch.Tensor, feature_extractor_name) -> torch.Tensor:
         """Extract features from input tensor.
 
         Args:
@@ -30,23 +30,30 @@ class UpscalingFeatureExtractor(nn.Module):
         Returns:
             (torch.Tensor): extracted feature map.
         """
+
         features = self.feature_extractor(input_tensor)
 
-        _, _, h, w = features[0].shape
-        feature_map = []
-        for layer in features:
-            # upscale all to 2x the size of the first (largest)
-            resized = F.interpolate(
-                layer,
-                size=(h * 2, w * 2),
-                mode="bilinear",
-            )
-            feature_map.append(resized)
-        # channel-wise concat
-        feature_map = torch.cat(feature_map, dim=1)
+        if "dino" in feature_extractor_name:
+            features, cls_tokens = features
+            return torch.cat(features, dim =1) # no upscaling or pooling for dino features (since all have same size + we have attention mechanism)
+        
+        else:
 
-        # neighboring patch aggregation
-        return self.pooler(feature_map)
+            _, _, h, w = features[0].shape
+            feature_map = []
+            for layer in features:
+                # upscale all to 2x the size of the first (largest)
+                resized = F.interpolate(
+                    layer,
+                    size=(h * 2, w * 2),
+                    mode="bilinear",
+                )
+                feature_map.append(resized)
+            # channel-wise concat
+            feature_map = torch.cat(feature_map, dim=1)
+
+            # neighboring patch aggregation
+            return self.pooler(feature_map)
 
     def get_channels_dim(self) -> int:
         return self.feature_extractor.get_channels_dim()

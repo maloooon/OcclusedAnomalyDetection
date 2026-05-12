@@ -560,5 +560,15 @@ class Ganomaly(nn.Module):
         scores = torch.mean(torch.pow((latent_i - latent_o), 2), dim=1).view(-1)  # convert nx1x1 to n
         anomaly_maps = torch.mean(torch.pow((padded_batch - fake), 2), dim=1).unsqueeze(1)
 
+        if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+            anomaly_scores = self.struct_core_instance.score(anomaly_maps, scores)
+        else:
+            k = float(self.scoring_mode.split('_')[-1])
+            max_scores = scores
+            mean_scores = torch.mean(flat, dim=1)
+            anomaly_scores = k * max_scores + (1 - k) * mean_scores
 
-        return anomaly_maps, scores
+
+
+
+        return anomaly_maps, anomaly_scores

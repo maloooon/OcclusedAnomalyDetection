@@ -97,8 +97,8 @@ class RD4AD(torch.nn.Module):
 
         enc_batch = self.encoder(batch)
         # For DinoV2 also return cls token
-        if "dino" in self.backbone_name:
-            enc_batch, cls_token = enc_batch
+       # if "dino" in self.backbone_name:
+       #     enc_batch, cls_token = enc_batch
         bn_batch = self.bn(enc_batch)
         dec_batch = self.decoder(bn_batch)
 

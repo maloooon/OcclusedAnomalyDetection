@@ -70,8 +70,13 @@ class SuperSimpleNet(nn.Module):
         feature_extractor,
         perlin_threshold: float = DEFAULT_PARAMETERS["perlin_threshold"],
         stop_grad: bool = DEFAULT_PARAMETERS["stop_grad"],
+        struct_core_instance = None,
+        scoring_mode = 'MAXMEAN_1',
     ) -> None:
         super().__init__()
+
+        # Get feature extractor name
+        self.feature_extractor_name = feature_extractor.model_name
 
         # feature extractor and pool
         self.feature_extractor = UpscalingFeatureExtractor(feature_extractor)
@@ -88,12 +93,16 @@ class SuperSimpleNet(nn.Module):
 
         self.segdec = Discriminator(channel_dim=channels, stop_grad=stop_grad)
         self.anomaly_generator = AnomalyGenerator(
-            noise_mean=self.DEFAULT_PARAMETERS["gaussian_noise_mean"], 
-            noise_std=self.DEFAULT_PARAMETERS["gaussian_noise_std"], 
-            threshold=self.DEFAULT_PARAMETERS["perlin_threshold"]
+            noise_mean=self.DEFAULT_PARAMETERS["gaussian_noise_mean"],
+            noise_std=self.DEFAULT_PARAMETERS["gaussian_noise_std"],
+            threshold=self.DEFAULT_PARAMETERS["perlin_threshold"],
+            feature_extractor_name=self.feature_extractor_name,
         )
 
         self.anomaly_map_generator = AnomalyMapGenerator(sigma=4)
+
+        self.struct_core_instance = struct_core_instance
+        self.scoring_mode = scoring_mode
 
     def forward(
         self,
@@ -130,7 +139,7 @@ class SuperSimpleNet(nn.Module):
 
         output_size = images.shape[-2:]
 
-        features = self.feature_extractor(images)
+        features = self.feature_extractor(images, self.feature_extractor_name)
         adapted = self.adaptor(features)
 
         if self.training:
@@ -150,6 +159,20 @@ class SuperSimpleNet(nn.Module):
 
         anomaly_map, anomaly_score = self.segdec(adapted)
         anomaly_map = self.anomaly_map_generator(anomaly_map, final_size=output_size)
+
+        # Since paper provides that in unsupervised setting, which we are working on,
+        # taking the max of anomaly map as anomaly score provides better scores, we do the same
+        anomaly_map_flat = anomaly_map.view(anomaly_map.shape[0], -1)
+        anomaly_score = torch.max(anomaly_map_flat, dim=1).values
+
+
+        if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
+            anomaly_score = self.struct_core_instance.score(anomaly_map, anomaly_scor)
+        else:
+            k = float(self.scoring_mode.split('_')[-1])
+            max_scores = anomaly_score
+            mean_scores = torch.mean(anomaly_map_flat, dim=1)
+            anomaly_score = k * max_scores + (1 - k) * mean_scores
 
 
         return anomaly_map, anomaly_score

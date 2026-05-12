@@ -24,13 +24,14 @@ class AnomalyGenerator(nn.Module):
         noise_mean: float,
         noise_std: float,
         threshold: float,
+        feature_extractor_name: str = "",
     ) -> None:
         super().__init__()
 
         self.noise_mean = noise_mean
         self.noise_std = noise_std
-
         self.threshold = threshold
+        self.feature_extractor_name = feature_extractor_name
 
     @staticmethod
     def next_power_2(num: int) -> int:
@@ -61,7 +62,7 @@ class AnomalyGenerator(nn.Module):
             perlin_width = self.next_power_2(width)
 
             # keep power of 2 here for reproduction purpose, although this function supports power2 internally
-            perlin_noise = generate_perlin_noise(height=perlin_height, width=perlin_width)
+            perlin_noise = generate_perlin_noise(height=perlin_height, width=perlin_width, feature_extractor_name=self.feature_extractor_name)
 
             # original is power of 2 scale, so fit to our size
             perlin_noise = F.interpolate(

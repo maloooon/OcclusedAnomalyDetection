@@ -65,6 +65,7 @@ from create_dataset import _center_object, data_split_non_anomalous
 
 from moviad.utilities.struct_core import StructCore
 
+from helper import apply_random_transform
 from image_manipulation import find_holes
 
 from ss_cutout import (CutoutReconstructionModel, apply_cutout,
@@ -75,6 +76,7 @@ from ss_cutout import (CutoutReconstructionModel, apply_cutout,
 
 class SingleRaspberryDataset(Dataset):
     def __init__(self, dataset_path: str, split=None, synthetic_augmentation=False, synthetic_augmentation_mode = 'replace',
+                 hole_augmentation=False, hole_augmentation_mode='replace',
                  AD_model=None, backbone_model=None, struct_core_collection_bool=False,
                  pass_og_bool=True):
         """
@@ -88,6 +90,8 @@ class SingleRaspberryDataset(Dataset):
         self.split = split
         self.synthetic_augmentation = synthetic_augmentation
         self.synthetic_augmentation_mode = synthetic_augmentation_mode
+        self.hole_augmentation = hole_augmentation
+        self.hole_augmentation_mode = hole_augmentation_mode
         self.struct_core_collection_bool = struct_core_collection_bool
         self.pass_og_bool = pass_og_bool
  
@@ -198,9 +202,9 @@ class SingleRaspberryDataset(Dataset):
                     new_depth = item['depth'].copy()
                     new_depth[~new_mask] = 0
 
-                    # --- create new sample dict ---
+                    # create new sample dict
                     new_item = {
-                        'img_path': item['img_path'],  # or mark as synthetic if you want
+                        'img_path': item['img_path'],  
                         'grade': grade,
                         'mask': new_mask,
                         'mask_unfiltered': new_mask_unfiltered,
@@ -214,13 +218,32 @@ class SingleRaspberryDataset(Dataset):
             self.data = self.data + augmented_data
 
 
- 
+        if hole_augmentation and self.split == 'train' and hole_augmentation_mode == 'augment':
+            augmented_data = []
+            for item in self.data:
+                if item.get('has_hole', False) and random.random() < 0.9:
+                    img_t, mask_t, depth_t, mask_unf_t = apply_random_transform(
+                        item['image'], item['mask'], item['depth'], item['mask_unfiltered']
+                    )
+                    augmented_data.append({
+                        'img_path': item['img_path'],
+                        'grade': item['grade'],
+                        'mask': mask_t,
+                        'mask_unfiltered': mask_unf_t,
+                        'depth': depth_t,
+                        'image': img_t,
+                        'has_hole': True,
+                    })
+            self.data = self.data + augmented_data
+
+
         self.img_paths = [item['img_path'] for item in self.data]
         self.grades = [item['grade'] for item in self.data]
         self.masks = [item['mask'] for item in self.data]
         self.depths = [item['depth'] for item in self.data]
         self.img_arrays = [item['image'] for item in self.data]
         self.masks_unfiltered = [item['mask_unfiltered'] for item in self.data]
+        self.hole_booleans = [item.get('has_hole', False) for item in self.data]
 
  
  
@@ -230,7 +253,8 @@ class SingleRaspberryDataset(Dataset):
 
     def __getitem__(self, idx):
         synthetic_added = False
- 
+        hole_added = False
+
         if self.synthetic_augmentation and self.synthetic_augmentation_mode == 'replace' and random.random() < 0.5:
             
          
@@ -301,7 +325,22 @@ class SingleRaspberryDataset(Dataset):
                 mask = Image.fromarray(mask.astype(np.uint8) * 255)
                 mask_unfiltered = Image.fromarray(new_mask_unfiltered.astype(np.uint8) * 255)
  
-        if not synthetic_added:
+        if (not synthetic_added
+                and self.hole_augmentation and self.hole_augmentation_mode == 'replace'
+                and self.hole_booleans[idx] and random.random() < 0.5):
+            img_arr, mask_arr, depth_arr, mask_unf_arr = apply_random_transform(
+                self.img_arrays[idx], self.masks[idx], self.depths[idx], self.masks_unfiltered[idx]
+            )
+            img = Image.fromarray(img_arr.astype(np.uint8))
+            og_img = img_arr.copy()
+            mask = Image.fromarray(mask_arr.astype(np.uint8) * 255)
+            mask_unfiltered = Image.fromarray(mask_unf_arr.astype(np.uint8) * 255)
+            og_mask = mask_arr.copy()
+            depth = depth_arr
+            og_depth = depth_arr.copy()
+            hole_added = True
+
+        if not synthetic_added and not hole_added:
             #img_file = self.img_paths[idx]
            # img = Image.open(img_file).convert("RGB")
             img = Image.fromarray(self.img_arrays[idx])
@@ -411,7 +450,7 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
     del model, optimizer, train_dataloader, train_dataset
     torch.cuda.empty_cache()
 
-def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, cls_token_viz_bool = False):
+def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, cls_token_viz_bool = False, hole_augmentation_bool = False, hole_augmentation_mode = 'replace'):
 
     mode = mode.lower()
     # initialize the feature extractor
@@ -429,7 +468,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
         shutil.rmtree(synthetic_folder)
     synthetic_folder.mkdir(parents=True, exist_ok=True)
 
-    train_dataset = SingleRaspberryDataset(train_set_path, split = 'train', synthetic_augmentation = synthetic_augmentation_bool, synthetic_augmentation_mode = synthetic_augmentation_mode, AD_model = mode, backbone_model = backbone)
+    train_dataset = SingleRaspberryDataset(train_set_path, split = 'train', synthetic_augmentation = synthetic_augmentation_bool, synthetic_augmentation_mode = synthetic_augmentation_mode, AD_model = mode, backbone_model = backbone, hole_augmentation = hole_augmentation_bool, hole_augmentation_mode = hole_augmentation_mode)
 
 
     if max_dataset_size is not None:
@@ -738,7 +777,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 0.35435453
+    opt_threshold = 0.352867
 
 
     # chek for the visual test
@@ -943,9 +982,10 @@ def saving_criteria(best_metrics, new_metrics):
 
 def main():
 
-    # TODO : try StructCore with topkmean higher percentage (i.e. we look at more of the highest scores)
+    # TODO : try more aggressive synthetic occlusion as well, as some raspberries that are very occluded do bad in the test set (even though they are classified correctly)
 
     # TODO : think that specular suppression (i.e. removing drupelets) is hurting the model... need to understand why
+    
 
     # TODO : try RD4AD implement that we can use backbone for better testing ? ; I think for RD4AD it is exactly as in the paper implemented, so need to exlain it like that aswell!! i.e. that we ALWAYS use layers1,2,3 from WRN-50-2 and the architecture of layer4 as the OCBE block...
     # TODO : could adjust simplenet to just take max of anomaly map and then adapt mask filtering in theory ; apparently paper showed that in the unsupervised setting, no difference
@@ -983,16 +1023,19 @@ def main():
     # TODO : maybe clean protrusions followed by smoothing in those areas (since they can be sharp and I think anomalies are detected there, double check)
     # TODO : fix the filter holes, it bumps performance already (on STFPM) but need to understand why it doesn't find all holes
     
+    # TODO : supersimplenet better performance with dinov2 using more layers, e.g. 3,6,9,11 // should also test WRN-50-2 with more layers? but I think dino better, nice argument
 
-    MODEL_MODE = 'stfpm' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
+    MODEL_MODE = 'supersimplenet' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
     SYN_AUG_BOOL = False # whether to use synthetic occlusions during training
     SYN_AUG_MODE = 'replace' # 'replace' or 'augment'
+    HOLE_AUG_BOOL = False
+    HOLE_AUG_MODE = 'augment'
 
     # NOTE : this only works with patchcore + dinov2 
     CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    FILTER_PRE = 'filtered_darkness_80_0.3_and_clean_protrusions_seed_42_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    FILTER_PRE = 'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
   
     FILTER_PRE = FILTER_PRE.upper()
@@ -1004,7 +1047,7 @@ def main():
         pass_og_bool = False
 
     FILTER_POST = 'NONE' # HOLE_DARKNESS_40_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details ; DARKNESS_k : filter out dark areas based on darkness of raspberry, k refers to threshold for darkness ; see utilities/filters for more details ; DRUPELETS for removing specular highlights ; NONE if no post filtering
-    SCORING = 'STRUCTCORE' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
+    SCORING = 'MAXMEAN_1' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
 
     TOP_K_RATIO_STRUCTCORE = 0.04
 
@@ -1024,20 +1067,26 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-    backbone = "wide_resnet50_2" 
-   # backbone = "dinov2_vitb14"
+   # backbone = "wide_resnet50_2" 
+    backbone = "dinov2_vitb14"
    # backbone = 'mobilenet_v2'
    # backbone = "dinov3_vitb16"
   #  ad_layers = ["features.4", "features.7", "features.10"] 
    # ad_layers = ["layer4"]
   #  ad_layers = ["features.10"] # SINBAD tests
-    ad_layers = ["layer2", "layer3"]
+   # ad_layers = ["layer2", "layer3"]
     
-  #  ad_layers = [11] 
+    ad_layers = [3,6,9,11] 
   #  if CLS_TOKEN_VIZ_BOOL:
   #      ad_layers.append(11) # extracting also CLS token for visualizations
     end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
-    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{SYN_AUG_MODE}_" if SYN_AUG_BOOL else f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_no_aug_"
+    aug_parts = []
+    if SYN_AUG_BOOL:
+        aug_parts.append(SYN_AUG_MODE)
+    if HOLE_AUG_BOOL:
+        aug_parts.append(f"hole_{HOLE_AUG_MODE}")
+    aug_str = "_".join(aug_parts) if aug_parts else "no_aug"
+    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{aug_str}_"
 
     custom_weights_path = None
    # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout_{'_'.join([str(layer) for layer in ad_layers])}.pt"
@@ -1052,13 +1101,10 @@ def main():
 
 
   
-   # train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL)
+    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, hole_augmentation_bool = HOLE_AUG_BOOL, hole_augmentation_mode = HOLE_AUG_MODE)
 
     # Check if visual test path exists and clear it out if it already exists
-    if SYN_AUG_BOOL:
-        visual_test_path = f"../../nvme1/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{SYN_AUG_MODE}/" # NOTE : disk normally
-    else:
-        visual_test_path = f"../../nvme1/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}/" # NOTE : disk normally
+    visual_test_path = f"../../nvme1/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{aug_str}/" # NOTE : disk normally
     visual_test_dir = Path(visual_test_path)
     if visual_test_dir.exists():
         shutil.rmtree(visual_test_dir)
@@ -1066,16 +1112,14 @@ def main():
 
 
     
-    test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE,
-     target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, 
-     filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, 
-     custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, top_k_ratio = TOP_K_RATIO_STRUCTCORE,
-    protrusion_damping_radius = 0, protrusion_damping_gamma = 1)
-    #detailed_eval(visual_test_path)
+  #  test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE,
+  #   target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, 
+  #   filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, 
+  #   custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, top_k_ratio = TOP_K_RATIO_STRUCTCORE,
+  #  protrusion_damping_radius = 0, protrusion_damping_gamma = 0)
+   # detailed_eval(visual_test_path)
 
-    # TODO : YES! SEEMS LIKE HIGHER top_k_ratio leads to STRUCTCORE GIVING BETTER RESULTS!!!! ; 0.04 boosts by like 0.8% in  AUROC, 2% in F1, 0.4% in PR ! 'filtered_darkness_80_0.3_and_clean_protrusions_seed_42_gt_256', no augmentation !! 
-    # TODO : currently showed better results in one case, need to test over more cases (on STFPM it worked!) ; then possibly also think whether we can adapt StructCore somehow for our use case?
-
+    # STRUCTCORE : only topk seems to work the best, in most cases (but stupid seed 1 it seems to improve performance)
 
 if __name__ == "__main__":
     main()

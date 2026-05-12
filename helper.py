@@ -1,5 +1,7 @@
 import os
+import random
 import numpy as np
+import cv2
 from PIL import Image, ImageDraw, ImageFont
 import re
 
@@ -124,6 +126,50 @@ def overlay_raspberries(folder_path, output_path=None):
     
     return canvas_rgb
 
+
+
+def apply_random_transform(img, mask, depth, mask_unfiltered=None,
+                           scale_range=(0.5, 0.8),
+                           rotation_range=(-180, 180)):
+    """
+    Apply random rotation + scale to img, mask, depth, and optionally
+    mask_unfiltered. A single affine matrix is computed and reused for all arrays so
+    they stay perfectly aligned.
+
+    Args:
+        img: HxWx3 uint8
+        mask: HxW bool
+        depth: HxW float32
+        mask_unfiltered: HxW bool (optional)
+        scale_range: (min, max) uniform scale factor
+        rotation_range: (min_deg, max_deg) uniform rotation in degrees
+
+    Returns:
+        (img_out, mask_out, depth_out) when mask_unfiltered is None, else
+        (img_out, mask_out, depth_out, mask_unfiltered_out)
+    """
+    angle = random.uniform(*rotation_range)
+    scale = random.uniform(*scale_range)
+
+    h, w = img.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle, scale)
+
+    img_out = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+    mask_out = cv2.warpAffine(
+        mask.astype(np.uint8), M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0
+    ).astype(bool)
+    depth_out = cv2.warpAffine(
+        depth.astype(np.float32), M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0
+    )
+
+    if mask_unfiltered is not None:
+        mask_unfiltered_out = cv2.warpAffine(
+            mask_unfiltered.astype(np.uint8), M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0
+        ).astype(bool)
+        return img_out, mask_out, depth_out, mask_unfiltered_out
+
+    return img_out, mask_out, depth_out
 
 
 def main():

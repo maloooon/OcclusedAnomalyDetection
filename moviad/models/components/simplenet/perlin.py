@@ -38,6 +38,7 @@ def generate_perlin_noise(
     width: int,
     scale: tuple[int, int] = None,
     device: torch.device = None,
+    feature_extractor_name: str = "",
 ) -> torch.Tensor:
     """Generate a Perlin noise pattern.
 
@@ -91,6 +92,10 @@ def generate_perlin_noise(
 
     pad_h = nextpow2(height)
     pad_w = nextpow2(width)
+
+    if "dino" in feature_extractor_name:
+        scalex = min(scalex, pad_h)
+        scaley = min(scaley, pad_w)
 
     # Generate base grid
     delta = (scalex / pad_h, scaley / pad_w)

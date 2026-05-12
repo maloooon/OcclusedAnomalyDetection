@@ -441,5 +441,10 @@ class CustomFeatureExtractor:
 
     # NOTE : added, was not in og code
     def get_channels_dim(self):
-        features = self(torch.rand(1,3,224,224).to(self.device))
+        result = self(torch.rand(1,3,224,224).to(self.device))
+        if isinstance(result, tuple):
+            # In case of DINO backbone
+            features, _ = result
+        else:
+            features = result
         return sum(feature.shape[1] for feature in features)

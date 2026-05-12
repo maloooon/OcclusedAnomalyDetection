@@ -293,7 +293,8 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
                min_hole_area=200,
                dilation_radius=15,
                border_exclusion_width=30,
-               visualize_bool=False):
+               visualize_bool=False,
+               return_boolean = False):
 
     # TODO : surrounding_threshold is now obsolete, can be taken out of the logic I believe (since we have border_exclusion_width)
     """
@@ -335,6 +336,8 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
                                 prevents shadow/darkness at the raspberry edge
                                 from being flagged as holes or bridging to
                                 real interior holes (default 30).
+        return_boolean : if True, returns only True or False (depending on whether we detected any holes or not)
+
 
     Returns:
         image_cleaned: image with hole pixels zeroed out
@@ -537,7 +540,10 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
         #plt.savefig("hole_detection_visualization.png", dpi=100, bbox_inches='tight')
         plt.close()
 
-    return image_cleaned, mask_cleaned, depth_cleaned
+    if return_boolean:
+        return (hole_mask > 0).sum() > 0
+    else:
+        return image_cleaned, mask_cleaned, depth_cleaned
 
 def find_holes(image, mask, depth, save_folder = None, filename = None,
                depth_threshold_percentile=50,

@@ -260,7 +260,7 @@ class CFA(nn.Module):
                return heatmaps.view(1,1,heatmaps.shape[0], heatmaps.shape[1]), anomaly_scores
             else:
                 return heatmaps.unsqueeze(dim=1), anomaly_scores
-                return heatmaps, anomaly_scores
+              #  return heatmaps, anomaly_scores
         
 
     def soft_boundary(self, phi_p: torch.Tensor) -> float:

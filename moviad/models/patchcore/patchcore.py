@@ -130,10 +130,14 @@ class PatchCore(nn.Module):
                 # based on only the raspberry mask area (i.e. we do not care for the black background)
                 input_tensor, mask = input_tensor
                 batch_og, masK_og, depth_og = None, None, None
-            if len(input_tensor) == 6:
+            elif len(input_tensor) == 6:
                 # For evaluation, we need the mask for only looking at the raspberry
                 # and the og values for the hole/darkness filtering
                 input_tensor, mask, mask_unfiltered, batch_og, mask_og , depth_og  = input_tensor
+            
+            elif len(input_tensor) == 3:
+                input_tensor, mask, mask_unfiltered = input_tensor
+                batch_og, mask_og, depth_og = None, None, None
  
     
 
