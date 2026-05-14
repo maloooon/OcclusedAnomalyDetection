@@ -1,5 +1,5 @@
 from datasets import load_dataset
-from ultralytics import SAM
+from ultralytics import SAM, YOLO
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -580,7 +580,7 @@ def is_enclosed_by(inner_mask: np.ndarray, outer_mask: np.ndarray, threshold: fl
 '''
 
 
-# F2 DEPTH ALGORITHM
+ # F2 DEPTH ALGORITHM
 def filter_overlapping_masks_extended(
     masks: np.ndarray,
     masks_depth_values: np.ndarray,
@@ -975,7 +975,7 @@ def extract_bonnet_bounding_box(sample, visualize_bool = False):
 
     return list(min_max_bbox)
 
-def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None)):
+def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None), prompt = "raspberry", filter_red=(True, 0.4), filter_holes_islands=False, filter_overlap_masks=False):
     """
     SAM3 segmentation model inference and mask saving.   
     
@@ -1004,7 +1004,12 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         save=False,
         device = 2 if torch.cuda.is_available() else "cpu"
     )
-    predictor = SAM3SemanticPredictor(overrides=overrides) 
+    predictor = SAM3SemanticPredictor(overrides=overrides)
+
+    # Load depth pipeline only when needed
+    depth_pipe = None
+    if filter_overlap_masks:
+        depth_pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf", device=2 if torch.cuda.is_available() else 'cpu')
 
     masks_list = []
     img_ids_list = []
@@ -1017,9 +1022,13 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
 
     times_image_encoding = []
     times_inference = []
+    times_red = []
     times_bbox = []
     times_mask_shape = []
     times_mask_size = []
+    times_holes_islands = []
+    times_depth = []
+    times_overlap = []
 
     for loop_idx, sample in enumerate(samples):
 
@@ -1032,13 +1041,25 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         if loop_idx > 0:
             times_image_encoding.append(end_time_0 - start_time_0)
         start_time = time()
-        results = predictor(text=["raspberry"])
+        results = predictor(text=[prompt])
         end_time = time()
         print(f"Inference (prompt encoding and mask decoding) time for sample {sample_idx}: {end_time - start_time:.2f} seconds")
         if loop_idx > 0:
             times_inference.append(end_time - start_time)
 
-        # Calculate median area and filter outliers
+        # 1. Red filter — discard non-raspberry masks before any other filtering
+        if results[0].masks is not None and filter_red[0]:
+            _t0 = time()
+            masks_np = results[0].masks.data.cpu().numpy()
+            red_valid_idx = _filter_red_masks(masks_np, np.array(sample_img), min_red_fraction=filter_red[1])
+            results[0].boxes = results[0].boxes[red_valid_idx]
+            results[0].masks = results[0].masks[red_valid_idx]
+            _t1 = time()
+            print(f"Red filter time for sample {sample_idx}: {_t1 - _t0:.2f} seconds")
+            if loop_idx > 0:
+                times_red.append(_t1 - _t0)
+
+        # 2. Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
 
         if len(boxes) > 0 and filter_bboxes[0]:
@@ -1089,16 +1110,79 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
                     print(f"Mask size filter time for sample {sample_idx}: {_t1 - _t0:.2f} seconds")
                     if loop_idx > 0:
                         times_mask_size.append(_t1 - _t0)
+
+        # 5. Holes-and-islands cleanup — refine each mask's shape morphologically
+        if filter_holes_islands and results[0].masks is not None:
+            start_time_0 = time()
+            masks = results[0].masks.data.cpu().numpy()
+            islands_threshold = int(min(m.astype(np.bool_).sum() for m in masks)) - 1
+            refined_masks = []
+            for mask in masks:
+                mask = mask.astype(np.bool_)
+                refined_mask, _ = remove_small_regions(mask, islands_threshold, mode='islands')
+                refined_mask, _ = remove_small_regions(refined_mask, 20000, mode='holes')
+                refined_masks.append(refined_mask)
+            refined_masks = np.array(refined_masks)
+            results[0].masks.data = torch.from_numpy(refined_masks).float()
+            end_time_0 = time()
+            print(f"Holes/islands filter time for sample {sample_idx}: {end_time_0 - start_time_0:.2f} seconds")
+            if loop_idx > 0:
+                times_holes_islands.append(end_time_0 - start_time_0)
+
+        # 6. Overlap filter — keep one mask when two masks overlap/contain each other, guided by depth
+        if filter_overlap_masks and results[0].masks is not None:
+            _t0 = time()
+            depth_array = np.array(depth_pipe(sample_img)["depth"])
+            _t1 = time()
+            print(f"Depth estimation time for sample {sample_idx}: {_t1 - _t0:.2f} seconds")
+            if loop_idx > 0:
+                times_depth.append(_t1 - _t0)
+            start_time_0 = time()
+            masks = results[0].masks.data.cpu().numpy()
+            masks_before_overlap = masks.copy()
+            masks_depth_values = np.array([depth_array * mask for mask in masks])
+            masks_filtered_dict = filter_overlapping_masks_extended(
+                masks,
+                masks_depth_values,
+                overlap_threshold=50,
+                containment_threshold=0.95,
+                depth_difference_threshold=40,
+                debug=False
+            )
+            results[0].masks = results[0].masks[masks_filtered_dict['kept_indices']]
+            results[0].boxes = results[0].boxes[masks_filtered_dict['kept_indices']]
+            end_time_0 = time()
+            print(f"Overlap filter time for sample {sample_idx}: {end_time_0 - start_time_0:.2f} seconds")
+            if loop_idx > 0:
+                times_overlap.append(end_time_0 - start_time_0)
+
+            if save_imgs_bool:
+                img_array = np.array(sample_img)
+                for mask in masks_filtered_dict['masks']:
+                    color = np.random.randint(0, 255, 3).tolist()
+                    color_mask = np.zeros_like(img_array)
+                    color_mask[mask == True] = color
+                    img_array = cv2.addWeighted(img_array, 1, color_mask, 0.9, 0)
+                cv2.imwrite('output_kept_masks.jpg', cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
+
+                non_kept_masks = np.array([masks_before_overlap[i] for i in masks_filtered_dict['removed_indices']])
+                img_array_non_kept = np.array(sample_img)
+                for mask in non_kept_masks:
+                    color = np.random.randint(0, 255, 3).tolist()
+                    color_mask = np.zeros_like(img_array_non_kept)
+                    color_mask[mask == True] = color
+                    img_array_non_kept = cv2.addWeighted(img_array_non_kept, 1, color_mask, 0.9, 0)
+                cv2.imwrite('output_removed_masks.jpg', cv2.cvtColor(img_array_non_kept, cv2.COLOR_RGB2BGR))
+
+#        plotted_img = results[0].plot(
+#            boxes=False,
+#            masks=True,
+#        )
         
-        plotted_img = results[0].plot(
-            boxes=False,
-            masks=True,
-        )
-        
-        plotted_img_w_boxes = results[0].plot(
-            boxes=True,
-            masks=True,
-        )
+ #       plotted_img_w_boxes = results[0].plot(
+ #           boxes=True,
+ #           masks=True,
+ #       )
 
         # Draw masks with different colors
         img_array = np.array(sample_img)
@@ -1132,25 +1216,38 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
 
         avg_enc        = _avg(times_image_encoding)
         avg_inf        = _avg(times_inference)
+        avg_red        = _avg(times_red)
         avg_bbox       = _avg(times_bbox)
         avg_mask_shape = _avg(times_mask_shape)
         avg_mask_size  = _avg(times_mask_size)
+        avg_hi         = _avg(times_holes_islands)
+        avg_depth      = _avg(times_depth)
+        avg_ov         = _avg(times_overlap)
 
         print("\n--- Timing Summary (excluding first sample) ---")
         print(f"Avg image encoding time  : {avg_enc:.3f} s")
         print(f"Avg inference time       : {avg_inf:.3f} s")
+        if times_red:
+            print(f"Avg red filter           : {avg_red:.3f} s")
         if times_bbox:
             print(f"Avg bbox size filter     : {avg_bbox:.3f} s")
         if times_mask_shape:
             print(f"Avg mask shape filter    : {avg_mask_shape:.3f} s")
         if times_mask_size:
             print(f"Avg mask size filter     : {avg_mask_size:.3f} s")
-        full_avg = avg_enc + avg_inf + avg_bbox + avg_mask_shape + avg_mask_size
+        if times_holes_islands:
+            print(f"Avg holes/islands filter : {avg_hi:.3f} s")
+        if times_depth:
+            print(f"Avg depth estimation     : {avg_depth:.3f} s")
+        if times_overlap:
+            print(f"Avg overlap filter       : {avg_ov:.3f} s")
+        full_avg = avg_enc + avg_inf + avg_red + avg_bbox + avg_mask_shape + avg_mask_size + avg_hi + avg_depth + avg_ov
         print(f"Avg full time (sum)      : {full_avg:.3f} s")
         print("-----------------------------------------------")
 
     if store_masks_bool:
-        store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list, sample_imgs, filepath= '../../disk/saved_masks/SAM3')
+        filepath = '../../disk/saved_masks/SAM3' if prompt == "raspberry" else '../../disk/saved_masks/SAM3_punnet'
+        store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list, sample_imgs, filepath=filepath)
 
 def model_SAM(samples, mode = 'mobile', save_imgs_bool = False, store_masks_bool = False, testing_samples = 1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None), filter_red = (True, 0.4)):
     """
@@ -1361,10 +1458,14 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
                      save=False)
     predictor = SAMPredictor(overrides=overrides)
 
-    # Load depth pipeline only when needed 
+    # Load depth pipeline only when needed
     depth_pipe = None
     if filter_overlap_masks:
         depth_pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf", device=2 if torch.cuda.is_available() else 'cpu')
+
+    # Load punnet detection model for dynamic bbox extraction
+    punnet_model = YOLO("../../disk/pretrained_models/yolo26n-seg-punnet-best.pt")
+    _FALLBACK_BONNET_BBOX = [260, 116, 1120, 707]  # x_min, y_min, x_max, y_max
 
     masks_list = []
     img_ids_list = []
@@ -1375,7 +1476,6 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
 
     # Build point grid for prompt encoding
     points_grid = build_point_grid(32)
-    bonnet_bbox = [260, 116, 1120, 707]  # x_min, y_min, x_max, y_max
 
     times_image_encoding = []
     times_inference = []
@@ -1383,6 +1483,7 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
     times_bbox = []
     times_mask_shape = []
     times_mask_size = []
+    times_punnet_detection = []
     times_holes_islands = []
     times_depth = []
     times_overlap = []
@@ -1393,6 +1494,23 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
         sample_idx = sample['image_id']
 
         H, W = sample_img.size[1], sample_img.size[0]
+
+        # Detect punnet bbox for this sample; fall back to fixed bbox if no detection
+        start_time_punnet = time()
+        punnet_results = punnet_model.predict(sample_img, device=2, verbose=False)
+        end_time_punnet = time()
+        if loop_idx > 0:
+            times_punnet_detection.append(end_time_punnet - start_time_punnet)
+        if punnet_results[0].boxes is not None and len(punnet_results[0].boxes) > 0:
+            # If multiple punnet detections exist, calc each box center, measure euclid dist to image center and choose box with smallest dist
+            boxes_xyxy = punnet_results[0].boxes.xyxy.cpu().numpy()  # (N, 4)
+            img_cx, img_cy = W / 2, H / 2
+            box_centers = np.stack([(boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2,
+                                    (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2], axis=1)
+            dists = np.hypot(box_centers[:, 0] - img_cx, box_centers[:, 1] - img_cy)
+            bonnet_bbox = boxes_xyxy[np.argmin(dists)].tolist()
+        else:
+            bonnet_bbox = _FALLBACK_BONNET_BBOX
 
         points_grid_scaled = points_grid * np.array([W, H])
         x_min, y_min, x_max, y_max = bonnet_bbox
@@ -1416,13 +1534,13 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
         
 
         # Save figure of the prompt points for visualisation/debugging
-       # if save_imgs_bool:
-       #     plt.imshow(sample_img)
-       #     plt.scatter(filtered_points[0][:, 0] * W, filtered_points[0][:, 1] * H, s=1)
-       #     plt.axis('off')
-       #     plt.title(f"Prompt points for sample {sample_idx}")
-       #     plt.savefig(f'prompt_points_{sample_idx}.png')
-       #     plt.close()
+        if save_imgs_bool:
+            plt.imshow(sample_img)
+            plt.scatter(filtered_points[0][:, 0] * W, filtered_points[0][:, 1] * H, s=1)
+            plt.axis('off')
+            plt.title(f"Prompt points for sample {sample_idx}")
+            plt.savefig(f'prompt_points_{sample_idx}.png')
+            plt.close()
         
        # exit()
 
@@ -1433,7 +1551,7 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
         if loop_idx > 0:
             times_image_encoding.append(end_time_0 - start_time_0)
         start_time = time()
-        results = predictor() # points = filtered_points
+        results = predictor(points = filtered_points) # 
         end_time = time()
         print(f"Inference time for sample {sample_idx}: {end_time - start_time:.2f} seconds")
         if loop_idx > 0:
@@ -1505,10 +1623,12 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
         if filter_holes_islands and results[0].masks is not None:
             start_time_0 = time()
             masks = results[0].masks.data.cpu().numpy()
+            # Get the area of the smallest mask and set islands threshold to just below that
+            islands_threshold = int(min(m.astype(np.bool_).sum() for m in masks)) - 1
             refined_masks = []
             for mask in masks:
                 mask = mask.astype(np.bool_)
-                refined_mask, _ = remove_small_regions(mask, 20000, mode='islands')
+                refined_mask, _ = remove_small_regions(mask, islands_threshold, mode='islands')
                 refined_mask, _ = remove_small_regions(refined_mask, 20000, mode='holes')
                 refined_masks.append(refined_mask)
             refined_masks = np.array(refined_masks)
@@ -1565,7 +1685,7 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
                 cv2.imwrite('output_removed_masks.jpg', cv2.cvtColor(img_array_non_kept, cv2.COLOR_RGB2BGR))
 
       #  plotted_img = results[0].plot(boxes=False, masks=True)
-       # plotted_img_w_boxes = results[0].plot(boxes=True, masks=True)
+#        plotted_img_w_boxes = results[0].plot(boxes=True, masks=True)
 
         # Draw masks with different colors
         img_array = np.array(sample_img)
@@ -1578,7 +1698,7 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
 
         if save_imgs_bool:
             cv2.imwrite('output_colored_masks.jpg', cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
-         #   cv2.imwrite('output_w_boxes.jpg', plotted_img_w_boxes)
+            cv2.imwrite('output_w_boxes.jpg', plotted_img_w_boxes)
             cv2.imwrite('sample_img.jpg', cv2.cvtColor(np.array(sample_img), cv2.COLOR_RGB2BGR))
 
         masks_list.append(results[0].masks.data.cpu().numpy())
@@ -1597,6 +1717,7 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
         avg_hi         = _avg(times_holes_islands)
         avg_depth      = _avg(times_depth)
         avg_ov         = _avg(times_overlap)
+        avg_punnet     = _avg(times_punnet_detection)
 
         print("\n--- Timing Summary (excluding first sample) ---")
         print(f"Avg image encoding time  : {avg_enc:.3f} s")
@@ -1615,7 +1736,9 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
             print(f"Avg depth estimation     : {avg_depth:.3f} s")
         if times_overlap:
             print(f"Avg overlap filter       : {avg_ov:.3f} s")
-        full_avg = avg_enc + avg_inf + avg_red + avg_bbox + avg_mask_shape + avg_mask_size + avg_hi + avg_depth + avg_ov
+        if times_punnet_detection:
+            print(f"Avg punnet detection     : {avg_punnet:.3f} s")
+        full_avg = avg_enc + avg_inf + avg_red + avg_bbox + avg_mask_shape + avg_mask_size + avg_hi + avg_depth + avg_ov + avg_punnet
         print(f"Avg full time (sum)      : {full_avg:.3f} s")
         print("-----------------------------------------------")
 
@@ -2039,6 +2162,8 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
             # Finally, iterate over all masks and use remove_small_regions
             if results[0].masks is not None:
                 masks = results[0].masks.data.cpu().numpy()
+                # Get the area of the smallest mask and set islands threshold to just below that
+                islands_threshold = int(min(m.astype(np.bool_).sum() for m in masks)) - 1
                 refined_masks = []
                 for mask in masks:
                     mask = mask.astype(np.bool_)
@@ -2051,7 +2176,7 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
                   #  kernel = np.ones((1, 1), np.uint8)
                   #  mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
                   #  mask = mask.astype(np.bool_)
-                    refined_mask, _ = remove_small_regions(mask, 20000, mode = 'islands')
+                    refined_mask, _ = remove_small_regions(mask, islands_threshold, mode = 'islands')
                     refined_mask, _ = remove_small_regions(refined_mask, 20000, mode = 'holes')
                     # Plot the refined mask
                 #  plt.figure(figsize=(5, 5))
@@ -2099,6 +2224,9 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
             if loop_idx > 0:
                 times_overlap.append(end_time_0 - start_time_0)
 
+
+        
+
             if save_imgs_bool:
                 # visualize_overlap_map(masks_filtered_dict['overlap_map'])
                 # Visualize kept masks after overlap filtering
@@ -2145,13 +2273,14 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
                 img_array = cv2.addWeighted(img_array, 1, color_mask, 0.9, 0)
         
         if save_imgs_bool:
+            plotted_img_w_boxes = results[0].plot(boxes=True, masks=True)
 
    
             # Write depth visualization
             cv2.imwrite('output_depth.jpg', cv2.applyColorMap(cv2.convertScaleAbs(depth_array, alpha=255.0/depth_array.max()), cv2.COLORMAP_PLASMA))
             cv2.imwrite('output_colored_masks.jpg', cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
            # cv2.imwrite('output.jpg', plotted_img)
-          #  cv2.imwrite('output_w_boxes.jpg', plotted_img_w_boxes)
+            cv2.imwrite('output_w_boxes.jpg', plotted_img_w_boxes)
             cv2.imwrite('sample_img.jpg', cv2.cvtColor(np.array(sample_img), cv2.COLOR_RGB2BGR))
 
         # Save masks
@@ -2481,8 +2610,8 @@ def _filter_red_masks(masks, img_array, min_red_fraction=0.4):
     # Red occupies two hue bands in OpenCV HSV (H in [0,180])
     red_mask = (
         ((img_hsv[:, :, 0] <= 10) | (img_hsv[:, :, 0] >= 170)) &
-        (img_hsv[:, :, 1] >= 80) &   # minimum saturation to exclude near-grey/white
-        (img_hsv[:, :, 2] >= 40)      # minimum value to exclude near-black
+        (img_hsv[:, :, 1] >= 60) &   # minimum saturation to exclude near-grey/white
+        (img_hsv[:, :, 2] >= 25)      # minimum value to exclude near-black
     )
 
     valid_idx = np.zeros(len(masks), dtype=bool)
@@ -2531,9 +2660,10 @@ def main():
     # Crop to bonnet area
   #  example_img = example_img.crop((bonnet_bbox[0], bonnet_bbox[1], bonnet_bbox[2], bonnet_bbox[3])) # left, upper, right, lower
 
-    MODE = "SAM_extended"
+    MODE = "SAM3"
 
-    full_data = list(ds['train']) + list(ds['valid'])
+    full_data = list(ds['valid']) # list(ds['train']) +
+    
 
    # if MODE == "SAM_manipulate":
    #     model_SAM_manipulate(list(ds['train']), save_imgs_bool = True, store_masks_bool = False, testing_samples = 1, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None))
@@ -2543,16 +2673,16 @@ def main():
     
     if MODE == "SAM_extended":
         # extended : added island + overlap filters
-        model_SAM_extended(full_data, mode = 'base', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (False, 0.2), filter_holes_islands = False, filter_overlap_masks = False)
+        model_SAM_extended(full_data, mode = 'base', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (True, 0.2, None), filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
     
     elif MODE == "grounding_SAM":
-        model_grounding_SAM(full_data, mode = 'mobile', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_holes_islands = False, filter_overlap_masks = False, filter_by_darkness = False)
+        model_grounding_SAM(full_data, mode = 'base', save_imgs_bool = True, store_masks_bool = False, testing_samples = 1, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_holes_islands = False, filter_overlap_masks = False, filter_by_darkness = False)
 
   #  elif MODE == "FastSAM":
   #      model_FastSAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = False, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
 
     elif MODE == "SAM3":
-        model_SAM3(full_data, save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_masks_shapes = (False, 0.95), filter_bboxes = (False, 0.2, 3.0), filter_masks_sizes = (False, 0.2, None))
+        model_SAM3(full_data, save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_masks_shapes = (False, 0.95), filter_bboxes = (False, 0.2, 3.0), filter_masks_sizes = (False, 0.2, None), prompt = "raspberry", filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
 
 
 

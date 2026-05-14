@@ -7,11 +7,28 @@
 from datasets import load_dataset
 import numpy as np
 from pathlib import Path
+from time import time
 import pickle
 import shutil
+from scipy.spatial import ConvexHull
+import torch
 from ultralytics import YOLO
-from SAM_segmentation import store_masks
+from ultralytics.models.sam.amg import remove_small_regions
+from transformers import pipeline
+from SAM_segmentation import store_masks, _filter_red_masks, _filter_bbox_sizes, _filter_mask_shapes, _filter_mask_sizes, filter_overlapping_masks_extended
 from evaluation_segmentation import calculate_segmentation_metrics, _points_to_mask, compute_ap50, compute_ap50_95
+
+
+def _convex_hull_polygon(poly):
+    """Return the convex hull vertices of a (N, 2) normalised polygon array.
+    Falls back to the original polygon if fewer than 3 unique points exist."""
+    if len(poly) < 3:
+        return poly
+    try:
+        hull = ConvexHull(poly)
+        return poly[hull.vertices]
+    except Exception:
+        return poly
 
 
 def setup_yolo_dataset_structure_extended(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, N_VAL_SAMPLES):
@@ -78,16 +95,22 @@ def setup_yolo_dataset_structure_extended(all_imgs, all_pred_xyn, all_pred_ids, 
 
         label_file.write_text("\n".join(lines))
 
-def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES):
+def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, mode="raspberry"):
 
     # Adjust to YOLO format : https://docs.ultralytics.com/datasets/segment/#ultralytics-yolo-format
 
     # First off, YOLO format requires images to be in a folder structure, with labels in a separate folder.
-    # So let us first deal with the images 
-    
+    # So let us first deal with the images
 
-    images_dir_train = Path("../../disk/YOLO_dataset/images/train")
-    images_dir_val = Path("../../disk/YOLO_dataset/images/val")
+    if mode == "punnet":
+        base_dir = Path("../../disk/YOLO_dataset_punnet")
+        class_name = "punnet"
+    else:
+        base_dir = Path("../../disk/YOLO_dataset")
+        class_name = "raspberry"
+
+    images_dir_train = base_dir / "images/train"
+    images_dir_val   = base_dir / "images/val"
 
     # Remove directories if they exist
     if images_dir_train.exists():
@@ -120,8 +143,8 @@ def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_label
     # Now replace
     polygons_per_image = polygons_per_image[:N_TRAIN_SAMPLES] + val_labels
 
-    labels_dir_train = Path("../../disk/YOLO_dataset/labels/train") 
-    labels_dir_val = Path("../../disk/YOLO_dataset/labels/val")
+    labels_dir_train = base_dir / "labels/train"
+    labels_dir_val   = base_dir / "labels/val"
 
     if labels_dir_train.exists():
         shutil.rmtree(labels_dir_train)
@@ -150,10 +173,12 @@ def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_label
 
         for poly in polys:
 
+            if mode == "punnet":
+                poly = _convex_hull_polygon(poly)
 
             # flatten x,y pairs to get it into wanted YOLO shape : x1 y1 x2 y2 x3 y3 ... xn yn
             coords = poly.flatten()
- 
+
 
 
             # NOTE : for now, just class index 0 since all objects are raspberries ; need to see if we need to adjust
@@ -164,10 +189,27 @@ def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_label
 
         label_file.write_text("\n".join(lines))
 
+    # Write YAML config so training can reference the correct dataset and class name
+    yaml_content = (
+        f"path: {base_dir.resolve()}\n"
+        f"train: images/train\n"
+        f"val: images/val\n\n"
+        f"nc: 1\n"
+        f"names: ['{class_name}']\n"
+    )
+    (base_dir / f"{class_name}-seg.yaml").write_text(yaml_content)
 
-def evaluate_yolo_iou(model, val_data, val_labels, device=2):
+
+def evaluate_yolo_iou(model, val_data, val_labels, device=2,
+                      filter_red=(True, 0.3),
+                      filter_bboxes=(True, None, 3.0),
+                      filter_masks_shapes=(False, 0.85),
+                      filter_masks_sizes=(False, 0.2, None),
+                      filter_holes_islands=False,
+                      filter_overlap_masks=False):
     """Compute the same averaged mean IoU used in evaluation_segmentation.py for SAM models.
-    This is mainly implemented since we calculate based on pixel level metrics, which is not the standard in YOLO"""
+    This is mainly implemented since we calculate based on pixel level metrics, which is not the standard in YOLO.
+    Optionally applies the same post-prediction filters used in model_SAM_extended before computing metrics."""
     avg_iou = 0.0
     avg_f1 = 0.0
     avg_precision = 0.0
@@ -177,15 +219,119 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2):
     all_conf_scores = []
     all_gt_masks = []
 
-    for sample, gt_polys in zip(val_data, val_labels):
+    depth_pipe = None
+    if filter_overlap_masks:
+        depth_pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf", device=device if torch.cuda.is_available() else 'cpu')
+
+    times_predict = []
+    times_red = []
+    times_bbox = []
+    times_mask_shape = []
+    times_mask_size = []
+    times_holes_islands = []
+    times_depth = []
+    times_overlap = []
+
+    for loop_idx, (sample, gt_polys) in enumerate(zip(val_data, val_labels)):
         img = sample['image']
         width, height = img.size
 
-        results = model.predict(img, device=device, verbose=False)
+        # retina_masks=True returns masks at original image resolution, required for the red filter
+        _t0 = time()
+        results = model.predict(img, device=device, verbose=False, retina_masks=True)
+        _t1 = time()
+        if loop_idx > 0:
+            times_predict.append(_t1 - _t0)
 
         if results[0].masks is not None:
-            pred_masks = [_points_to_mask(poly.flatten(), width, height)
-                          for poly in results[0].masks.xyn]
+            img_array = np.array(img)
+
+            # 1. Red filter — discard non-raspberry masks
+            if filter_red[0]:
+                _t0 = time()
+                masks_np = results[0].masks.data.cpu().numpy()
+                red_valid_idx = _filter_red_masks(masks_np, img_array, min_red_fraction=filter_red[1])
+                results[0].boxes = results[0].boxes[red_valid_idx]
+                results[0].masks = results[0].masks[red_valid_idx]
+                if loop_idx > 0:
+                    times_red.append(time() - _t0)
+
+            # 2. Bbox size filter
+            if filter_bboxes[0] and results[0].masks is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                if len(boxes) > 0:
+                    _t0 = time()
+                    valid_idx, _ = _filter_bbox_sizes(boxes, upper_multiplier=filter_bboxes[2], lower_multiplier=filter_bboxes[1])
+                    results[0].boxes = results[0].boxes[valid_idx]
+                    results[0].masks = results[0].masks[valid_idx]
+                    if loop_idx > 0:
+                        times_bbox.append(time() - _t0)
+
+            # 3. Mask shape filter (rectangularity)
+            if filter_masks_shapes[0] and results[0].masks is not None:
+                _t0 = time()
+                masks_np = results[0].masks.data.cpu().numpy()
+                boxes_np = results[0].boxes.xyxy.cpu().numpy()
+                shape_valid_idx = _filter_mask_shapes(masks_np, boxes_np, rectangularity_threshold=filter_masks_shapes[1])
+                results[0].boxes = results[0].boxes[shape_valid_idx]
+                results[0].masks = results[0].masks[shape_valid_idx]
+                if loop_idx > 0:
+                    times_mask_shape.append(time() - _t0)
+
+            # 4. Mask size filter
+            if filter_masks_sizes[0] and results[0].masks is not None:
+                _t0 = time()
+                masks_np = results[0].masks.data.cpu().numpy()
+                size_valid_idx, _ = _filter_mask_sizes(masks_np, upper_multiplier=filter_masks_sizes[2], lower_multiplier=filter_masks_sizes[1])
+                results[0].boxes = results[0].boxes[size_valid_idx]
+                results[0].masks = results[0].masks[size_valid_idx]
+                if loop_idx > 0:
+                    times_mask_size.append(time() - _t0)
+
+            # 5. Holes-and-islands cleanup — replaces the YOLO Masks object with a plain tensor
+            if filter_holes_islands and results[0].masks is not None:
+                _t0 = time()
+                masks = results[0].masks.data.cpu().numpy()
+                islands_threshold = int(min(m.astype(np.bool_).sum() for m in masks)) - 1
+                refined_masks = []
+                for mask in masks:
+                    mask = mask.astype(np.bool_)
+                    refined_mask, _ = remove_small_regions(mask, islands_threshold, mode='islands')
+                    refined_mask, _ = remove_small_regions(refined_mask, 20000, mode='holes')
+                    refined_masks.append(refined_mask)
+                results[0].masks = torch.from_numpy(np.array(refined_masks))
+                if loop_idx > 0:
+                    times_holes_islands.append(time() - _t0)
+
+            # 6. Overlap filter — guided by depth estimation
+            if filter_overlap_masks and results[0].masks is not None:
+                _t0 = time()
+                depth_array = np.array(depth_pipe(img)["depth"])
+                if loop_idx > 0:
+                    times_depth.append(time() - _t0)
+                _t0 = time()
+                masks = results[0].masks.data.cpu().numpy()
+                masks_depth_values = np.array([depth_array * mask for mask in masks])
+                masks_filtered_dict = filter_overlapping_masks_extended(
+                    masks,
+                    masks_depth_values,
+                    overlap_threshold=50,
+                    containment_threshold=0.95,
+                    depth_difference_threshold=40,
+                    debug=False
+                )
+                results[0].masks = results[0].masks[masks_filtered_dict['kept_indices']]
+                results[0].boxes = results[0].boxes[masks_filtered_dict['kept_indices']]
+                if loop_idx > 0:
+                    times_overlap.append(time() - _t0)
+
+        if results[0].masks is not None:
+            # holes/islands filter replaces the YOLO Masks object with a plain tensor, so .xyn is unavailable
+            if isinstance(results[0].masks, torch.Tensor):
+                pred_masks = list(results[0].masks.cpu().numpy().astype(bool))
+            else:
+                pred_masks = [_points_to_mask(poly.flatten(), width, height)
+                              for poly in results[0].masks.xyn]
             conf_scores = results[0].boxes.conf.cpu().numpy()
         else:
             pred_masks = []
@@ -215,6 +361,31 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2):
     print(f"AP@50:             {ap50:.4f}")
     print(f"AP@50:95:          {ap50_95:.4f}")
 
+    if times_predict:
+        def _avg(lst): return sum(lst) / len(lst) if lst else 0.0
+
+        print("\n--- Timing Summary (excluding first sample) ---")
+        print(f"Avg YOLO prediction      : {_avg(times_predict):.3f} s")
+        if times_red:
+            print(f"Avg red filter           : {_avg(times_red):.3f} s")
+        if times_bbox:
+            print(f"Avg bbox size filter     : {_avg(times_bbox):.3f} s")
+        if times_mask_shape:
+            print(f"Avg mask shape filter    : {_avg(times_mask_shape):.3f} s")
+        if times_mask_size:
+            print(f"Avg mask size filter     : {_avg(times_mask_size):.3f} s")
+        if times_holes_islands:
+            print(f"Avg holes/islands filter : {_avg(times_holes_islands):.3f} s")
+        if times_depth:
+            print(f"Avg depth estimation     : {_avg(times_depth):.3f} s")
+        if times_overlap:
+            print(f"Avg overlap filter       : {_avg(times_overlap):.3f} s")
+        full_avg = (_avg(times_predict) + _avg(times_red) + _avg(times_bbox) +
+                    _avg(times_mask_shape) + _avg(times_mask_size) +
+                    _avg(times_holes_islands) + _avg(times_depth) + _avg(times_overlap))
+        print(f"Avg full time (sum)      : {full_avg:.3f} s")
+        print("-----------------------------------------------")
+
 
 def run_yolo_and_store_masks(model, filepath, device=2):
 
@@ -241,7 +412,7 @@ def run_yolo_and_store_masks(model, filepath, device=2):
         idx = full_data[img_id]['image_id']
         
   
-        results = model.predict(sample_path, device=device, verbose=False)
+        results = model.predict(sample_path, device=device, verbose=False, retina_masks = True) # retina_masks to get masks in the original size
 
         if results[0].masks is None:
             # No detections: store empty arrays
@@ -278,7 +449,7 @@ def main():
     
     val_labels = [sample['labels'] for sample in val_data]
 
-    # Remove bonnet mask (class 0)
+    # Remove punnet mask (class 0)
     val_labels = [[label for label in sample_labels if label[0] != 0] for sample_labels in val_labels]
 
     # Do not record the raspberry grade, since we are only interested in segmentation performance for now, not classification performance
@@ -309,17 +480,54 @@ def main():
 
 
     # Load a model
-   # model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
+  #  model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
     # Train the model
-  #  results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz=[1280,800], name = "yolo26n-seg-pseudo-labels", device = 2)
+    #imgsz=[1280,800]
+   # results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz= 640, name = "yolo26n-seg-pseudo-labels", device = 2)
 
     # Load trained model
-    model = YOLO("../../disk/pretrained_models/yolo26n-seg-pseudo-labels-best-1008-sam3.pt")
+    model = YOLO("../../disk/pretrained_models/yolo26n-seg-pseudo-labels-best-640-input.pt")
     #metrics = model.val(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", device = 2)
     #print(metrics.seg.f1)
-    evaluate_yolo_iou(model, val_data, val_labels, device=2)
+    evaluate_yolo_iou(model, val_data, val_labels, device=2, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
 
-   # run_yolo_and_store_masks(model, filepath="../../disk/saved_masks/yolo_fullsize", device=2)
+  #  run_yolo_and_store_masks(model, filepath="../../disk/saved_masks/yolo_640", device=2)
+
+
+
+
+
+
+    # -------------------------------------------------------------------------
+    # Punnet training
+    # -------------------------------------------------------------------------
+
+    # GT val labels for punnet: keep only class-0 entries, then strip the class index
+    val_labels_punnet = [sample['labels'] for sample in val_data]
+    val_labels_punnet = [[label for label in sample_labels if label[0] == 0] for sample_labels in val_labels_punnet]
+    val_labels_punnet = [[label[1:] for label in sample_labels] for sample_labels in val_labels_punnet]
+
+    # Load predicted punnet masks (produced by SAM3 on the punnet class)
+    PUNNET_MASKS_FILE = '../../disk/saved_masks/SAM3_punnet/masks.pkl'
+    with open(PUNNET_MASKS_FILE, 'rb') as f:
+        pred_data_punnet = pickle.load(f)
+
+    all_pred_masks_ids_punnet = [(pred_data_punnet[key], key) for key in pred_data_punnet.keys()]
+    all_pred_masks_ids_punnet.sort(key=lambda x: x[1])
+
+    all_pred_ids_punnet    = [img_id for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
+    all_pred_xyn_punnet    = [masks_and_xyn_and_imgs[1] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
+    all_imgs_punnet        = [masks_and_xyn_and_imgs[3] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
+
+   # setup_yolo_dataset_structure(all_imgs_punnet, all_pred_xyn_punnet, all_pred_ids_punnet, val_labels_punnet, N_TRAIN_SAMPLES, mode="punnet")
+
+    # Load a pretrained model and train on punnet pseudo-labels
+   # model_punnet = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")
+   # results_punnet = model_punnet.train(data="../../disk/YOLO_dataset_punnet/punnet-seg.yaml", epochs=100, imgsz=640, name="yolo26n-seg-punnet-pseudo-labels-convexhull", device=2)
+
+    # Load trained punnet model and evaluate
+  #  model_punnet = YOLO("../../disk/pretrained_models/yolo26n-seg-punnet-pseudo-labels-best.pt")
+  #  evaluate_yolo_iou(model_punnet, val_data, val_labels_punnet, device=2)
 
 
     # Get inference time by evaluating on 5 random samples in /home/marlon_helbing/disk/YOLO_dataset/images/val

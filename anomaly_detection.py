@@ -982,6 +982,8 @@ def saving_criteria(best_metrics, new_metrics):
 
 def main():
 
+    # TODO : train on segmented raspberries from models, evaluate on GT ? 
+
     # TODO : try more aggressive synthetic occlusion as well, as some raspberries that are very occluded do bad in the test set (even though they are classified correctly)
 
     # TODO : think that specular suppression (i.e. removing drupelets) is hurting the model... need to understand why

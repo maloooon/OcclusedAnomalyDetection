@@ -752,13 +752,13 @@ def apply_filters(dataset_path,
 
 def main():
 
-    CREATE_BASED_ON = 'gt' # Options: 'gt', 'sam3' 'yolo', 'yolo_fullsize'
+    CREATE_BASED_ON = 'yolo_640' # Options: 'gt', 'sam3' 'yolo', 'yolo_fullsize', 'yolo_640'
 
     # --- Config ---
     IMG_SIZE = 256
     UNBLURRED = False
     SPECULAR_SUPPRESSION = False
-    CLEAN_PROTRUSIONS = True
+    CLEAN_PROTRUSIONS = False
     FILTER_HOLES = False
     HOLES_DEPTH_THRESH = 40
     HOLES_BRIGHTNESS_THRESH = 40
@@ -767,7 +767,7 @@ def main():
 
     SIZE_FILTERING = False
     SIZE_FILTERING_FACTOR = 1.5
-    DARKNESS_FILTERING = True # Fully filters out too dark samples
+    DARKNESS_FILTERING = False # Fully filters out too dark samples
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
  

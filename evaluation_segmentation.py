@@ -425,12 +425,12 @@ def main():
     train_data = list(ds['train'])
     valid_data = list(ds['valid'])
 
-    full_data = list(ds['train']) + list(ds['valid'])
+    full_data = list(ds['valid'])  # list(ds['train']) + 
 
     all_gt_masks_ids  = _extract_masks(full_data)
 
     ## Load predicted masks
-    PRED_MASKS_FILE = '../../disk/saved_masks/DINO_SAM_mobile/masks.pkl'
+    PRED_MASKS_FILE = '../../disk/saved_masks/SAM3/masks.pkl'
 
     if PRED_MASKS_FILE.endswith('.pkl'):
         with open(PRED_MASKS_FILE, 'rb') as f:
@@ -515,7 +515,7 @@ def main():
 
     ap50_95, per_threshold = compute_ap50_95(all_pred_masks, all_conf_scores, all_gt_masks)
     print(f"  AP@50:95:     {ap50_95:.4f}")
-  #  print("  Per-threshold breakdown:")
+   # print("  Per-threshold breakdown:")
   #  for name, val in per_threshold.items():
   #      print(f"    {name}: {val:.4f}")
 
