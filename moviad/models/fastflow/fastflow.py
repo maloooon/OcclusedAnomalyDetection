@@ -1,4 +1,5 @@
 import numpy as np
+import cv2 as cv
 import torch.nn as nn
 import torch
 from torch import Tensor
@@ -20,10 +21,10 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-def create_fastflow(img_shape, backbone_name, device, struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0):
+def create_fastflow(img_shape, backbone_name, device, struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = True):
     backbone_name = "wide_resnet50_2"
 
-    fast_flow_model = CompleteFastFlowModel(backbone_name,input_size= img_shape, normalize = True, struct_core_instance = struct_core_instance, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+    fast_flow_model = CompleteFastFlowModel(backbone_name,input_size= img_shape, normalize = True, struct_core_instance = struct_core_instance, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     fast_flow_module = FastflowModel(input_size = img_shape,flow_steps=8,conv3x3_only=False,hidden_ratio=1.0,channels=fast_flow_model.channels,scales=fast_flow_model.scales)
     fast_flow_model.fast_flow_module = fast_flow_module
 
@@ -602,7 +603,7 @@ class AnomalyMapGenerator(nn.Module):
 
 
 class CompleteFastFlowModel(nn.Module):
-    def __init__(self,backbone_name,input_size,normalize, struct_core_instance, scoring_mode, filter_post, mask_border_filter_thickness):
+    def __init__(self,backbone_name,input_size,normalize, struct_core_instance, scoring_mode, filter_post, mask_border_filter_thickness, AD_only_on_mask = True):
         super().__init__()
 
         if backbone_name in ["cait_m48_448", "deit_base_distilled_patch16_384"]:
@@ -624,6 +625,7 @@ class CompleteFastFlowModel(nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.AD_only_on_mask = AD_only_on_mask
 
         if backbone_name in ["cait_m48_448", "deit_base_distilled_patch16_384"]:
             channels = [768]
@@ -664,15 +666,20 @@ class CompleteFastFlowModel(nn.Module):
 
     def forward(self,input_tensor):
 
+        mask = None
         if isinstance(input_tensor, tuple):
             if len(input_tensor) == 6:
                 input_tensor, mask, mask_unfiltered, batch_og, mask_og, depth_og = input_tensor
-            if len(input_tensor) == 2:
+            elif len(input_tensor) == 2:
                 input_tensor, mask = input_tensor
                 batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
-            if len(input_tensor) == 3:
+            elif len(input_tensor) == 3:
                 input_tensor, mask, mask_unfiltered = input_tensor
                 batch_og, mask_og, depth_og = None, None, None
+
+        # Ensure batch dimension is present
+        if input_tensor.ndim == 3:
+            input_tensor = input_tensor.unsqueeze(0)
 
         if isinstance(self.feature_extractor, VisionTransformer):
             # print("get_vit_features")
@@ -691,15 +698,45 @@ class CompleteFastFlowModel(nn.Module):
 
         if not self.training:
             anomaly_maps = self.anomaly_map_generator(hidden_variables)
-            anomaly_scores = anomaly_maps.view(anomaly_maps.shape[0],-1).max(dim=1).values
 
+            if mask is not None and self.AD_only_on_mask:
+                if mask.ndim == 3:
+                    mask = mask.unsqueeze(1)
+                device = anomaly_maps.device
+                effective_mask = torch.zeros_like(mask, dtype=torch.float32)
+                for i in range(mask.shape[0]):
+                    sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
+                    if self.mask_border_filter_thickness > 0:
+                        contours, _ = cv.findContours(
+                            sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+                        )
+                        contour_band = np.zeros_like(sample_mask)
+                        cv.drawContours(
+                            contour_band, contours, -1, 255,
+                            thickness=self.mask_border_filter_thickness
+                        )
+                        inner_mask = sample_mask.copy()
+                        inner_mask[contour_band == 255] = 0
+                    else:
+                        inner_mask = sample_mask
+                    effective_mask[i, 0] = torch.from_numpy(
+                        inner_mask.astype(np.float32)
+                    ).to(device)
+                effective_mask = (effective_mask > 0).float()
+                # FastFlow scores are in [-1, 0): closer to 0 = more anomalous.
+                # Set outside-mask pixels to -1 (least anomalous) so max/mean
+                # reflect only the inside-mask region, analogous to STFPM's zeroing.
+                anomaly_maps = anomaly_maps * effective_mask + (effective_mask - 1)
+
+            anomaly_maps_flat = anomaly_maps.view(anomaly_maps.shape[0], -1)
+            anomaly_scores = anomaly_maps_flat.max(dim=1).values
 
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
                 anomaly_scores = self.struct_core_instance.score(anomaly_maps, anomaly_scores)
             else:
                 k = float(self.scoring_mode.split('_')[-1])
                 max_scores = anomaly_scores
-                mean_scores = torch.mean(flat, dim=1)
+                mean_scores = torch.mean(anomaly_maps_flat, dim=1)
                 anomaly_scores = k * max_scores + (1 - k) * mean_scores
 
             return_val = (anomaly_maps, anomaly_scores)

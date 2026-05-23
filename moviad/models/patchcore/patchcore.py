@@ -47,6 +47,7 @@ class PatchCore(nn.Module):
         cls_token_viz_bool = False,
         protrusion_damping_radius: int = 0,
         protrusion_damping_gamma: float = 1,
+        AD_only_on_mask = True,
 
     ) -> None:
 
@@ -71,6 +72,7 @@ class PatchCore(nn.Module):
         self.mask_border_filter_thickness = mask_border_filter_thickness
         self.protrusion_damping_radius = protrusion_damping_radius
         self.protrusion_damping_gamma = protrusion_damping_gamma
+        self.AD_only_on_mask = AD_only_on_mask
 
 
         self.cls_token_viz_bool = cls_token_viz_bool
@@ -138,6 +140,11 @@ class PatchCore(nn.Module):
             elif len(input_tensor) == 3:
                 input_tensor, mask, mask_unfiltered = input_tensor
                 batch_og, mask_og, depth_og = None, None, None
+
+        
+        # Ensure batch dimension is present
+        if input_tensor.dim() == 3:
+            input_tensor = input_tensor.unsqueeze(0)
  
     
 
@@ -290,8 +297,9 @@ class PatchCore(nn.Module):
                 ).to(effective_mask.device)
                 effective_mask = effective_mask * protrusion_weight
 
-            effective_mask_flat = effective_mask.reshape(batch_size, -1)
-            patch_scores = patch_scores * effective_mask_flat
+            if self.AD_only_on_mask:
+                effective_mask_flat = effective_mask.reshape(batch_size, -1)
+                patch_scores = patch_scores * effective_mask_flat
 
             # compute the anomaly score of the images
             pred_scores = self.compute_anomaly_score(patch_scores, locations, embedding)

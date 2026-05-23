@@ -15,7 +15,7 @@ import torch
 from ultralytics import YOLO
 from ultralytics.models.sam.amg import remove_small_regions
 from transformers import pipeline
-from SAM_segmentation import store_masks, _filter_red_masks, _filter_bbox_sizes, _filter_mask_shapes, _filter_mask_sizes, filter_overlapping_masks_extended
+from SAM_segmentation import store_masks, _filter_red_masks, _filter_bbox_sizes, _filter_mask_shapes, _filter_mask_sizes, filter_overlapping_masks_extended, filter_overlapping_masks_extended_old
 from evaluation_segmentation import calculate_segmentation_metrics, _points_to_mask, compute_ap50, compute_ap50_95
 
 
@@ -206,10 +206,12 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
                       filter_masks_shapes=(False, 0.85),
                       filter_masks_sizes=(False, 0.2, None),
                       filter_holes_islands=False,
-                      filter_overlap_masks=False):
+                      filter_overlap_masks=(False, 'new')):
     """Compute the same averaged mean IoU used in evaluation_segmentation.py for SAM models.
     This is mainly implemented since we calculate based on pixel level metrics, which is not the standard in YOLO.
-    Optionally applies the same post-prediction filters used in model_SAM_extended before computing metrics."""
+    Optionally applies the same post-prediction filters used in model_SAM_extended before computing metrics.
+    filter_overlap_masks: (bool, 'new'|'old') — 'new' uses filter_overlapping_masks_extended,
+        'old' uses filter_overlapping_masks_extended_old (F2 algorithm)."""
     avg_iou = 0.0
     avg_f1 = 0.0
     avg_precision = 0.0
@@ -220,7 +222,7 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
     all_gt_masks = []
 
     depth_pipe = None
-    if filter_overlap_masks:
+    if filter_overlap_masks[0]:
         depth_pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf", device=device if torch.cuda.is_available() else 'cpu')
 
     times_predict = []
@@ -235,6 +237,7 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
     for loop_idx, (sample, gt_polys) in enumerate(zip(val_data, val_labels)):
         img = sample['image']
         width, height = img.size
+
 
         # retina_masks=True returns masks at original image resolution, required for the red filter
         _t0 = time()
@@ -304,7 +307,7 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
                     times_holes_islands.append(time() - _t0)
 
             # 6. Overlap filter — guided by depth estimation
-            if filter_overlap_masks and results[0].masks is not None:
+            if filter_overlap_masks[0] and results[0].masks is not None:
                 _t0 = time()
                 depth_array = np.array(depth_pipe(img)["depth"])
                 if loop_idx > 0:
@@ -312,14 +315,22 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
                 _t0 = time()
                 masks = results[0].masks.data.cpu().numpy()
                 masks_depth_values = np.array([depth_array * mask for mask in masks])
-                masks_filtered_dict = filter_overlapping_masks_extended(
-                    masks,
-                    masks_depth_values,
-                    overlap_threshold=50,
-                    containment_threshold=0.95,
-                    depth_difference_threshold=40,
-                    debug=False
-                )
+                if filter_overlap_masks[1] == 'old':
+                    masks_filtered_dict = filter_overlapping_masks_extended_old(
+                        masks,
+                        masks_depth_values,
+                        overlap_threshold=50,
+                        containment_threshold=0.95,
+                    )
+                else:
+                    masks_filtered_dict = filter_overlapping_masks_extended(
+                        masks,
+                        masks_depth_values,
+                        overlap_threshold=50,
+                        containment_threshold=0.95,
+                        depth_difference_threshold=40,
+                        debug=False
+                    )
                 results[0].masks = results[0].masks[masks_filtered_dict['kept_indices']]
                 results[0].boxes = results[0].boxes[masks_filtered_dict['kept_indices']]
                 if loop_idx > 0:
@@ -386,8 +397,13 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
         print(f"Avg full time (sum)      : {full_avg:.3f} s")
         print("-----------------------------------------------")
 
-
-def run_yolo_and_store_masks(model, filepath, device=2):
+def run_yolo_and_store_masks(model, filepath, device=2,
+                             filter_red=(True, 0.3),
+                             filter_bboxes=(True, None, 3.0),
+                             filter_masks_shapes=(False, 0.85),
+                             filter_masks_sizes=(False, 0.2, None),
+                             filter_holes_islands=True,
+                             filter_overlap_masks=(True, 'new')):
 
     masks_list = []
     xyn_list = []
@@ -395,36 +411,109 @@ def run_yolo_and_store_masks(model, filepath, device=2):
     sample_imgs = []
     img_ids_list = []
 
-
     # Get raspberry dataset
     ds = load_dataset("FBK-TeV/RaspGrade")
 
     full_data = list(ds['train']) + list(ds['valid'])
-
 
     train_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/train").glob("*.png")))
     val_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/val").glob("*.png")))
 
     all_img_paths = train_img_paths + val_img_paths
 
+    depth_pipe = None
+    if filter_overlap_masks[0]:
+        depth_pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Base-hf", device=device if torch.cuda.is_available() else 'cpu')
+
     for img_id, sample_path in enumerate(all_img_paths):
         img = full_data[img_id]['image']
         idx = full_data[img_id]['image_id']
-        
-  
-        results = model.predict(sample_path, device=device, verbose=False, retina_masks = True) # retina_masks to get masks in the original size
+
+        results = model.predict(sample_path, device=device, verbose=False, retina_masks=True)
+
+        if results[0].masks is not None:
+            img_array = np.array(img)
+
+            # 1. Red filter — discard non-raspberry masks
+            if filter_red[0]:
+                masks_np = results[0].masks.data.cpu().numpy()
+                red_valid_idx = _filter_red_masks(masks_np, img_array, min_red_fraction=filter_red[1])
+                results[0].boxes = results[0].boxes[red_valid_idx]
+                results[0].masks = results[0].masks[red_valid_idx]
+
+            # 2. Bbox size filter
+            if filter_bboxes[0] and results[0].masks is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                if len(boxes) > 0:
+                    valid_idx, _ = _filter_bbox_sizes(boxes, upper_multiplier=filter_bboxes[2], lower_multiplier=filter_bboxes[1])
+                    results[0].boxes = results[0].boxes[valid_idx]
+                    results[0].masks = results[0].masks[valid_idx]
+
+            # 3. Mask shape filter (rectangularity)
+            if filter_masks_shapes[0] and results[0].masks is not None:
+                masks_np = results[0].masks.data.cpu().numpy()
+                boxes_np = results[0].boxes.xyxy.cpu().numpy()
+                shape_valid_idx = _filter_mask_shapes(masks_np, boxes_np, rectangularity_threshold=filter_masks_shapes[1])
+                results[0].boxes = results[0].boxes[shape_valid_idx]
+                results[0].masks = results[0].masks[shape_valid_idx]
+
+            # 4. Mask size filter
+            if filter_masks_sizes[0] and results[0].masks is not None:
+                masks_np = results[0].masks.data.cpu().numpy()
+                size_valid_idx, _ = _filter_mask_sizes(masks_np, upper_multiplier=filter_masks_sizes[2], lower_multiplier=filter_masks_sizes[1])
+                results[0].boxes = results[0].boxes[size_valid_idx]
+                results[0].masks = results[0].masks[size_valid_idx]
+
+            # 5. Holes-and-islands cleanup — replaces the YOLO Masks object with a plain tensor
+            if filter_holes_islands and results[0].masks is not None:
+                masks = results[0].masks.data.cpu().numpy()
+                islands_threshold = int(min(m.astype(np.bool_).sum() for m in masks)) - 1
+                refined_masks = []
+                for mask in masks:
+                    mask = mask.astype(np.bool_)
+                    refined_mask, _ = remove_small_regions(mask, islands_threshold, mode='islands')
+                    refined_mask, _ = remove_small_regions(refined_mask, 20000, mode='holes')
+                    refined_masks.append(refined_mask)
+                results[0].masks = torch.from_numpy(np.array(refined_masks))
+
+            # 6. Overlap filter — guided by depth estimation
+            if filter_overlap_masks[0] and results[0].masks is not None:
+                depth_array = np.array(depth_pipe(img)["depth"])
+                masks = results[0].masks.data.cpu().numpy()
+                masks_depth_values = np.array([depth_array * mask for mask in masks])
+                if filter_overlap_masks[1] == 'old':
+                    masks_filtered_dict = filter_overlapping_masks_extended_old(
+                        masks,
+                        masks_depth_values,
+                        overlap_threshold=50,
+                        containment_threshold=0.95,
+                    )
+                else:
+                    masks_filtered_dict = filter_overlapping_masks_extended(
+                        masks,
+                        masks_depth_values,
+                        overlap_threshold=50,
+                        containment_threshold=0.95,
+                        depth_difference_threshold=40,
+                        debug=False
+                    )
+                results[0].masks = results[0].masks[masks_filtered_dict['kept_indices']]
+                results[0].boxes = results[0].boxes[masks_filtered_dict['kept_indices']]
 
         if results[0].masks is None:
-            # No detections: store empty arrays
             masks_list.append(np.zeros((0, img.size[1], img.size[0]), dtype=bool))
             xyn_list.append([])
             conf_scores_list.append(np.array([]))
         else:
-            masks_list.append(results[0].masks.data.cpu().numpy().astype(bool))
-            xyn_list.append(results[0].masks.xyn)
+            # holes/islands filter replaces the YOLO Masks object with a plain tensor, so .xyn is unavailable
+            if isinstance(results[0].masks, torch.Tensor):
+                masks_list.append(results[0].masks.cpu().numpy().astype(bool))
+                xyn_list.append([])
+            else:
+                masks_list.append(results[0].masks.data.cpu().numpy().astype(bool))
+                xyn_list.append(results[0].masks.xyn)
             conf_scores_list.append(results[0].boxes.conf.cpu().numpy())
 
-        
         sample_imgs.append(img)
         img_ids_list.append(idx)
 
@@ -456,7 +545,7 @@ def main():
     val_labels = [[label[1:] for label in sample_labels] for sample_labels in val_labels]
 
     ## Load predicted masks
-    PRED_MASKS_FILE = '../../disk/saved_masks/SAM3/masks.pkl'
+    PRED_MASKS_FILE = '../../nvme1/thesis/saved_masks/sam3/masks.pkl'
     with open(PRED_MASKS_FILE, 'rb') as f:
         pred_data = pickle.load(f)
 
@@ -483,15 +572,16 @@ def main():
   #  model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
     # Train the model
     #imgsz=[1280,800]
-   # results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz= 640, name = "yolo26n-seg-pseudo-labels", device = 2)
+  #  results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz= 640, name = "yolo26n-seg-pseudo-labels-frozen24", device = 2, freeze= 23)
 
     # Load trained model
-    model = YOLO("../../disk/pretrained_models/yolo26n-seg-pseudo-labels-best-640-input.pt")
+    model = YOLO("../../disk/pretrained_models/yolo26n-seg-pseudo-labels-best-640-input-frozen22.pt") 
+    #print(len(model.model.model)) # num layers
     #metrics = model.val(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", device = 2)
     #print(metrics.seg.f1)
-    evaluate_yolo_iou(model, val_data, val_labels, device=2, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
+#    evaluate_yolo_iou(model, val_data, val_labels, device=2, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (False, 0.3), filter_holes_islands = False, filter_overlap_masks = (False, 'new'))
 
-  #  run_yolo_and_store_masks(model, filepath="../../disk/saved_masks/yolo_640", device=2)
+   # run_yolo_and_store_masks(model, filepath="../../nvme1/thesis/saved_masks/yolo_640", device=2)
 
 
 

@@ -27,6 +27,7 @@ from moviad.models.components.simplenet.feature_extractor import UpscalingFeatur
 from moviad.models.components.blur import GaussianBlur
 
 import numpy as np
+import cv2 as cv
 SEED = 32
 import random
 random.seed(SEED)
@@ -72,6 +73,8 @@ class SuperSimpleNet(nn.Module):
         stop_grad: bool = DEFAULT_PARAMETERS["stop_grad"],
         struct_core_instance = None,
         scoring_mode = 'MAXMEAN_1',
+        mask_border_filter_thickness = 0,
+        AD_only_on_mask = True,
     ) -> None:
         super().__init__()
 
@@ -103,6 +106,8 @@ class SuperSimpleNet(nn.Module):
 
         self.struct_core_instance = struct_core_instance
         self.scoring_mode = scoring_mode
+        self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.AD_only_on_mask = AD_only_on_mask
 
     def forward(
         self,
@@ -135,6 +140,11 @@ class SuperSimpleNet(nn.Module):
             elif len(images) == 6:
                 images, masks, masks_unfiltered, batch_og, mask_og, depth_og = images
 
+        
+        # Ensure images have batch dimension
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
            # images, masks, _, _ , _ = images
 
         output_size = images.shape[-2:]
@@ -159,6 +169,32 @@ class SuperSimpleNet(nn.Module):
 
         anomaly_map, anomaly_score = self.segdec(adapted)
         anomaly_map = self.anomaly_map_generator(anomaly_map, final_size=output_size)
+
+        if masks is not None and self.AD_only_on_mask:
+            if masks.ndim == 3:
+                masks = masks.unsqueeze(1)
+            device = anomaly_map.device
+            effective_mask = torch.zeros_like(masks, dtype=torch.float32)
+            for i in range(masks.shape[0]):
+                sample_mask = masks[i, 0].cpu().numpy().astype(np.uint8)
+                if self.mask_border_filter_thickness > 0:
+                    contours, _ = cv.findContours(
+                        sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
+                    )
+                    contour_band = np.zeros_like(sample_mask)
+                    cv.drawContours(
+                        contour_band, contours, -1, 255,
+                        thickness=self.mask_border_filter_thickness
+                    )
+                    inner_mask = sample_mask.copy()
+                    inner_mask[contour_band == 255] = 0
+                else:
+                    inner_mask = sample_mask
+                effective_mask[i, 0] = torch.from_numpy(
+                    inner_mask.astype(np.float32)
+                ).to(device)
+            effective_mask = (effective_mask > 0).float()
+            anomaly_map = anomaly_map * effective_mask
 
         # Since paper provides that in unsupervised setting, which we are working on,
         # taking the max of anomaly map as anomaly score provides better scores, we do the same

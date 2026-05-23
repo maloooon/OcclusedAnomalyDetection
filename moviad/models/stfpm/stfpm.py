@@ -23,7 +23,7 @@ class STFPM(torch.nn.Module):
     DEFAULT_PARAMETERS = {
         "epochs": 100,
         "batch_size": 32,
-        "learning_rate": 0.2,
+        "learning_rate": 0.4, # 0.2
         "weight_decay": 1e-4,
         "momentum": 0.9,
     }
@@ -38,6 +38,7 @@ class STFPM(torch.nn.Module):
         mask_border_filter_thickness = 0,
         protrusion_damping_radius: int = 0,
         protrusion_damping_gamma: float = 1,
+        AD_only_on_mask = True
     ):
         super().__init__()
         self.teacher = teacher
@@ -48,6 +49,7 @@ class STFPM(torch.nn.Module):
         self.mask_border_filter_thickness = mask_border_filter_thickness
         self.protrusion_damping_radius = protrusion_damping_radius
         self.protrusion_damping_gamma = protrusion_damping_gamma
+        self.AD_only_on_mask = AD_only_on_mask
 
     def forward(self, batch: torch.Tensor):
 
@@ -56,12 +58,16 @@ class STFPM(torch.nn.Module):
         if (isinstance(batch, tuple)):
             if len(batch) == 6:
                 batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch # NOTE : added mask_unfiltered
-            if len(batch) == 2:
+            elif len(batch) == 2:
                 batch, mask = batch
                 batch_og, mask_og, depth_og = None, None, None
-            if len(batch) == 3:
+            elif len(batch) == 3:
                 batch, mask, mask_unfiltered = batch
                 batch_og, mask_og, depth_og = None, None, None
+
+        # Ensure batch has 4 dimensions (B, C, H, W)
+        if batch.ndim == 3:
+            batch = batch.unsqueeze(0) # unsqueeze initial dimension
                
 
         if self.training:
@@ -287,7 +293,8 @@ class STFPM(torch.nn.Module):
                 post_mask_filtered = specular_mask
 
        # effective_mask_flat = effective_mask.reshape(batch_size, -1)
-        score_maps = score_maps * effective_mask
+        if self.AD_only_on_mask:
+            score_maps = score_maps * effective_mask
 
 
         if self.protrusion_damping_gamma > 0:

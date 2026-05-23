@@ -78,7 +78,7 @@ class SingleRaspberryDataset(Dataset):
     def __init__(self, dataset_path: str, split=None, synthetic_augmentation=False, synthetic_augmentation_mode = 'replace',
                  hole_augmentation=False, hole_augmentation_mode='replace',
                  AD_model=None, backbone_model=None, struct_core_collection_bool=False,
-                 pass_og_bool=True):
+                 pass_og_bool=True, include_gt_fill_ins=True):
         """
         Args:
             dataset_path: path to the 'processed' folder (contains normal/, anomalous/, splits/)
@@ -96,10 +96,10 @@ class SingleRaspberryDataset(Dataset):
         self.pass_og_bool = pass_og_bool
  
  
-        if AD_model == 'ganomaly':
-            transform_sizes = 256
+        if AD_model == 'ganomaly' or AD_model =='stfpm' or AD_model == 'rd4ad' or AD_model == 'fastflow' or AD_model == 'supersimplenet': # earlier was only with ganomaly
+            self.transform_sizes = 256
         else:
-            transform_sizes = 224 
+            self.transform_sizes = 224
  
         if self.synthetic_augmentation:
             from synthetic_occlusion import SyntheticOcclusion
@@ -109,7 +109,7 @@ class SingleRaspberryDataset(Dataset):
             )
  
         self.transform_img = transforms.Compose([
-            transforms.Resize((transform_sizes, transform_sizes), antialias=True,
+            transforms.Resize((self.transform_sizes, self.transform_sizes), antialias=True,
                              interpolation=InterpolationMode.BILINEAR),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -117,7 +117,7 @@ class SingleRaspberryDataset(Dataset):
         ])
  
         self.transform_mask = transforms.Compose([
-            transforms.Resize((transform_sizes, transform_sizes), antialias=True,
+            transforms.Resize((self.transform_sizes, self.transform_sizes), antialias=True,
                              interpolation=InterpolationMode.BILINEAR),
             transforms.ToTensor(),
         ])
@@ -138,10 +138,13 @@ class SingleRaspberryDataset(Dataset):
  
         normal_test = [normal_data[i] for i in self.test_indices_non_anom]
         normal_train = [normal_data[i] for i in self.train_indices_non_anom]
- 
+
         if self.split == 'train':
             self.data = normal_train
         else:
+            if not include_gt_fill_ins:
+                normal_test    = [r for r in normal_test    if not r.get('filled_from_gt', False)]
+                anomalous_data = [r for r in anomalous_data if not r.get('filled_from_gt', False)]
             self.data = anomalous_data + normal_test
 
 
@@ -249,6 +252,10 @@ class SingleRaspberryDataset(Dataset):
  
     def __len__(self):
         return len(self.img_paths)
+
+    
+    def get_input_size(self):
+        return (self.transform_sizes, self.transform_sizes)
  
 
     def __getitem__(self, idx):
@@ -450,7 +457,7 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
     del model, optimizer, train_dataloader, train_dataset
     torch.cuda.empty_cache()
 
-def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, cls_token_viz_bool = False, hole_augmentation_bool = False, hole_augmentation_mode = 'replace'):
+def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, cls_token_viz_bool = False, hole_augmentation_bool = False, hole_augmentation_mode = 'replace', include_gt_fill_ins = True, batch_size_train = 8, epochs = 50, AD_only_on_mask = True):
 
     mode = mode.lower()
     # initialize the feature extractor
@@ -474,52 +481,46 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     if max_dataset_size is not None:
         train_dataset = torch.utils.data.Subset(train_dataset, range(max_dataset_size))
     
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=8, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True)
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
-    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) 
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool, include_gt_fill_ins = include_gt_fill_ins)
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
-    
+
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False)
 
     print(f"Length train dataset: {len(train_dataset)}")
     print(f"Length test dataset: {len(test_dataset)}")
+
+    input_size = train_dataset.get_input_size()
     
 
     # TODO : change if len(2) for dino to backbone.model_name  because else it messes up (i.e. STFPM fucked up with len(2) ...)
     # NOTE : Ganomaly & supersimplenet & STFPM have no device, therefore also run on cuda:0 ...
-    if mode == 'patchcore':
-        # NOTE : CLS TOKEN BOOL ACTIVATED !
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool) 
+    if mode == 'patchcore': # k = 70000, num_neighbors = 500 // YOLO +WRN-50-2 layers2,3 has 3506832 total patches, so 1%-patchcore is 35068 , 3 neighbours is basic setting
+        model = PatchCore(device, input_size= input_size, feature_extractor=feature_extractor, k = 35068, num_neighbors = 3, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, AD_only_on_mask = AD_only_on_mask) 
     elif mode == 'cfa':
-        model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0, protrusion_damping_gamma = 0)
-  #  if mode == 'patchcore':
-   #     model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, cls_token_scoring_bool = False) # NOTE : adjust to keep testing
-    #elif mode == 'cfa':
-    #    model = CFA(feature_extractor, backbone, device)
-    #    model.initialize_memory_bank(train_dataloader)
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = 0, protrusion_damping_gamma = 0, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'fastflow':
-        model = create_fastflow((224,224), backbone, device)
+        model = create_fastflow(input_size, backbone, device, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'rd4ad':
-        model = RD4AD(backbone, device, input_size = (224,224))
-    #elif mode == 'stfpm':
-    #    model = STFPM(teacher, student)
+        model = RD4AD(backbone, device, input_size = input_size, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'padim':
         diagonal_convergence = False
-        model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers)
+        model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'ganomaly':
-        model = Ganomaly(input_size = (256,256), num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
+        model = Ganomaly(input_size = input_size, num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
     elif mode == 'supersimplenet':
-        model = SuperSimpleNet(feature_extractor)
+        model = SuperSimpleNet(feature_extractor, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'sinbad':
         model = SINBAD(
             device=device,
-            input_size=(224, 224),
+            input_size=input_size,
             feature_extractor=feature_extractor,
             n_projections=200,   # paper default
             n_quantiles=5,        # paper default
@@ -550,7 +551,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     elif mode == 'sinbad':
         trainer = TrainerSINBAD(model, train_dataloader, test_dataloader, device,save_path=save_path, logger=None)
     if mode not in ('patchcore', 'padim', 'sinbad'):
-        trainer.train(epochs = 50, evaluation_epoch_interval=1)
+        trainer.train(epochs = epochs, evaluation_epoch_interval=1)
     else:
         trainer.train()
 
@@ -575,7 +576,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     torch.cuda.empty_cache()
     gc.collect()
 
-def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', top_k_ratio = 0.01, filter_post = 'NONE', mask_border_filter_thickness = 0, protrusion_damping_radius = 0, protrusion_damping_gamma = 0):
+def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', top_k_ratio = 0.01, filter_post = 'NONE', mask_border_filter_thickness = 0, protrusion_damping_radius = 0, protrusion_damping_gamma = 0, AD_only_on_mask = True):
     """
     After creating the memory bank/ training a model, collect descriptors for StructCore based on training data
     """
@@ -599,13 +600,15 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
         train_dataset = torch.utils.data.Subset(train_dataset, range(max_dataset_size))
     print(f"Length train dataset: {len(train_dataset)}")
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
+
+    input_size = train_dataset.get_input_size()
     
     # NOTE :added filter post etc. not tested ; but needed I think, such that STFPM collects on the correct post filters!
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
+        model = PatchCore(device, input_size=input_size, feature_extractor=feature_extractor, k = 70000, num_neighbors = 500,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
+        model = STFPM(teacher, student,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
 
     
 
@@ -664,13 +667,13 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
 
     return struct_core
 
-def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, pass_og_bool = False, custom_weights_path = None, cls_token_viz_bool = False, top_k_ratio = 0.01, protrusion_damping_radius = 0, protrusion_damping_gamma = 0):
+def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, pass_og_bool = False, custom_weights_path = None, cls_token_viz_bool = False, top_k_ratio = 0.01, protrusion_damping_radius = 0, protrusion_damping_gamma = 0, include_gt_fill_ins = True, AD_only_on_mask = True):
     
 
     
     if scoring_mode == 'STRUCTCORE':
         print("StructCore collection ...")
-        struct_core = struct_core_collection(dataset_path, backbone, ad_layers, model_checkpoint_path, device, max_dataset_size, mode, target_path, top_k_ratio = top_k_ratio, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
+        struct_core = struct_core_collection(dataset_path, backbone, ad_layers, model_checkpoint_path, device, max_dataset_size, mode, target_path, top_k_ratio = top_k_ratio, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
         print("StructCore collection done")
 
         
@@ -684,7 +687,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
-    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool) 
+    test_dataset = SingleRaspberryDataset(test_set_path, split = 'test', synthetic_augmentation = False, AD_model = mode, backbone_model = backbone, pass_og_bool = pass_og_bool, include_gt_fill_ins = include_gt_fill_ins)
 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
@@ -698,28 +701,29 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
         # occluded raspberry is an anomaly), we set some thickness to the contour and then remove this area. Obviously we lose some raspberry by this
         # but the anomalies seem not be directly at the border area, so we lose little.
 
+    input_size = test_dataset.get_input_size()
 
     model_load_start_time = time()
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=(224, 224), feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
+        model = PatchCore(device, input_size=input_size, feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'cfa':
-        model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'stfpm':
-        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma)
+        model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'rd4ad':
-        model = RD4AD(backbone, device, input_size = (224,224), struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = RD4AD(backbone, device, input_size = input_size, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'fastflow':
-        model = create_fastflow((224,224), backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = create_fastflow(input_size, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'padim':
         diagonal_convergence = False
-        model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'ganomaly':
-        model = Ganomaly(input_size = (256,256), num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
+        model = Ganomaly(input_size = input_size, num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
     elif mode == 'supersimplenet':
-        model = SuperSimpleNet(feature_extractor)
+        model = SuperSimpleNet(feature_extractor, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'sinbad':
-        model = SINBAD(device=device, input_size=(224, 224),feature_extractor=feature_extractor, n_projections=200,n_quantiles=5,shrinkage=0.1,scoring_mode='knn')
+        model = SINBAD(device=device, input_size=input_size,feature_extractor=feature_extractor, n_projections=200,n_quantiles=5,shrinkage=0.1,scoring_mode='knn')
 
     
 
@@ -749,19 +753,43 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     model_load_end_time = time()
     print(f"Model loading time: {model_load_end_time - model_load_start_time:.2f} seconds")
 
+
+
     # length of state dict
    # state_dict = torch.load(model_checkpoint_path, map_location=device)
    # print(f"Length of state dict: {len(state_dict)}")
+
+
+
   
 
     model.to(device)
     model.eval()
 
-
+   
 
 
     evaluator = Evaluator(test_dataloader, device)
     metrics = evaluator.evaluate(model)
+
+
+    if mode == 'patchcore' or mode == 'cfa':
+        sizes, total_size = model.get_model_size_and_macs()
+
+        print(f"SIZES : {sizes}")
+        print(f"TOTAL SIZE : {total_size}")
+
+    else:
+        param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+        total_mb = (param_bytes + buffer_bytes) / 1e6
+
+        print(f"params: {param_bytes / 1e6:.2f} MB")
+        print(f"buffers: {buffer_bytes / 1e6:.2f} MB")
+        print(f"total: {total_mb:.2f} MB")
+
+        for name, buf in model.named_buffers():
+            print(name, buf.shape, f"{buf.numel() * buf.element_size() / 1e6:.2f} MB")
 
 
 
@@ -1033,13 +1061,23 @@ def main():
     HOLE_AUG_BOOL = False
     HOLE_AUG_MODE = 'augment'
 
+    BATCH_SIZE_TRAIN = 32
+    EPOCHS = 30
+    AD_ONLY_ON_MASK = False
+
     # NOTE : this only works with patchcore + dinov2 
     CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
 
     # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    FILTER_PRE = 'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+    FILTER_PRE = 'full_no_filters_seed_42_yolo_640_shared_test_set_256'#'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
 
   
+    # Only applies when FILTER_PRE points to a _shared_test_set dataset.
+    # True  → test set includes GT fill-in samples (full GT test set size).
+    # False → test set contains only model-detected samples in the GT test set.
+    # Only use this flag when not using the GT dataset
+    INCLUDE_GT_FILL_INS = True
+
     FILTER_PRE = FILTER_PRE.upper()
     # Get the last element in filter_pre
     last_element = FILTER_PRE.split('_')[-1]
@@ -1054,7 +1092,7 @@ def main():
     TOP_K_RATIO_STRUCTCORE = 0.04
 
 
-    dataset_path = Path('../../nvme1/dataset_single_objects/GT/') 
+    dataset_path = Path('../../nvme1/thesis/dataset_single_objects/') 
     target_path = FILTER_PRE.lower()
 
 
@@ -1069,16 +1107,19 @@ def main():
     # Train the model
     device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
     print(device)
-   # backbone = "wide_resnet50_2" 
-    backbone = "dinov2_vitb14"
+    backbone = "wide_resnet50_2" 
+   # backbone = "resnet18"
+  #  backbone = "dinov2_vitb14"
    # backbone = 'mobilenet_v2'
    # backbone = "dinov3_vitb16"
   #  ad_layers = ["features.4", "features.7", "features.10"] 
    # ad_layers = ["layer4"]
   #  ad_layers = ["features.10"] # SINBAD tests
-   # ad_layers = ["layer2", "layer3"]
+    ad_layers = ["layer2", "layer3"]
+  #  ad_layers = ["layer2", "layer3", "layer4"]
+  #  ad_layers = ["layer1", "layer2", "layer3"]
     
-    ad_layers = [3,6,9,11] 
+  #  ad_layers = [3,6] 
   #  if CLS_TOKEN_VIZ_BOOL:
   #      ad_layers.append(11) # extracting also CLS token for visualizations
     end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
@@ -1088,10 +1129,10 @@ def main():
     if HOLE_AUG_BOOL:
         aug_parts.append(f"hole_{HOLE_AUG_MODE}")
     aug_str = "_".join(aug_parts) if aug_parts else "no_aug"
-    save_path = f"../../disk/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{aug_str}_"
+    save_path = f"../../nvme1/thesis/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{aug_str}_"
 
     custom_weights_path = None
-   # custom_weights_path = f"../../disk/pretrained_models/{backbone}_cutout_{'_'.join([str(layer) for layer in ad_layers])}.pt"
+   # custom_weights_path = f"../../nvme1/thesis/pretrained_models/{backbone}_cutout_{'_'.join([str(layer) for layer in ad_layers])}.pt"
    # if not os.path.exists(custom_weights_path):
    #     raise FileNotFoundError(f"Custom weights not found at {custom_weights_path}. Please run pretrain_backbone_cutout first to generate these weights.")
 
@@ -1103,10 +1144,10 @@ def main():
 
 
   
-    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, hole_augmentation_bool = HOLE_AUG_BOOL, hole_augmentation_mode = HOLE_AUG_MODE)
+    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, hole_augmentation_bool = HOLE_AUG_BOOL, hole_augmentation_mode = HOLE_AUG_MODE, include_gt_fill_ins = INCLUDE_GT_FILL_INS, epochs = EPOCHS, batch_size_train = BATCH_SIZE_TRAIN, AD_only_on_mask = AD_ONLY_ON_MASK)
 
     # Check if visual test path exists and clear it out if it already exists
-    visual_test_path = f"../../nvme1/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{aug_str}/" # NOTE : disk normally
+    visual_test_path = f"../../nvme1/thesis/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{aug_str}/" # NOTE : disk normally
     visual_test_dir = Path(visual_test_path)
     if visual_test_dir.exists():
         shutil.rmtree(visual_test_dir)
@@ -1115,11 +1156,11 @@ def main():
 
     
   #  test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE,
-  #   target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING, 
-  #   filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool, 
+  #   target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING,
+  #   filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool,
   #   custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, top_k_ratio = TOP_K_RATIO_STRUCTCORE,
-  #  protrusion_damping_radius = 0, protrusion_damping_gamma = 0)
-   # detailed_eval(visual_test_path)
+  #   protrusion_damping_radius = 0, protrusion_damping_gamma = 0, include_gt_fill_ins = INCLUDE_GT_FILL_INS, AD_only_on_mask = AD_ONLY_ON_MASK)
+  #  detailed_eval(visual_test_path)
 
     # STRUCTCORE : only topk seems to work the best, in most cases (but stupid seed 1 it seems to improve performance)
 

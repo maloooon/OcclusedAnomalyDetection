@@ -411,6 +411,7 @@ class Generator(nn.Module):
                 - First encoder's latent vector
                 - Second encoder's latent vector
         """
+
         latent_i = self.encoder1(input_tensor)
         gen_image = self.decoder(latent_i)
         latent_o = self.encoder2(gen_image)
@@ -546,25 +547,31 @@ class Ganomaly(nn.Module):
         if (isinstance(batch, tuple)):
             if len(batch) == 6:
                 batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch
-            if len(batch) == 2:
+            elif len(batch) == 2:
                 batch, mask = batch
                 batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
-            if len(batch) == 3:
+            elif len(batch) == 3:
                 batch, mask, mask_unfiltered = batch
                 batch_og, mask_og, depth_og = None, None, None
+
+        # Ensure batch has batch dimension
+        if batch.dim() == 3:
+            batch = batch.unsqueeze(0)
 
         padded_batch = Ganomaly.pad_nextpow2(batch)
         fake, latent_i, latent_o = self.generator(padded_batch)
         if self.training:
             return padded_batch, fake, latent_i, latent_o
+            
         scores = torch.mean(torch.pow((latent_i - latent_o), 2), dim=1).view(-1)  # convert nx1x1 to n
         anomaly_maps = torch.mean(torch.pow((padded_batch - fake), 2), dim=1).unsqueeze(1)
+        flat = anomaly_maps.view(anomaly_maps.shape[0], -1)
 
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
             anomaly_scores = self.struct_core_instance.score(anomaly_maps, scores)
         else:
             k = float(self.scoring_mode.split('_')[-1])
-            max_scores = scores
+            max_scores = scores 
             mean_scores = torch.mean(flat, dim=1)
             anomaly_scores = k * max_scores + (1 - k) * mean_scores
 

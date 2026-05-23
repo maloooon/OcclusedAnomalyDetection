@@ -42,7 +42,8 @@ class CFA(nn.Module):
             struct_core_instance = None,
             scoring_mode = 'MAXMEAN_1',
             filter_post = 'NONE',
-            mask_border_filter_thickness = 0
+            mask_border_filter_thickness = 0,
+            AD_only_on_mask = False
         ):
 
         """
@@ -82,6 +83,8 @@ class CFA(nn.Module):
 
         self.feature_maps_shape: tuple = None # only for model footprint
 
+        self.AD_only_on_mask = AD_only_on_mask
+
     def initialize_memory_bank(self, training_dataloader: DataLoader):
         """
         Initialize the memory bank
@@ -119,12 +122,16 @@ class CFA(nn.Module):
         if isinstance(x, tuple):
             if len(x) == 6:
                 x, mask, mask_unfiltered, batch_og, mask_og, depth_og = x
-            if len(x) == 2:
+            elif len(x) == 2:
                 x, mask = x
                 mask_unfiltered, batch_og, mask_og, depth_og = None, None, None, None
-            if len(x) == 3:
+            elif len(x) == 3:
                 x, mask, mask_unfiltered = x
                 batch_og, mask_og, depth_og = None, None, None
+
+        # Ensure input has batch dimension
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
     
         p = self.feature_extractor(x)
 
@@ -225,6 +232,8 @@ class CFA(nn.Module):
                 effective_mask = torch.squeeze(effective_mask, dim=1) # (B, H, W)
                 effective_mask = effective_mask.to(device)
                 curr_heatmaps_shape = heatmaps.shape
+
+            if self.AD_only_on_mask:
                 heatmaps = heatmaps * effective_mask
        
                 
@@ -341,6 +350,7 @@ class CFA(nn.Module):
             "macs" : macs
         }
 
+        
         macs, params = get_model_macs(self.Descriptor, self.feature_maps_shape)
         sizes["patch_descriptor"] = {
             "size" : get_torch_model_size(self.Descriptor),

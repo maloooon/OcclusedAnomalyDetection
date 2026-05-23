@@ -87,6 +87,7 @@ class Padim(nn.Module):
             scoring_mode = 'MAXMEAN_1',
             filter_post = 'NONE',
             mask_border_filter_thickness = 0,
+            AD_only_on_mask = False
     ):
         """
         Args:
@@ -104,6 +105,7 @@ class Padim(nn.Module):
         # feature extractor backbone model
         self.backbone_model_name = backbone_model_name
         self.layers_idxs = layers_idxs
+        self.AD_only_on_mask = AD_only_on_mask
 
        # self.layers_idxs = idx_to_layer_name(
        #     backbone_model_name, layers_idxs
@@ -173,12 +175,16 @@ class Padim(nn.Module):
         if isinstance(x, tuple):
             if len(x) == 6:
                 x, mask, mask_unfiltered, batch_og, mask_og, depth_og = x
-            if len(x) == 2:
+            elif len(x) == 2:
                 x, mask = x
                 mask_unfiltered, batch_og, mask_og, depth_og = None, None, None, None
-            if len(x) == 3:
+            elif len(x) == 3:
                 x, mask, mask_unfiltered = x
                 batch_og, mask_og, depth_og = None, None, None
+
+        # Ensure batch dimension is present       
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
  
 
         # 1. extract feature maps and get the raw layer outputs (conv. feature maps)
@@ -254,7 +260,8 @@ class Padim(nn.Module):
                 effective_mask[i, 0] = torch.from_numpy(inner_mask.astype(np.float32))
 
             effective_mask = (effective_mask > 0).float()
-            score_map_t = score_map_t * effective_mask
+            if self.AD_only_on_mask:
+                score_map_t = score_map_t * effective_mask
 
       #  if 'HOLE_DARKNESS' in self.filter_post:
       #      thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]

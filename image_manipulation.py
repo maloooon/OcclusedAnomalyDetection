@@ -104,7 +104,7 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True,
     S, V = hsv[:, :, 1], hsv[:, :, 2]
     
     s_thresh = 100
-    v_thresh = 210
+    v_thresh = 230
     max_blob_area = 200
 
     raw_highlights = ((S < s_thresh) & (V > v_thresh) & (mask > 0)).astype(np.uint8) * 255
@@ -785,7 +785,7 @@ def main():
         path = anomalous_data[i]['img_path']
         stem_path = (Path(path)).stem + '.png'
 
-       # if stem_path == "img076_obj8_grade5.png": #"": #"img002_obj19_grade2.png": :
+        if stem_path == "img076_obj8_grade5.png": #"": #"img002_obj19_grade2.png": :
     
 
             # Convert sample to rgb
@@ -809,7 +809,7 @@ def main():
          #   find_holes(normal_sample, normal_mask, normal_depth, path_tests, stem_path, visualize_bool = True)
            # find_contour(normal_sample, normal_mask)
            # apply_cutout(normal_sample, normal_mask)
-        apply_specular_suppression(anomalous_sample, anomalous_mask, visualize=True, inpainting=True, save_all = True, save_folder = path_tests, filename = stem_path)
+            apply_specular_suppression(anomalous_sample, anomalous_mask, visualize=True, inpainting=True, save_all = False, save_folder = path_tests, filename = stem_path)
            # filter_darkness(anomalous_sample, anomalous_mask, brightness_threshold_percentile=30, visualize=True)
          #   morphological_opening(anomalous_sample, anomalous_mask, kernel_size=15)
            

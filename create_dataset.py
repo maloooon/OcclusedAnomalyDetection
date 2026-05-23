@@ -187,15 +187,21 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
             shutil.rmtree(save_path)
         os.makedirs(save_path, exist_ok=True)
 
-    # --- Grade matching (unchanged) ---
+    # --- Grade matching ---
+    # Also builds pred_to_gt_idx_all: per-image {pred_idx -> gt_idx} so filenames
+    # use GT object indices, making names consistent across GT / SAM3 / YOLO datasets.
     grades_matched = []
+    pred_to_gt_idx_all = []  # list of dicts, one per image
     if all_gt_masks and all_gt_grades is not None:
         for pred_masks_img, gt_masks_img, gt_grades_img in zip(masks, all_gt_masks, all_gt_grades):
             curr_grades = np.full(len(pred_masks_img), -1, dtype=int)
+            pred_to_gt = {}
             matched_pairs, _, _ = match_instances(pred_masks_img, gt_masks_img, iou_threshold=0.5, gt_grades=gt_grades_img)
-            for pred_idx, _, _, grade in matched_pairs:
+            for pred_idx, gt_idx, _, grade in matched_pairs:
                 curr_grades[pred_idx] = grade
+                pred_to_gt[pred_idx] = gt_idx
             grades_matched.append(curr_grades)
+            pred_to_gt_idx_all.append(pred_to_gt)
 
     # --- Depth estimation (unchanged) ---
     pipe = pipeline(
@@ -235,6 +241,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
         for j, mask in enumerate(img_masks):
             masked_img = img.copy()
             masked_img = np.array(masked_img)
+            mask = mask.astype(bool) # ensure boolean
             masked_img[~mask] = 0
 
             curr_img_raw.append(masked_img)
@@ -328,12 +335,18 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                 os.makedirs(raw_img_folder, exist_ok=True)
                 os.makedirs(processed_img_folder, exist_ok=True)
 
+                pred_to_gt_idx = pred_to_gt_idx_all[i] if pred_to_gt_idx_all else {}
                 for j, (curr_img_raw, curr_img_processed, curr_depth_raw, curr_depth_processed) in enumerate(
                     zip(imgs_raw, imgs_processed, depths_raw, depths_processed)
                 ):
                     grade = int(img_grades[j])
-                    # CHANGE: filename uses original img_id and obj index j — always stable
-                    img_filename = f"{img_id}_obj{j}_grade{grade}.png"
+                    if j in pred_to_gt_idx:
+                        # Matched prediction: use GT object index for consistent naming.
+                        img_filename = f"{img_id}_obj{pred_to_gt_idx[j]}_grade{grade}.png"
+                    else:
+                        # Unmatched (false positive, grade=-1): use fp prefix to avoid
+                        # colliding with the GT obj-index namespace.
+                        img_filename = f"{img_id}_fp{j}_grade{grade}.png"
 
                     
                     raw_img_path = os.path.join(raw_img_folder, img_filename)
@@ -747,27 +760,249 @@ def apply_filters(dataset_path,
     print(f"  Remaining anomalous: {len(filtered_anomalous)}")
     print(f"  Filtered images saved to: {filtered_base}")
 
+def data_split_aligned_to_gt(processed_path, gt_processed_path):
+    """
+    For model runs with SHARED_TEST_SET=True.
 
+    Assigns each model-detected sample to test or train based on the GT split,
+    not randomly. Normal and anomalous samples whose filename stem is in the GT
+    test set go to test; the rest go to train (or are excluded for anomalous,
+    since anomaly detection models don't train on anomalous samples and those
+    detections don't belong in a shared test comparison).
+
+    Args:
+        processed_path:    path to the model's processed/ folder.
+        gt_processed_path: path to the GT processed/ folder (same filter/seed/size).
+    """
+    processed_path = Path(processed_path)
+    gt_stems_path = Path(gt_processed_path) / 'splits' / 'gt_test_stems.pkl'
+
+    if not gt_stems_path.exists():
+        raise FileNotFoundError(
+            f"GT test stems not found at {gt_stems_path}. "
+            "Run with CREATE_BASED_ON='gt' and SHARED_TEST_SET=True first."
+        )
+
+    with open(gt_stems_path, 'rb') as f:
+        gt_test_stems = pickle.load(f)
+
+    normal_pkl_path = processed_path / 'normal' / 'normal_samples.pkl'
+    anomalous_pkl_path = processed_path / 'anomalous' / 'anomalous_samples.pkl'
+    splits_path = processed_path / 'splits'
+    splits_path.mkdir(parents=True, exist_ok=True)
+
+    with open(normal_pkl_path, 'rb') as f:
+        normal_data = pickle.load(f)
+    with open(anomalous_pkl_path, 'rb') as f:
+        anomalous_data = pickle.load(f)
+
+    test_normal_indices = []
+    train_normal_indices = []
+    for i, rec in enumerate(normal_data):
+        if Path(rec['img_path']).name in gt_test_stems:
+            test_normal_indices.append(i)
+        else:
+            train_normal_indices.append(i)
+
+    # Keep only anomalous samples that are in the GT test set.
+    # Model-detected anomalous not in GT test have no shared-test-set role (and should anyway not exist)
+    filtered_anomalous = [rec for rec in anomalous_data
+                          if Path(rec['img_path']).name in gt_test_stems]
+    n_excluded_anom = len(anomalous_data) - len(filtered_anomalous)
+    with open(anomalous_pkl_path, 'wb') as f:
+        pickle.dump(filtered_anomalous, f)
+
+    with open(splits_path / 'train_normal_indices.pkl', 'wb') as f:
+        pickle.dump(train_normal_indices, f)
+    with open(splits_path / 'test_normal_indices.pkl', 'wb') as f:
+        pickle.dump(test_normal_indices, f)
+    with open(splits_path / 'train_normal_paths.pkl', 'wb') as f:
+        pickle.dump([normal_data[i]['img_path'] for i in train_normal_indices], f)
+    with open(splits_path / 'test_normal_paths.pkl', 'wb') as f:
+        pickle.dump([normal_data[i]['img_path'] for i in test_normal_indices], f)
+
+    print(
+        f"[data_split_aligned_to_gt] "
+        f"Train normal: {len(train_normal_indices)}, "
+        f"Test normal: {len(test_normal_indices)}, "
+        f"Test anomalous: {len(filtered_anomalous)}"
+        + (f" ({n_excluded_anom} anomalous excluded — detected but not in GT test set)"
+           if n_excluded_anom else "")
+    )
+
+def save_gt_test_stems(processed_path):
+    """
+    After creating the GT dataset and its split, persist the set of test sample
+    filenames (stems) so that model datasets can fill in missing entries later.
+
+    Saves to {processed_path}/splits/gt_test_stems.pkl as a set of filename strings
+    like 'img004_obj5_grade2.png'.
+    """
+    processed_path = Path(processed_path)
+    splits_path = processed_path / 'splits'
+
+    with open(processed_path / 'normal' / 'normal_samples.pkl', 'rb') as f:
+        normal_data = pickle.load(f)
+    with open(processed_path / 'anomalous' / 'anomalous_samples.pkl', 'rb') as f:
+        anomalous_data = pickle.load(f)
+    with open(splits_path / 'test_normal_indices.pkl', 'rb') as f:
+        test_normal_indices = pickle.load(f)
+
+    test_stems = set()
+    for rec in anomalous_data:
+        test_stems.add(Path(rec['img_path']).name)
+    for i in test_normal_indices:
+        test_stems.add(Path(normal_data[i]['img_path']).name)
+
+    with open(splits_path / 'gt_test_stems.pkl', 'wb') as f:
+        pickle.dump(test_stems, f)
+
+    print(f"[save_gt_test_stems] Saved {len(test_stems)} GT test stems.")
+    return test_stems
+
+def fill_test_set_from_gt(model_processed_path, gt_processed_path):
+    """
+    For each sample in the GT test set that is absent from the model's test set,
+    copy the GT-processed image and record into the model dataset and add it to
+    the model's test split.
+
+    This gives every model the same test set size as GT, while using the model's
+    own masks for raspberries it detected and GT masks for the ones it missed.
+
+    Args:
+        model_processed_path: path to the model's processed/ folder.
+        gt_processed_path:    path to the corresponding GT processed/ folder
+                              (same filter/seed/size settings, only model name differs).
+    """
+    model_processed_path = Path(model_processed_path)
+    gt_processed_path = Path(gt_processed_path)
+    gt_stems_path = gt_processed_path / 'splits' / 'gt_test_stems.pkl'
+
+    if not gt_stems_path.exists():
+        raise FileNotFoundError(
+            f"GT test stems not found at {gt_stems_path}. "
+            "Run with CREATE_BASED_ON='gt' and SHARED_TEST_SET=True first."
+        )
+
+    with open(gt_stems_path, 'rb') as f:
+        gt_test_stems = pickle.load(f)
+
+    normal_pkl_path = model_processed_path / 'normal' / 'normal_samples.pkl'
+    anomalous_pkl_path = model_processed_path / 'anomalous' / 'anomalous_samples.pkl'
+    splits_path = model_processed_path / 'splits'
+
+    with open(normal_pkl_path, 'rb') as f:
+        normal_data = pickle.load(f)
+    with open(anomalous_pkl_path, 'rb') as f:
+        anomalous_data = pickle.load(f)
+    with open(splits_path / 'test_normal_indices.pkl', 'rb') as f:
+        test_normal_indices = pickle.load(f)
+    with open(splits_path / 'train_normal_indices.pkl', 'rb') as f:
+        train_normal_indices = pickle.load(f)
+
+    model_test_stems = set()
+    for i in test_normal_indices:
+        model_test_stems.add(Path(normal_data[i]['img_path']).name)
+    for rec in anomalous_data:
+        model_test_stems.add(Path(rec['img_path']).name)
+
+    missing_stems = gt_test_stems - model_test_stems
+    if not missing_stems:
+        print("[fill_test_set_from_gt] No missing samples — model test set already covers full GT test set.")
+        return
+
+    # Index GT records by filename stem for fast lookup
+    with open(gt_processed_path / 'normal' / 'normal_samples.pkl', 'rb') as f:
+        gt_normal_data = pickle.load(f)
+    with open(gt_processed_path / 'anomalous' / 'anomalous_samples.pkl', 'rb') as f:
+        gt_anomalous_data = pickle.load(f)
+
+    gt_by_stem = {}
+    for rec in gt_normal_data:
+        gt_by_stem[Path(rec['img_path']).name] = ('normal', rec)
+    for rec in gt_anomalous_data:
+        gt_by_stem[Path(rec['img_path']).name] = ('anomalous', rec)
+
+    n_filled_normal = 0
+    n_filled_anomalous = 0
+
+    for stem in sorted(missing_stems):
+        if stem not in gt_by_stem:
+            print(f"[fill_test_set_from_gt] Warning: {stem} not found in GT dataset, skipping.")
+            continue
+
+        source_type, gt_rec = gt_by_stem[stem]
+
+        if source_type == 'normal':
+            dest_path = model_processed_path / 'normal' / stem
+            gt_img_path = Path(gt_rec['img_path'])
+            if gt_img_path.exists():
+                shutil.copy2(gt_img_path, dest_path)
+            else:
+                Image.fromarray(gt_rec['image'].astype(np.uint8)).save(dest_path)
+
+            new_rec = {**gt_rec, 'img_path': str(dest_path), 'filled_from_gt': True}
+            new_idx = len(normal_data)
+            normal_data.append(new_rec)
+            test_normal_indices.append(new_idx)
+            n_filled_normal += 1
+
+        else:  # anomalous
+            dest_path = model_processed_path / 'anomalous' / stem
+            gt_img_path = Path(gt_rec['img_path'])
+            if gt_img_path.exists():
+                shutil.copy2(gt_img_path, dest_path)
+            else:
+                Image.fromarray(gt_rec['image'].astype(np.uint8)).save(dest_path)
+
+            new_rec = {**gt_rec, 'img_path': str(dest_path), 'filled_from_gt': True}
+            anomalous_data.append(new_rec)
+            n_filled_anomalous += 1
+
+    # Persist updated pkl files
+    with open(normal_pkl_path, 'wb') as f:
+        pickle.dump(normal_data, f)
+    with open(anomalous_pkl_path, 'wb') as f:
+        pickle.dump(anomalous_data, f)
+
+    # Persist updated split files
+    with open(splits_path / 'test_normal_indices.pkl', 'wb') as f:
+        pickle.dump(test_normal_indices, f)
+    with open(splits_path / 'test_normal_paths.pkl', 'wb') as f:
+        pickle.dump([normal_data[i]['img_path'] for i in test_normal_indices], f)
+    with open(splits_path / 'train_normal_paths.pkl', 'wb') as f:
+        pickle.dump([normal_data[i]['img_path'] for i in train_normal_indices], f)
+
+    print(
+        f"[fill_test_set_from_gt] Filled {n_filled_normal} normal + "
+        f"{n_filled_anomalous} anomalous samples from GT. "
+        f"({len(missing_stems)} total missing stems)"
+    )
 
 
 def main():
 
-    CREATE_BASED_ON = 'yolo_640' # Options: 'gt', 'sam3' 'yolo', 'yolo_fullsize', 'yolo_640'
+    CREATE_BASED_ON = 'sam3' # Options: 'gt', 'sam3', 'yolo_640' # sam3 uses only hole&islands filter segmentation since didnt improve, yolo_640 uses them
+
+    # When True: GT run saves its test stems; model runs assign test/train based
+    # on the GT split and always fill in any missing GT test samples, marking them
+    # filled_from_gt=True. The downstream loader decides whether to include them.
+    # Always run GT first so gt_test_stems.pkl exists before model runs.
+    SHARED_TEST_SET = True
 
     # --- Config ---
     IMG_SIZE = 256
     UNBLURRED = False
-    SPECULAR_SUPPRESSION = False
-    CLEAN_PROTRUSIONS = False
+    SPECULAR_SUPPRESSION = True
+    CLEAN_PROTRUSIONS = True
     FILTER_HOLES = False
     HOLES_DEPTH_THRESH = 40
     HOLES_BRIGHTNESS_THRESH = 40
-    SEED = 0
- 
+    SEED = 42
 
     SIZE_FILTERING = False
     SIZE_FILTERING_FACTOR = 1.5
-    DARKNESS_FILTERING = False # Fully filters out too dark samples
+    DARKNESS_FILTERING = True # Fully filters out too dark samples
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
  
@@ -798,12 +1033,22 @@ def main():
         filter_str = "full_no_filters" + "_seed_" + str(SEED)
     
     filter_str += f"_{CREATE_BASED_ON}"
- 
-    SAVE_PATH = f'../../nvme1/dataset_single_objects/GT/{filter_str}_{IMG_SIZE}' # NOTE : disk normally
+
+    # GT path derived before any model-specific suffix is appended, so it always
+    # points to the plain GT folder regardless of SHARED_TEST_SET/EXTEND flags.
+    gt_filter_str = filter_str[: filter_str.rfind(f'_{CREATE_BASED_ON}')] + '_gt'
+    GT_SAVE_PATH = f'../../nvme1/thesis/dataset_single_objects/{gt_filter_str}_{IMG_SIZE}'
+
+    # For model runs, append _shared_test_set to make the mode explicit.
+    # GT folders never get this suffix.
+    if SHARED_TEST_SET and CREATE_BASED_ON != 'gt':
+        filter_str += '_shared_test_set'
+
+    SAVE_PATH = f'../../nvme1/thesis/dataset_single_objects/{filter_str}_{IMG_SIZE}' # NOTE : disk normally
     if CREATE_BASED_ON != 'gt':
-        PRED_MASKS_FILE = f'../../disk/saved_masks/{CREATE_BASED_ON}/masks.pkl'
+        PRED_MASKS_FILE = f'../../nvme1/thesis/saved_masks/{CREATE_BASED_ON}/masks.pkl'
     else:
-        PRED_MASKS_FILE = f'../../disk/saved_masks/sam3/masks.pkl' # irrelevant, just for loading purposes
+        PRED_MASKS_FILE = f'../../nvme1/thesis/saved_masks/sam3/masks.pkl' # irrelevant, just for loading purposes
 
 
     
@@ -812,7 +1057,7 @@ def main():
     valid_data = list(ds['valid'])
 
     if UNBLURRED:
-        unblurred_dir = '../../disk/dataset_bonnets/raspberries_unblurred'
+        unblurred_dir = '../../nvme1/dataset_bonnets/raspberries_unblurred'
         for i, sample in enumerate(train_data):
             sample['image'] = Image.open(f'{unblurred_dir}/{i}.jpg').convert('RGB')
         for j, sample in enumerate(valid_data):
@@ -860,15 +1105,23 @@ def main():
         filter_holes_depth_thresh=HOLES_DEPTH_THRESH, filter_holes_brightness_thresh=HOLES_BRIGHTNESS_THRESH
     )
 
-    # --- Step 2: Create deterministic split (unchanged logic) ---
-    data_split_non_anomalous(
-        data_path_normal=f'{SAVE_PATH}/processed/normal/normal_samples.pkl',
-        data_path_anomalous=f'{SAVE_PATH}/processed/anomalous/anomalous_samples.pkl',
-        save_path=f'{SAVE_PATH}/processed/splits',
-        seed = SEED
-    )
+    # --- Step 2: Create split ---
+    if SHARED_TEST_SET and CREATE_BASED_ON != 'gt':
+        # Assign test/train based on GT split membership, not randomly.
+        data_split_aligned_to_gt(
+            processed_path=f'{SAVE_PATH}/processed',
+            gt_processed_path=f'{GT_SAVE_PATH}/processed',
+        )
+    else:
+        # GT run (or SHARED_TEST_SET=False): standard random split.
+        data_split_non_anomalous(
+            data_path_normal=f'{SAVE_PATH}/processed/normal/normal_samples.pkl',
+            data_path_anomalous=f'{SAVE_PATH}/processed/anomalous/anomalous_samples.pkl',
+            save_path=f'{SAVE_PATH}/processed/splits',
+            seed=SEED,
+        )
 
-    # --- Step 3 (NEW): Apply filters post-hoc if requested ---
+    # --- Step 3: Apply filters post-hoc if requested ---
     if SIZE_FILTERING or DARKNESS_FILTERING:
         apply_filters(
             dataset_path=f'{SAVE_PATH}/processed',
@@ -878,6 +1131,21 @@ def main():
             darkness_threshold=DARKNESS_THRESHOLD,
             max_dark_ratio=MAX_DARK_RATIO,
         )
+
+    # --- Step 4: Shared test set bookkeeping (after filtering) ---
+    if SHARED_TEST_SET:
+        if CREATE_BASED_ON == 'gt':
+            # Save canonical test stems after filtering so stems reflect only
+            # the samples that survived, preventing phantom stems in model runs.
+            save_gt_test_stems(f'{SAVE_PATH}/processed')
+        else:
+            # Fill missing GT test samples after model-specific filtering, so
+            # any sample the model filtered out but GT kept is correctly re-added
+            # and tagged filled_from_gt=True.
+            fill_test_set_from_gt(
+                model_processed_path=f'{SAVE_PATH}/processed',
+                gt_processed_path=f'{GT_SAVE_PATH}/processed',
+            )
 
 
 if __name__ == "__main__":

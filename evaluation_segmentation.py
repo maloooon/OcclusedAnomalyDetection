@@ -425,12 +425,12 @@ def main():
     train_data = list(ds['train'])
     valid_data = list(ds['valid'])
 
-    full_data = list(ds['valid'])  # list(ds['train']) + 
+    full_data =   list(ds['train']) + list(ds['valid'])  #
 
     all_gt_masks_ids  = _extract_masks(full_data)
 
     ## Load predicted masks
-    PRED_MASKS_FILE = '../../disk/saved_masks/SAM3/masks.pkl'
+    PRED_MASKS_FILE = '../../nvme1/thesis/saved_masks/SAM3/masks.pkl'
 
     if PRED_MASKS_FILE.endswith('.pkl'):
         with open(PRED_MASKS_FILE, 'rb') as f:

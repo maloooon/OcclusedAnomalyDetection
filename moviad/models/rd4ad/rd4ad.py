@@ -37,7 +37,7 @@ class RD4AD(torch.nn.Module):
         "betas": (0.5,0.999),
     }
 
-    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0):
+    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = False):
         super().__init__()
 
         self.backbone_name = backbone_name
@@ -47,6 +47,7 @@ class RD4AD(torch.nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.AD_only_on_mask = AD_only_on_mask
        # self.encoder, self.bn = resnet18(pretrained=True)
        # self.decoder = de_resnet18(pretrained=False)
 
@@ -88,12 +89,16 @@ class RD4AD(torch.nn.Module):
         if (isinstance(batch, tuple)):
             if len(batch) == 6:
                 batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch
-            if len(batch) == 2:
+            elif len(batch) == 2:
                 batch, mask = batch
                 batch_og, mask_og, depth_og, mask_unfiltered = None, None, None, None
-            if len(batch) == 3:
+            elif len(batch) == 3:
                 batch, mask, mask_unfiltered = batch
                 batch_og, mask_og, depth_og = None, None, None
+
+        # Ensure batch has batch dimension
+        if batch.dim() == 3:
+            batch = batch.unsqueeze(0)
 
         enc_batch = self.encoder(batch)
         # For DinoV2 also return cls token
@@ -189,7 +194,8 @@ class RD4AD(torch.nn.Module):
                 ).to(device)
 
             effective_mask = (effective_mask > 0).float()
-            anomaly_map = anomaly_map * effective_mask
+            if self.AD_only_on_mask:
+                anomaly_map = anomaly_map * effective_mask
 
         # Filter holes before computing anomaly scores
         if 'HOLE_DARKNESS' in self.filter_post:

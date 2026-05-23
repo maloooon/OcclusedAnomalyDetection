@@ -276,17 +276,20 @@ class Evaluator:
         all_actual_grades = list() # NOTE : added
         all_image_paths = list() # NOTE : added
         all_cls_tokens = list() # NOTE : added
+        test_time_full = 0
     
 
-        test_start_time = time()
+        
         for images, labels, masks, path, full_mask, actual_grade, mask_unfiltered, og_img, og_mask, og_depth in tqdm(self.test_dataloader, desc="Eval"):
             # get anomaly map and score
             with torch.no_grad():
                 
 
-            
+                test_start_time = time()
                 out = model((images.to(self.device), full_mask.to(self.device), mask_unfiltered.to(self.device), og_img.to(self.device), og_mask.to(self.device), og_depth.to(self.device))) # NOTE : added full_mask and depth
-            
+                test_end_time = time()
+                batch_time = test_end_time - test_start_time
+                test_time_full += batch_time
 
                 if len(out) == 5: # NOTE : added for patchcore currently
                     anomaly_maps, anomaly_scores, embeddings, memory_bank, cls_tokens = out
@@ -350,8 +353,8 @@ class Evaluator:
           #  all_embeddings = np.asarray(all_embeddings) # NOTE : added
        #     memory_bank = memory_bank.cpu().numpy() # NOTE : added
 
-        test_end_time = time()
-        print(f"Inference time: {test_end_time - test_start_time:.2f} seconds")
+        
+        print(f"Average Inference time per Raspberry: {test_time_full / len(pred_img_scores):.6f} seconds")
 
         all_grades = np.asarray(all_grades) # NOTE : added
         all_actual_grades = np.asarray(all_actual_grades) # NOTE : added

@@ -1,5 +1,6 @@
 from datasets import load_dataset
 from ultralytics import SAM, YOLO
+from ultralytics.engine.results import Masks
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -67,12 +68,12 @@ def get_boxes(results: DetectionResult) -> List[List[List[float]]]:
 
 
 # F2 ALGORITHM
-'''
-def filter_overlapping_masks_extended(
+
+def filter_overlapping_masks_extended_old(
     masks: np.ndarray,
     masks_depth_values: np.ndarray,
     overlap_threshold: int = 30,
-    containment_threshold: float = 0.98
+    containment_threshold: float = 0.9
 ) -> dict:
     """
     Mask filtering with overlap analysis and containment checking.
@@ -225,7 +226,7 @@ def filter_overlapping_masks_extended(
         'removal_reasons': {sorted_indices[k]: reason 
                            for k, reason in removal_reasons.items()}
     }
-'''
+
 
 
 # OLD , DIDNT WORK THAT WELL
@@ -1246,7 +1247,7 @@ def model_SAM3(samples, save_imgs_bool=False, store_masks_bool=False, testing_sa
         print("-----------------------------------------------")
 
     if store_masks_bool:
-        filepath = '../../disk/saved_masks/SAM3' if prompt == "raspberry" else '../../disk/saved_masks/SAM3_punnet'
+        filepath = '../../nvme1/thesis/saved_masks/SAM3' if prompt == "raspberry" else '../../nvme1/thesis/saved_masks/SAM3_punnet'
         store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list, sample_imgs, filepath=filepath)
 
 def model_SAM(samples, mode = 'mobile', save_imgs_bool = False, store_masks_bool = False, testing_samples = 1, filter_bboxes = (True, 0.2, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None), filter_red = (True, 0.4)):
@@ -1632,7 +1633,7 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
                 refined_mask, _ = remove_small_regions(refined_mask, 20000, mode='holes')
                 refined_masks.append(refined_mask)
             refined_masks = np.array(refined_masks)
-            results[0].masks = torch.from_numpy(refined_masks)
+            results[0].masks = Masks(torch.from_numpy(refined_masks.astype(np.float32)), results[0].orig_shape)
             end_time_0 = time()
             print(f"Holes/islands filter time for sample {sample_idx}: {end_time_0 - start_time_0:.2f} seconds")
             if loop_idx > 0:
@@ -1684,8 +1685,8 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
                     img_array_non_kept = cv2.addWeighted(img_array_non_kept, 1, color_mask, 0.9, 0)
                 cv2.imwrite('output_removed_masks.jpg', cv2.cvtColor(img_array_non_kept, cv2.COLOR_RGB2BGR))
 
-      #  plotted_img = results[0].plot(boxes=False, masks=True)
-#        plotted_img_w_boxes = results[0].plot(boxes=True, masks=True)
+     #   plotted_img = results[0].plot(boxes=False, masks=True)
+        plotted_img_w_boxes = results[0].plot(boxes=True, masks=True)
 
         # Draw masks with different colors
         img_array = np.array(sample_img)
@@ -1744,9 +1745,9 @@ def model_SAM_extended(samples, mode='mobile', save_imgs_bool=False, store_masks
 
     if store_masks_bool:
         if mode == 'mobile':
-            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list=None, sample_imgs=None, filepath='../../disk/saved_masks/SAM_extended_mobile')
+            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list=None, sample_imgs=None, filepath='../../nvme1/thesis/saved_masks/SAM_extended_mobile')
         else:
-            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list=None, sample_imgs=None, filepath='../../disk/saved_masks/SAM_extended')
+            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list=None, sample_imgs=None, filepath='../../nvme1/thesis/saved_masks/SAM_extended')
 
     return masks_list, conf_scores_list, img_ids_list
 
@@ -1891,7 +1892,7 @@ def model_SAM_manipulate(samples, save_imgs_bool=False, store_masks_bool=False, 
     if store_masks_bool:
         store_masks(masks_list, img_ids_list, filepath='saved_masks/SAM_manipulate')
     
-def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None), filter_holes_islands = False, filter_overlap_masks = False, filter_by_darkness = False):
+def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None), filter_red=(True, 0.4), filter_holes_islands = False, filter_overlap_masks = False, filter_by_darkness = False):
     """
     Grounding DINO to find bboxes based on text prompt + SAM to generate masks.
     """
@@ -1907,6 +1908,7 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
         filter_bboxes (tuple): (bool, lower_multiplier, upper_multiplier) to filter bounding boxes based on area relative to median.
         filter_masks_shapes (tuple): (bool, rectangularity_threshold) to filter masks based on shape.
         filter_masks_sizes (tuple): (bool, lower_multiplier, upper_multiplier) to filter masks based on size.
+        filter_red (tuple): (bool, min_red_fraction) to keep only masks whose covered pixels are mostly red.
         filter_by_darkness (bool): Whether to filter masks based on darkness using LAB color space.
     """
 
@@ -1917,7 +1919,7 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # BBOX DETECTOR : Grounding DINO
-    detector_id = "IDEA-Research/grounding-dino-tiny"
+    detector_id = "IDEA-Research/grounding-dino-tiny" # tiny or base
     object_detector = pipeline(model=detector_id, task="zero-shot-object-detection", device=2 if torch.cuda.is_available() else 'cpu')
     labels = ["raspberry."]
     labels = [label if label.endswith(".") else label+"." for label in labels]
@@ -1968,6 +1970,7 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
     times_dino = []
     times_image_encoding = []
     times_inference = []
+    times_red = []
     times_bbox = []
     times_mask_shape = []
     times_mask_size = []
@@ -2052,7 +2055,19 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
         print(f"Full inference time DINO + SAM: {end_time_2 - start_time_2 + end_time_1 - start_time_1 + end_time_0 - start_time_0} seconds")
 
 
-        
+
+
+        # 1. Red filter — discard non-raspberry masks before any other filtering
+        if results[0].masks is not None and filter_red[0]:
+            _t0 = time()
+            masks_np = results[0].masks.data.cpu().numpy()
+            red_valid_idx = _filter_red_masks(masks_np, np.array(sample_img), min_red_fraction=filter_red[1])
+            results[0].boxes = results[0].boxes[red_valid_idx]
+            results[0].masks = results[0].masks[red_valid_idx]
+            _t1 = time()
+            print(f"Red filter time for sample {sample_idx}: {_t1 - _t0:.2f} seconds")
+            if loop_idx > 0:
+                times_red.append(_t1 - _t0)
 
         # Calculate median area and filter outliers
         boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -2186,7 +2201,7 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
                     refined_masks.append(refined_mask)
                 refined_masks = np.array(refined_masks)
 
-                results[0].masks = torch.from_numpy(refined_masks)
+                results[0].masks = Masks(torch.from_numpy(refined_masks.astype(np.float32)), results[0].orig_shape)
 
             
             end_time_0 = time()
@@ -2324,9 +2339,9 @@ def model_grounding_SAM(samples, mode = 'base', save_imgs_bool=False, store_mask
 
     if store_masks_bool:
         if mode == 'mobile':
-            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list = None, sample_imgs = None, filepath= '../../disk/saved_masks/DINO_SAM_mobile')
+            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list = None, sample_imgs = None, filepath= '../../nvme1/thesis/saved_masks/DINO_SAM_mobile')
         else:
-            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list = None, sample_imgs = None, filepath= '../../disk/saved_masks/DINO_SAM')
+            store_masks(masks_list, img_ids_list, conf_scores_list, xyn_list = None, sample_imgs = None, filepath= '../../nvme1/thesis/saved_masks/DINO_SAM')
 
 def model_FastSAM(samples, save_imgs_bool=False, store_masks_bool=False, testing_samples=1, filter_bboxes=(True, 0.2, 3.0), filter_masks_shapes=(True, 0.85), filter_masks_sizes=(True, 0.2, None)):
     """
@@ -2662,7 +2677,7 @@ def main():
 
     MODE = "SAM3"
 
-    full_data = list(ds['valid']) # list(ds['train']) +
+    full_data =  list(ds['train']) + list(ds['valid']) # 
     
 
    # if MODE == "SAM_manipulate":
@@ -2673,16 +2688,16 @@ def main():
     
     if MODE == "SAM_extended":
         # extended : added island + overlap filters
-        model_SAM_extended(full_data, mode = 'base', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (True, 0.2, None), filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
+        model_SAM_extended(full_data, mode = 'mobile', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
     
     elif MODE == "grounding_SAM":
-        model_grounding_SAM(full_data, mode = 'base', save_imgs_bool = True, store_masks_bool = False, testing_samples = 1, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_holes_islands = False, filter_overlap_masks = False, filter_by_darkness = False)
+        model_grounding_SAM(full_data, mode = 'mobile', save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_bboxes = (True, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True, filter_by_darkness = False)
 
   #  elif MODE == "FastSAM":
   #      model_FastSAM(list(ds['train']), save_imgs_bool = False, store_masks_bool = False, testing_samples = 15, filter_bboxes = (True, None, 3.0), filter_masks_shapes = (True, 0.85), filter_masks_sizes = (True, 0.2, None))
 
     elif MODE == "SAM3":
-        model_SAM3(full_data, save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_masks_shapes = (False, 0.95), filter_bboxes = (False, 0.2, 3.0), filter_masks_sizes = (False, 0.2, None), prompt = "raspberry", filter_red = (True, 0.3), filter_holes_islands = True, filter_overlap_masks = True)
+        model_SAM3(full_data, save_imgs_bool = False, store_masks_bool = True, testing_samples = 'all', filter_masks_shapes = (False, 0.95), filter_bboxes = (False, None, 3.0), filter_masks_sizes = (False, 0.2, None), prompt = "raspberry", filter_red = (False, 0.3), filter_holes_islands = True, filter_overlap_masks = False)
 
 
 
