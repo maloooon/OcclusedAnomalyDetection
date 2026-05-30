@@ -1,5 +1,6 @@
 import numpy as np
 import cv2 as cv
+import os
 import torch.nn as nn
 import torch
 from torch import Tensor
@@ -12,14 +13,6 @@ from timm.models.cait import Cait
 from scipy.stats import special_ortho_group
 import warnings
 
-SEED = 32
-import random
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 def create_fastflow(img_shape, backbone_name, device, struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = True):
     backbone_name = "wide_resnet50_2"
@@ -613,7 +606,7 @@ class CompleteFastFlowModel(nn.Module):
                 backbone_name,
                 pretrained=True,
                 features_only=True,
-                out_indices=[1, 2, 3],
+                out_indices=[1,2,3], # LAYER SELECTION !
             )
 
        

@@ -10,15 +10,6 @@ from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtra
 from moviad.utilities.evaluator import Evaluator
 from moviad.trainers.trainer import TrainerResult, Trainer
 
-SEED = 32
-import random
-import numpy as np
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 
 class TrainerCFA(Trainer):

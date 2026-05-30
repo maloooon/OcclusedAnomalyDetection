@@ -2,22 +2,11 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 
-from moviad.trainers.trainer import Trainer, TrainerResult
+from moviad.trainers.trainer import Trainer, TrainerResult, seed_everything
 from moviad.models.components.simplenet.loss import SSNLoss
-from moviad.models.supersimplenet.supersimplenet import SuperSimpleNet 
+from moviad.models.supersimplenet.supersimplenet import SuperSimpleNet
 
 from tqdm import tqdm
-
-
-SEED = 32
-import random
-import numpy as np
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 class TrainerSuperSimpleNet(Trainer):
 

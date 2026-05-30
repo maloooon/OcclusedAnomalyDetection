@@ -1,4 +1,5 @@
 import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 from pathlib import Path
 import shutil
 import matplotlib.pyplot as plt
@@ -66,12 +67,57 @@ from create_dataset import _center_object, data_split_non_anomalous
 from moviad.utilities.struct_core import StructCore
 
 from helper import apply_random_transform
-from image_manipulation import find_holes
+from image_manipulation import find_holes, find_holes_fix
 
 from ss_cutout import (CutoutReconstructionModel, apply_cutout,
                        train_cutout_reconstruction, create_cutout_model,
                        DINOV2_EMBED_DIMS)
 
+from moviad.utilities.seed_utils import SEED, seed_everything, seed_worker, make_generator
+seed_everything(SEED)
+
+
+
+
+
+def _paste_hole(target_img, target_mask, hole_pixels, hole_mask, max_attempts=100, fade_width=8):
+    """Paste extracted hole pixels onto target image at a random position inside the target mask.
+
+    The hole bounding box must fit entirely within the target mask (every active hole pixel must
+    land on a mask pixel). Up to max_attempts random positions are tried; returns None if none work.
+    Edges of the pasted hole are feathered over fade_width pixels using a distance-transform alpha.
+    """
+    hole_coords = np.argwhere(hole_mask)
+    if len(hole_coords) == 0:
+        return None
+    y_min, x_min = hole_coords.min(axis=0)
+    y_max, x_max = hole_coords.max(axis=0)
+    hole_crop = hole_pixels[y_min:y_max + 1, x_min:x_max + 1]
+    hole_mask_crop = hole_mask[y_min:y_max + 1, x_min:x_max + 1]
+    h, w = hole_crop.shape[:2]
+    H, W = target_img.shape[:2]
+
+    if h > H or w > W:
+        return None
+
+    # Alpha ramps from 0 at the hole boundary to 1 fade_width pixels inward.
+    dist = cv2.distanceTransform(hole_mask_crop.astype(np.uint8), cv2.DIST_L2, 3)
+    alpha = np.clip(dist / max(fade_width, 1), 0.0, 1.0)[..., np.newaxis].astype(np.float32)
+
+    hole_crop_f = hole_crop.astype(np.float32)
+
+    for _ in range(max_attempts):
+        paste_y = random.randint(0, H - h)
+        paste_x = random.randint(0, W - w)
+        target_region = (target_mask[paste_y:paste_y + h, paste_x:paste_x + w] > 0)
+        if np.all(target_region[hole_mask_crop]):
+            result = target_img.copy().astype(np.float32)
+            region = result[paste_y:paste_y + h, paste_x:paste_x + w]
+            blended = alpha * hole_crop_f + (1.0 - alpha) * region
+            region[hole_mask_crop] = blended[hole_mask_crop]
+            return result.clip(0, 255).astype(np.uint8)
+
+    return None
 
 
 class SingleRaspberryDataset(Dataset):
@@ -96,7 +142,7 @@ class SingleRaspberryDataset(Dataset):
         self.pass_og_bool = pass_og_bool
  
  
-        if AD_model == 'ganomaly' or AD_model =='stfpm' or AD_model == 'rd4ad' or AD_model == 'fastflow' or AD_model == 'supersimplenet': # earlier was only with ganomaly
+        if AD_model == 'ganomaly' or AD_model == 'fastflow' or AD_model == 'supersimplenet': # earlier was only with ganomaly
             self.transform_sizes = 256
         else:
             self.transform_sizes = 224
@@ -237,6 +283,44 @@ class SingleRaspberryDataset(Dataset):
                         'image': img_t,
                         'has_hole': True,
                     })
+            self.data = self.data + augmented_data
+
+        if hole_augmentation and self.split == 'train' and hole_augmentation_mode == 'paste_hole':
+            augmented_data = []
+            _paste_save_dir = Path(__file__).parent / 'example_pastes_holes'
+            _paste_save_dir.mkdir(parents=True, exist_ok=True)
+            _n_saved, _max_save = 0, 20
+            non_hole_items = [item for item in self.data if not item.get('has_hole', False)]
+            if non_hole_items:
+                for item in self.data:
+                    if not item.get('has_hole', False):
+                        continue
+                    _, _, _, hole_pixels = find_holes_fix(
+                        item['image'], item['mask'], item['depth'], dilation_radius = 20, return_hole=True
+                    )
+                    hole_mask = hole_pixels.sum(axis=2) > 0
+                    if not hole_mask.any():
+                        continue
+                    targets = random.choices(non_hole_items, k=15)
+                    for target in targets:
+                        pasted_img = _paste_hole(target['image'], target['mask'], hole_pixels, hole_mask)
+                        if pasted_img is None:
+                            continue
+                        if _n_saved < _max_save:
+                            side_by_side = np.concatenate([target['image'], pasted_img], axis=1)
+                            Image.fromarray(side_by_side.astype(np.uint8)).save(
+                                _paste_save_dir / f'paste_{_n_saved:04d}.png'
+                            )
+                            _n_saved += 1
+                        augmented_data.append({
+                            'img_path': target['img_path'],
+                            'grade': target['grade'],
+                            'mask': target['mask'].copy(),
+                            'mask_unfiltered': target['mask_unfiltered'].copy(),
+                            'depth': target['depth'].copy(),
+                            'image': pasted_img,
+                            'has_hole': True,
+                        })
             self.data = self.data + augmented_data
 
 
@@ -399,6 +483,8 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
     """
     Self-supervised cutout pre-training for backbone fine-tuning.
 
+    target_path : what dataset to train on
+
     Supported backbones:
       'mobilenet_v2'          — unfreeze_from controls which features.* block onwards is trained
       'wide_resnet50_2'       — unfreeze_from controls which of the 4 encoder stages is trained
@@ -411,17 +497,33 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
     For DINOv2, see the note in DINOv2CutoutReconstructionModel.save_encoder_weights().
     """
 
+    seed_everything(SEED)
+
     train_set_path = dataset_path / Path(f'{target_path}/processed')
 
     train_dataset = SingleRaspberryDataset(
         train_set_path, split='train',
         synthetic_augmentation=False,
-        AD_model='patchcore',
+        AD_model='patchcore', # just so we resize to 224x224
         backbone_model=backbone,
         struct_core_collection_bool=True,  # returns (img, mask) pairs
     )
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    n_val = max(1, int(len(train_dataset) * 0.2)) # 20% val split
+    n_train = len(train_dataset) - n_val
+    train_subset, val_subset = torch.utils.data.random_split(
+        train_dataset, [n_train, n_val],
+        generator=make_generator(SEED),
+    )
+    train_dataloader = torch.utils.data.DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True,
+        generator=make_generator(SEED), worker_init_fn=seed_worker,
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_subset, batch_size=batch_size, shuffle=False,
+        worker_init_fn=seed_worker,
+    )
+    print(f"Train: {n_train} samples | Val: {n_val} samples")
 
     # Select the right model class based on backbone type.
     # DINOv2 uses unfreeze_last_n_blocks / LoRA params; CNN backbones use unfreeze_from.
@@ -448,16 +550,19 @@ def pretrain_backbone_cutout(dataset_path, device, backbone, save_path,
         epochs=epochs, lr=lr,
         optimizer=optimizer, criterion=criterion,
         n_holes=n_holes, hole_size_range=hole_size_range,
+        val_loader=val_dataloader,
     )
 
     # Each model class knows its own key-mapping format for the save.
     trained_model.save_encoder_weights(save_path)
     print(f"Saved fine-tuned {backbone} encoder to {save_path}")
 
-    del model, optimizer, train_dataloader, train_dataset
+    del model, optimizer, train_dataloader, val_dataloader, train_dataset
     torch.cuda.empty_cache()
 
 def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path : str, device : torch.device, max_dataset_size : int = None, mode = 'patchcore', target_path = 'full_no_filters', pass_og_bool = False, custom_weights_path = None, synthetic_augmentation_bool = False, synthetic_augmentation_mode = 'replace', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, cls_token_viz_bool = False, hole_augmentation_bool = False, hole_augmentation_mode = 'replace', include_gt_fill_ins = True, batch_size_train = 8, epochs = 50, AD_only_on_mask = True):
+
+    seed_everything(SEED)
 
     mode = mode.lower()
     # initialize the feature extractor
@@ -481,7 +586,10 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     if max_dataset_size is not None:
         train_dataset = torch.utils.data.Subset(train_dataset, range(max_dataset_size))
     
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size_train, shuffle=True,
+        generator=make_generator(SEED), worker_init_fn=seed_worker,
+    )
 
     # Only anomalous samples for testing
     test_set_path = dataset_path  / Path(f'{target_path}/processed')
@@ -490,7 +598,9 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
 
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False)
+    test_dataloader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=4, shuffle=False, worker_init_fn=seed_worker,
+    )
 
     print(f"Length train dataset: {len(train_dataset)}")
     print(f"Length test dataset: {len(test_dataset)}")
@@ -509,7 +619,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
     elif mode == 'fastflow':
         model = create_fastflow(input_size, backbone, device, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'rd4ad':
-        model = RD4AD(backbone, device, input_size = input_size, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
+        model = RD4AD(backbone, device, input_size = input_size, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness, skip_layer1 = False, custom_weights_path = custom_weights_path)
     elif mode == 'padim':
         diagonal_convergence = False
         model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
@@ -522,7 +632,7 @@ def train_model(dataset_path : str, backbone : str, ad_layers : list, save_path 
             device=device,
             input_size=input_size,
             feature_extractor=feature_extractor,
-            n_projections=200,   # paper default
+            n_projections=1000,   # paper default
             n_quantiles=5,        # paper default
             shrinkage=0.1,        # paper default
             scoring_mode='knn',   # 'knn' (original) 
@@ -581,9 +691,11 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
     After creating the memory bank/ training a model, collect descriptors for StructCore based on training data
     """
 
+    seed_everything(SEED)
+
     struct_core = StructCore(top_k_ratio = top_k_ratio)
 
-
+    # TODO: CHECK IF WE ADD RD4AD TO ALSO ADD CUSTOM WEIGHTS PATH IF BETTER!
     # initialize the feature extractor
     if mode != 'stfpm':
         feature_extractor = CustomFeatureExtractor(backbone, ad_layers, device, True, False, None)
@@ -599,16 +711,33 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
     if max_dataset_size is not None:
         train_dataset = torch.utils.data.Subset(train_dataset, range(max_dataset_size))
     print(f"Length train dataset: {len(train_dataset)}")
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=4, shuffle=True,
+        generator=make_generator(SEED), worker_init_fn=seed_worker,
+    )
 
     input_size = train_dataset.get_input_size()
     
     # NOTE :added filter post etc. not tested ; but needed I think, such that STFPM collects on the correct post filters!
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=input_size, feature_extractor=feature_extractor, k = 70000, num_neighbors = 500,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
+        model = PatchCore(device, input_size=input_size, feature_extractor=feature_extractor,k = 35068, num_neighbors = 3, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'stfpm':
         model = STFPM(teacher, student,  filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
+    elif mode == 'rd4ad':
+        model = RD4AD(backbone, device, input_size = input_size, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
+    elif mode == 'fastflow':
+        model = create_fastflow(input_size, backbone, device, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
+    elif mode == 'padim':
+        diagonal_convergence = False
+        model = Padim(backbone, class_name = 'raspberry', device = device, diag_cov = diagonal_convergence, layers_idxs = ad_layers, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
+    elif mode == 'ganomaly':
+        model = Ganomaly(input_size = input_size, num_input_channels = 3, n_features = 64, latent_vec_size = 100, extra_layers = 0, add_final_conv_layer = True)
+    elif mode == 'supersimplenet':
+        model = SuperSimpleNet(feature_extractor, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
+    elif mode == 'sinbad':
+        model = SINBAD(device=device, input_size=input_size,feature_extractor=feature_extractor, n_projections=200,n_quantiles=5,shrinkage=0.1,scoring_mode='knn')
+    
 
     
 
@@ -668,9 +797,9 @@ def struct_core_collection(dataset_path : str, backbone : str, ad_layers : list,
     return struct_core
 
 def test_model(dataset_path : str, backbone : str, ad_layers : list, model_checkpoint_path : str, device : torch.device, max_dataset_size : int = None, visual_test_path: str = None, mode = 'patchcore', scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', target_path = 'full_no_filters', mask_border_filter_thickness = 1, pass_og_bool = False, custom_weights_path = None, cls_token_viz_bool = False, top_k_ratio = 0.01, protrusion_damping_radius = 0, protrusion_damping_gamma = 0, include_gt_fill_ins = True, AD_only_on_mask = True):
-    
 
-    
+    seed_everything(SEED)
+
     if scoring_mode == 'STRUCTCORE':
         print("StructCore collection ...")
         struct_core = struct_core_collection(dataset_path, backbone, ad_layers, model_checkpoint_path, device, max_dataset_size, mode, target_path, top_k_ratio = top_k_ratio, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
@@ -692,7 +821,9 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     if max_dataset_size is not None:
         test_dataset = torch.utils.data.Subset(test_dataset, range(max_dataset_size))
     print(f"Length test dataset: {len(test_dataset)}")
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False)
+    test_dataloader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=4, shuffle=False, worker_init_fn=seed_worker,
+    )
 
     ## mask_border_filter_thickness refers to : 
         # We want to only look at the mask area of the raspberry when we create the anomaly map
@@ -706,13 +837,13 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     model_load_start_time = time()
     # load the model
     if mode == 'patchcore':
-        model = PatchCore(device, input_size=input_size, feature_extractor=feature_extractor, k = 70000, num_neighbors = 500, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
+        model = PatchCore(device, input_size=input_size, feature_extractor=feature_extractor, k = 35068, num_neighbors = 3, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, mask_border_filter_thickness = mask_border_filter_thickness, filter_post = filter_post, cls_token_viz_bool = cls_token_viz_bool, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'cfa':
         model = CFA(feature_extractor, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'stfpm':
         model = STFPM(teacher, student, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, protrusion_damping_radius = protrusion_damping_radius, protrusion_damping_gamma = protrusion_damping_gamma, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'rd4ad':
-        model = RD4AD(backbone, device, input_size = input_size, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
+        model = RD4AD(backbone, device, input_size = input_size, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask, skip_layer1 = False, custom_weights_path = custom_weights_path)
     elif mode == 'fastflow':
         model = create_fastflow(input_size, backbone, device, struct_core_instance = struct_core if scoring_mode == 'STRUCTCORE' else None, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
     elif mode == 'padim':
@@ -723,7 +854,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     elif mode == 'supersimplenet':
         model = SuperSimpleNet(feature_extractor, AD_only_on_mask = AD_only_on_mask, mask_border_filter_thickness = mask_border_filter_thickness)
     elif mode == 'sinbad':
-        model = SINBAD(device=device, input_size=input_size,feature_extractor=feature_extractor, n_projections=200,n_quantiles=5,shrinkage=0.1,scoring_mode='knn')
+        model = SINBAD(device=device, input_size=input_size,feature_extractor=feature_extractor, n_projections=1000,n_quantiles=5,shrinkage=0.1,scoring_mode='knn')
 
     
 
@@ -776,7 +907,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     if mode == 'patchcore' or mode == 'cfa':
         sizes, total_size = model.get_model_size_and_macs()
 
-        print(f"SIZES : {sizes}")
+    #    print(f"SIZES : {sizes}")
         print(f"TOTAL SIZE : {total_size}")
 
     else:
@@ -784,12 +915,12 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
         buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
         total_mb = (param_bytes + buffer_bytes) / 1e6
 
-        print(f"params: {param_bytes / 1e6:.2f} MB")
-        print(f"buffers: {buffer_bytes / 1e6:.2f} MB")
+      #  print(f"params: {param_bytes / 1e6:.2f} MB")
+      #  print(f"buffers: {buffer_bytes / 1e6:.2f} MB")
         print(f"total: {total_mb:.2f} MB")
 
-        for name, buf in model.named_buffers():
-            print(name, buf.shape, f"{buf.numel() * buf.element_size() / 1e6:.2f} MB")
+       # for name, buf in model.named_buffers():
+       #     print(name, buf.shape, f"{buf.numel() * buf.element_size() / 1e6:.2f} MB")
 
 
 
@@ -805,7 +936,7 @@ def test_model(dataset_path : str, backbone : str, ad_layers : list, model_check
     """)
 
 
-    opt_threshold = 0.352867
+    opt_threshold = 0.44718945
 
 
     # chek for the visual test
@@ -983,23 +1114,6 @@ def detailed_eval(data_path):
 
     return results
 
-
-'''
-def saving_criteria(best_metrics, new_metrics):
-    # Since this is needed for the AD models that have training
-    if new_metrics["img_roc_auc"] > best_metrics["img_roc_auc"]:
-        return True
-    elif math.isclose(new_metrics["img_roc_auc"], best_metrics["img_roc_auc"]):
-        if (new_metrics["img_f1"] >= best_metrics["img_f1"]) or (new_metrics["img_pr_auc"] >= best_metrics["img_pr_auc"]):
-            print("ROC AUC same, but better F1 OR better PR AUC; saving new model")
-            return True
-     #   elif new_metrics["img_pr_auc"] >= best_metrics["img_pr_auc"]:
-     #       print("ROC AUC same, better PR AUC")
-      #      return True
-    return False
-'''
-
-
 def saving_criteria(best_metrics, new_metrics):
     # Based on average of img_roc_auc, img_f1 and img_pr_auc ; if this average is better for the new metrics, we save the new model
     if (new_metrics["img_roc_auc"] + new_metrics["img_f1"] + new_metrics["img_pr_auc"]) / 3 > (best_metrics["img_roc_auc"] + best_metrics["img_f1"] + best_metrics["img_pr_auc"]) / 3:
@@ -1053,114 +1167,119 @@ def main():
     # TODO : maybe clean protrusions followed by smoothing in those areas (since they can be sharp and I think anomalies are detected there, double check)
     # TODO : fix the filter holes, it bumps performance already (on STFPM) but need to understand why it doesn't find all holes
     
-    # TODO : supersimplenet better performance with dinov2 using more layers, e.g. 3,6,9,11 // should also test WRN-50-2 with more layers? but I think dino better, nice argument
+    # 
+    # TODO : fastflow has ViT settings, need to adjust when running dinov2 on it
+    datasets = ['filtered_unblurred_seed_0_yolo_640_shared_test_set_256', 'filtered_unblurred_seed_1_yolo_640_shared_test_set_256', 'filtered_unblurred_seed_42_yolo_640_shared_test_set_256'] # 'full_no_filters_seed_0_gt_256', 'full_no_filters_seed_1_gt_256', 'full_no_filters_seed_42_gt_256'
 
-    MODEL_MODE = 'supersimplenet' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet'
-    SYN_AUG_BOOL = False # whether to use synthetic occlusions during training
-    SYN_AUG_MODE = 'replace' # 'replace' or 'augment'
-    HOLE_AUG_BOOL = False
-    HOLE_AUG_MODE = 'augment'
-
-    BATCH_SIZE_TRAIN = 32
-    EPOCHS = 30
-    AD_ONLY_ON_MASK = False
-
-    # NOTE : this only works with patchcore + dinov2 
-    CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
-
-    # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
-    FILTER_PRE = 'full_no_filters_seed_42_yolo_640_shared_test_set_256'#'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
-
-  
-    # Only applies when FILTER_PRE points to a _shared_test_set dataset.
-    # True  → test set includes GT fill-in samples (full GT test set size).
-    # False → test set contains only model-detected samples in the GT test set.
-    # Only use this flag when not using the GT dataset
-    INCLUDE_GT_FILL_INS = True
-
-    FILTER_PRE = FILTER_PRE.upper()
-    # Get the last element in filter_pre
-    last_element = FILTER_PRE.split('_')[-1]
-    if last_element != 'variable':
-        pass_og_bool = True
-    else:
-        pass_og_bool = False
-
-    FILTER_POST = 'NONE' # HOLE_DARKNESS_40_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details ; DARKNESS_k : filter out dark areas based on darkness of raspberry, k refers to threshold for darkness ; see utilities/filters for more details ; DRUPELETS for removing specular highlights ; NONE if no post filtering
-    SCORING = 'MAXMEAN_1' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
-
-    TOP_K_RATIO_STRUCTCORE = 0.04
-
-
-    dataset_path = Path('../../nvme1/thesis/dataset_single_objects/') 
-    target_path = FILTER_PRE.lower()
-
-
-    # Create a folder 'synthetic' in the current directory and clear it out if it already exists
-  #  synthetic_dir = dataset_path / 'synthetic'
-  #  if synthetic_dir.exists():
-  #      shutil.rmtree(synthetic_dir)
-  #  synthetic_dir.mkdir(parents=True, exist_ok=True)
-
-
-
-    # Train the model
-    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
-    print(device)
-    backbone = "wide_resnet50_2" 
-   # backbone = "resnet18"
-  #  backbone = "dinov2_vitb14"
-   # backbone = 'mobilenet_v2'
-   # backbone = "dinov3_vitb16"
-  #  ad_layers = ["features.4", "features.7", "features.10"] 
-   # ad_layers = ["layer4"]
-  #  ad_layers = ["features.10"] # SINBAD tests
-    ad_layers = ["layer2", "layer3"]
-  #  ad_layers = ["layer2", "layer3", "layer4"]
-  #  ad_layers = ["layer1", "layer2", "layer3"]
+    for i in range(3):
     
-  #  ad_layers = [3,6] 
-  #  if CLS_TOKEN_VIZ_BOOL:
-  #      ad_layers.append(11) # extracting also CLS token for visualizations
-    end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
-    aug_parts = []
-    if SYN_AUG_BOOL:
-        aug_parts.append(SYN_AUG_MODE)
-    if HOLE_AUG_BOOL:
-        aug_parts.append(f"hole_{HOLE_AUG_MODE}")
-    aug_str = "_".join(aug_parts) if aug_parts else "no_aug"
-    save_path = f"../../nvme1/thesis/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{aug_str}_"
+        MODEL_MODE = 'rd4ad' # 'patchcore', 'cfa', 'stfpm', 'rd4ad', 'fastflow', 'padim', 'ganomaly', 'supersimplenet', 'sinbad'
+        SYN_AUG_BOOL = False # whether to use synthetic occlusions during training
+        SYN_AUG_MODE = 'replace' # 'replace' or 'augment'
+        HOLE_AUG_BOOL = False
+        HOLE_AUG_MODE = 'paste_hole' 
 
-    custom_weights_path = None
-   # custom_weights_path = f"../../nvme1/thesis/pretrained_models/{backbone}_cutout_{'_'.join([str(layer) for layer in ad_layers])}.pt"
-   # if not os.path.exists(custom_weights_path):
-   #     raise FileNotFoundError(f"Custom weights not found at {custom_weights_path}. Please run pretrain_backbone_cutout first to generate these weights.")
+        BATCH_SIZE_TRAIN = 16
+        EPOCHS = 500
+        AD_ONLY_ON_MASK = False
+
+        # NOTE : this only works with patchcore + dinov2 
+        CLS_TOKEN_VIZ_BOOL = False # For visualizations (understanding whether CLS token can be used for distinguishing better between different raspberry grades)
+
+        # TODO : fix patchcore heatmap visually (i.e somehow dim down that everything red, try to understand why)
+        FILTER_PRE = datasets[i] # 'full_no_filters_seed_1_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_seed_0_gt_256'#'filtered_darkness_80_0.3_and_clean_protrusions_and_filter_holes_seed_42_gt_256'# # FILTERED_SIZE_k_imgsize, where k refers to the factor for MAD filtering ; FULL_NO_FILTERS_imgsize if no filters
+        # yolo_640_shared_test_set_
+    
+        # Only applies when FILTER_PRE points to a _shared_test_set dataset.
+        # True  → test set includes GT fill-in samples (full GT test set size).
+        # False → test set contains only model-detected samples in the GT test set.
+        # Only use this flag when not using the GT dataset
+        INCLUDE_GT_FILL_INS = True
+
+        FILTER_PRE = FILTER_PRE.upper()
+        # Get the last element in filter_pre
+        last_element = FILTER_PRE.split('_')[-1]
+        if last_element != 'variable':
+            pass_og_bool = True
+        else:
+            pass_og_bool = False
+
+        FILTER_POST = 'NONE' # HOLE_DARKNESS_40_40 best results,  HOLE_DARKNESS_k_j : filter out holes and dark areas based on depth & darkness of raspberry ; k refers to threshold for depth and j to threshold for darkness ; see utilities/filters for more details ; DARKNESS_k : filter out dark areas based on darkness of raspberry, k refers to threshold for darkness ; see utilities/filters for more details ; DRUPELETS for removing specular highlights ; NONE if no post filtering
+        SCORING = 'MAXMEAN_1' # MAXMEAN_k , where k refers to the factor for the max (i.e. k * max_score + (1-k) * mean_score) ; STRUCTCORE
+
+        TOP_K_RATIO_STRUCTCORE = 0.04
 
 
-    # unfreeze_from : mobilenet/wrn-50-2, unfreeze_last_n_blocks : vit, for vit we unfreeze the last n blocks, for mobilenet/wrn we unfreeze from the layer specified by unfreeze_from (e.g. 4 means unfreeze from layer4 and then also layer4 itself)
-   # pretrain_backbone_cutout(dataset_path, device, backbone, save_path=custom_weights_path,
-   #                         unfreeze_from=4, epochs=10, lr=1e-3, batch_size=32,
-   #                         n_holes=1, hole_size_range=(32, 64), target_path=target_path, unfreeze_last_n_blocks=1, lora_rank = 4, lora_alpha = 4)
+        dataset_path = Path('../../nvme1/thesis/dataset_single_objects/') 
+        target_path = FILTER_PRE.lower()
 
 
-  
-    train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, hole_augmentation_bool = HOLE_AUG_BOOL, hole_augmentation_mode = HOLE_AUG_MODE, include_gt_fill_ins = INCLUDE_GT_FILL_INS, epochs = EPOCHS, batch_size_train = BATCH_SIZE_TRAIN, AD_only_on_mask = AD_ONLY_ON_MASK)
+        # Create a folder 'synthetic' in the current directory and clear it out if it already exists
+    #  synthetic_dir = dataset_path / 'synthetic'
+    #  if synthetic_dir.exists():
+    #      shutil.rmtree(synthetic_dir)
+    #  synthetic_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if visual test path exists and clear it out if it already exists
-    visual_test_path = f"../../nvme1/thesis/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{aug_str}/" # NOTE : disk normally
-    visual_test_dir = Path(visual_test_path)
-    if visual_test_dir.exists():
-        shutil.rmtree(visual_test_dir)
-    visual_test_dir.mkdir(parents=True, exist_ok=True)
+
+
+        # Train the model
+        device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+        print(device)
+        backbone = "wide_resnet50_2" 
+     #   backbone = "resnet18"
+      #  backbone = "dinov2_vitb14"
+    # backbone = 'mobilenet_v2'
+    # backbone = "dinov3_vitb16"
+    #  ad_layers = ["features.4", "features.7", "features.10"] 
+    # ad_layers = ["layer4"]
+    #  ad_layers = ["features.10"] # SINBAD tests
+      #  ad_layers = ["layer2", "layer3"]
+       # ad_layers = ["layer3"]
+      #  ad_layers = ["layer2", "layer3"]
+        ad_layers = ["layer1", "layer2", "layer3"]
+        
+     #   ad_layers = [5] 
+    ##  if CLS_TOKEN_VIZ_BOOL:
+    #      ad_layers.append(11) # extracting also CLS token for visualizations
+        end = ".pt" if MODEL_MODE != 'sinbad' else ".pkl"
+        aug_parts = []
+        if SYN_AUG_BOOL:
+            aug_parts.append(SYN_AUG_MODE)
+        if HOLE_AUG_BOOL:
+            aug_parts.append(f"hole_{HOLE_AUG_MODE}")
+        aug_str = "_".join(aug_parts) if aug_parts else "no_aug"
+        save_path = f"../../nvme1/thesis/pretrained_models/{MODEL_MODE}_{backbone}_{'_'.join([str(layer) for layer in ad_layers])}_data_{FILTER_PRE}{end}_{aug_str}_"
+    # save_path = f"../../nvme1/thesis/pretrained_models/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}{end}_{aug_str}_"
+
+        custom_weights_path = None
+    #  ad_layers_pretrained = ["layer3", "layer4"] # a bit of a mess, tuned are layers2,3,4, but named it wrongly ...
+    #  custom_weights_path = f"../../nvme1/thesis/pretrained_models/dataset_{FILTER_PRE}_{backbone}_cutout_{'_'.join([str(layer) for layer in ad_layers_pretrained])}.pt"
+
+        # unfreeze_from : mobilenet/wrn-50-2, unfreeze_last_n_blocks : vit, for vit we unfreeze the last n blocks, for mobilenet/wrn we unfreeze from the layer specified by unfreeze_from (e.g. 4 means unfreeze from layer4 and then also layer4 itself)
+    # pretrain_backbone_cutout(dataset_path, device, backbone, save_path=custom_weights_path,
+    #                         unfreeze_from=3, epochs=100, lr=1e-3, batch_size=32,
+    #                         n_holes=1, hole_size_range=(32, 64), target_path=target_path, unfreeze_last_n_blocks=1, lora_rank = 4, lora_alpha = 4)
 
 
     
-  #  test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE,
-  #   target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING,
-  #   filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool,
-  #   custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, top_k_ratio = TOP_K_RATIO_STRUCTCORE,
-  #   protrusion_damping_radius = 0, protrusion_damping_gamma = 0, include_gt_fill_ins = INCLUDE_GT_FILL_INS, AD_only_on_mask = AD_ONLY_ON_MASK)
-  #  detailed_eval(visual_test_path)
+        train_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE, target_path = target_path, pass_og_bool = pass_og_bool, scoring_mode = SCORING, filter_post = FILTER_POST, mask_border_filter_thickness = 0, custom_weights_path = custom_weights_path, synthetic_augmentation_bool = SYN_AUG_BOOL, synthetic_augmentation_mode = SYN_AUG_MODE, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, hole_augmentation_bool = HOLE_AUG_BOOL, hole_augmentation_mode = HOLE_AUG_MODE, include_gt_fill_ins = INCLUDE_GT_FILL_INS, epochs = EPOCHS, batch_size_train = BATCH_SIZE_TRAIN, AD_only_on_mask = AD_ONLY_ON_MASK)
+
+        # Check if visual test path exists and clear it out if it already exists
+        visual_test_path = f"../../nvme1/thesis/visual_test/{MODEL_MODE}_{backbone}_{'_'.join([str(layer) for layer in ad_layers])}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{aug_str}/" # NOTE : disk normally
+    # visual_test_path = f"../../nvme1/thesis/visual_test/{MODEL_MODE}_{backbone}_data_{FILTER_PRE}_{SCORING}_test_set_{FILTER_POST}_{aug_str}/" # NOTE : disk normally
+        visual_test_dir = Path(visual_test_path)
+        if visual_test_dir.exists():
+            shutil.rmtree(visual_test_dir)
+        visual_test_dir.mkdir(parents=True, exist_ok=True)
+
+
+        
+       # test_model(dataset_path, backbone, ad_layers, save_path, device, mode = MODEL_MODE,
+       # target_path = target_path, visual_test_path = visual_test_path, scoring_mode = SCORING,
+       # filter_post = FILTER_POST, mask_border_filter_thickness = 0, pass_og_bool = pass_og_bool,
+       # custom_weights_path = custom_weights_path, cls_token_viz_bool = CLS_TOKEN_VIZ_BOOL, top_k_ratio = TOP_K_RATIO_STRUCTCORE,
+       # protrusion_damping_radius = 0, protrusion_damping_gamma = 0, include_gt_fill_ins = INCLUDE_GT_FILL_INS, AD_only_on_mask = AD_ONLY_ON_MASK)
+    #  detailed_eval(visual_test_path)
 
     # STRUCTCORE : only topk seems to work the best, in most cases (but stupid seed 1 it seems to improve performance)
 

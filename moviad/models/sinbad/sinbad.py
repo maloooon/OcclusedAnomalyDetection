@@ -16,14 +16,6 @@ from torch import Tensor
 
 from sklearn.covariance import ShrunkCovariance
 
-SEED = 32
-import random
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 
 class CumulativeSetFeatures:
@@ -283,7 +275,6 @@ class SINBAD(nn.Module):
             features = [F.normalize(f, p=2, dim=1) for f in features]
             embedding = torch.cat(features, dim=1)  # [B, C_total, H, W]
         else:
-            # TODO : Possible that this problematic, i.e. try with how they did it in the paper 
             # CNN path: resize to common spatial dims
             H_max = max(f.shape[2] for f in features)
             W_max = max(f.shape[3] for f in features)

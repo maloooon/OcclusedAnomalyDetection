@@ -20,14 +20,6 @@ from ...utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from ...utilities.get_sizes import *
 from ...utilities.filters import filter_holes_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_protrusion_weight_patchgrid
 
-SEED = 32
-import random
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 class PatchCore(nn.Module):
     """Patchcore Module."""

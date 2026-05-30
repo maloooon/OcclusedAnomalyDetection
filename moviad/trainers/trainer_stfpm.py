@@ -8,18 +8,8 @@ from torch.utils.data import DataLoader
 
 from moviad.models.stfpm.stfpm import STFPM
 from moviad.utilities.evaluator import Evaluator
-from moviad.trainers.trainer import TrainerResult, Trainer
+from moviad.trainers.trainer import TrainerResult, Trainer, seed_everything
 
-
-SEED = 32
-import random
-import numpy as np
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 from time import time
 
@@ -34,6 +24,7 @@ class TrainerSTFPM(Trainer):
         return torch.sum((teacher_features - student_features) ** 2, 1).mean()
 
     def train(self, epochs: int, evaluation_epoch_interval: int = 10) -> (TrainerResult, TrainerResult):
+    
 
         optimizer = torch.optim.SGD(
             self.model.student.model.parameters(),

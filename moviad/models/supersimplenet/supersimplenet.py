@@ -15,7 +15,7 @@ See Also:
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -28,14 +28,7 @@ from moviad.models.components.blur import GaussianBlur
 
 import numpy as np
 import cv2 as cv
-SEED = 32
-import random
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+
 
 class SuperSimpleNet(nn.Module):
 

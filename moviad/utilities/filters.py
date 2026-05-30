@@ -418,8 +418,8 @@ def suppress_removed_mask_regions(
         influence_radius: Pixels out from removed region over which attenuation
                           is applied. 0 means only the removed region is zeroed.
         gamma:            Exponent of the distance ramp. 1 = linear taper;
-                          <1 = stronger suppression further out;
-                          >1 = more abrupt recovery to full score.
+                          <1 = more abrupt recovery to full score;
+                          >1 = stronger suppression further out
         removed_mask:     (B, 1, H, W) pre-computed binary mask of the region to
                           suppress. When given, unioned with the mask-diff region derived from mask / mask_unfiltered.
 

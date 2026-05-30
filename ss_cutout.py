@@ -630,7 +630,8 @@ def apply_cutout(images, mask, n_holes=3, hole_size_range=(32, 64)):
 
 def train_cutout_reconstruction(model, train_loader, device, epochs=30, lr=1e-4,
                                 optimizer=None, criterion=None,
-                                n_holes=3, hole_size_range=(32, 64)):
+                                n_holes=3, hole_size_range=(32, 64),
+                                val_loader=None, early_stopping_patience=10):
     """
     Train loop. Loss computed only on the cutout regions within
     the raspberry mask — forces the model to learn berry texture,
@@ -642,7 +643,15 @@ def train_cutout_reconstruction(model, train_loader, device, epochs=30, lr=1e-4,
     interface, so no changes are needed here.
 
     n_holes, hole_size_range: forwarded to apply_cutout, same semantics.
+    val_loader: if provided, validation loss is computed each epoch, the best
+                checkpoint is returned, and early stopping is applied.
+    early_stopping_patience: epochs without val loss improvement before stopping.
     """
+    import copy
+
+    best_val_loss = float('inf')
+    best_state = copy.deepcopy(model.state_dict())
+    epochs_without_improvement = 0
 
     model.train()
     for epoch in range(epochs):
@@ -676,6 +685,45 @@ def train_cutout_reconstruction(model, train_loader, device, epochs=30, lr=1e-4,
 
             total_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(train_loader):.6f}")
+        train_loss = total_loss / len(train_loader)
+
+        if val_loader is not None:
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for images, masks, _ in val_loader:
+                    images, masks = images.to(device), masks.to(device)
+                    masked_images, holes = apply_cutout(images, masks, n_holes=n_holes, hole_size_range=hole_size_range)
+                    reconstruction = model(masked_images)
+                    pixel_loss = criterion(reconstruction, images).mean(dim=1, keepdim=True)
+                    hole_pixels = holes.sum()
+                    if hole_pixels > 0:
+                        val_loss += (pixel_loss * holes).sum().item() / hole_pixels.item()
+                    else:
+                        val_loss += pixel_loss.mean().item()
+            val_loss /= len(val_loader)
+
+            improved = val_loss < best_val_loss
+            if improved:
+                best_val_loss = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}"
+                  + (" *" if improved else f" (no improvement {epochs_without_improvement}/{early_stopping_patience})"))
+
+            model.train()
+
+            if epochs_without_improvement >= early_stopping_patience:
+                print(f"Early stopping at epoch {epoch+1} (patience {early_stopping_patience} reached)")
+                break
+        else:
+            print(f"Epoch {epoch+1}/{epochs} - Loss: {train_loss:.6f}")
+
+    if val_loader is not None:
+        print(f"Loading best checkpoint (val loss: {best_val_loss:.6f})")
+        model.load_state_dict(best_state)
 
     return model

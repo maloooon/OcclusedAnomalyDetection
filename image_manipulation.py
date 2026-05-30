@@ -294,7 +294,8 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
                dilation_radius=15,
                border_exclusion_width=30,
                visualize_bool=False,
-               return_boolean = False):
+               return_boolean=False,
+               return_hole=False):
 
     # TODO : surrounding_threshold is now obsolete, can be taken out of the logic I believe (since we have border_exclusion_width)
     """
@@ -337,16 +338,23 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
                                 from being flagged as holes or bridging to
                                 real interior holes (default 30).
         return_boolean : if True, returns only True or False (depending on whether we detected any holes or not)
-
+        return_hole : if True, returns a 4-tuple (image_cleaned, mask_cleaned, depth_cleaned, hole_pixels)
+                      where hole_pixels is an array same shape as image with original pixel values at hole
+                      locations and zeros elsewhere. Ignored when return_boolean=True.
 
     Returns:
         image_cleaned: image with hole pixels zeroed out
         mask_cleaned: mask with hole pixels removed
         depth_cleaned: depth with hole pixels zeroed out
+        hole_pixels (only when return_hole=True): original pixel values at hole locations, zeros elsewhere
     """
     binary_mask = (mask > 0).astype(np.uint8)
 
     if binary_mask.sum() == 0:
+        if return_boolean:
+            return False
+        if return_hole:
+            return image.copy(), mask.copy(), depth.copy(), np.zeros_like(image)
         return image.copy(), mask.copy(), depth.copy()
 
     # Depth thresholding
@@ -542,8 +550,13 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
 
     if return_boolean:
         return (hole_mask > 0).sum() > 0
-    else:
-        return image_cleaned, mask_cleaned, depth_cleaned
+
+    hole_pixels = np.zeros_like(image)
+    hole_pixels[hole_mask > 0] = image[hole_mask > 0]
+
+    if return_hole:
+        return image_cleaned, mask_cleaned, depth_cleaned, hole_pixels
+    return image_cleaned, mask_cleaned, depth_cleaned
 
 def find_holes(image, mask, depth, save_folder = None, filename = None,
                depth_threshold_percentile=50,

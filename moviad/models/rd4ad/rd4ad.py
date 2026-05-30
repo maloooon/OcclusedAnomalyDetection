@@ -5,14 +5,6 @@ from torchvision.transforms import GaussianBlur
 import torch.nn.functional as F
 import numpy as np
 
-SEED = 32
-import random
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 
 from moviad.models.components.rd4ad import resnet as _enc
@@ -37,7 +29,7 @@ class RD4AD(torch.nn.Module):
         "betas": (0.5,0.999),
     }
 
-    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = False):
+    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = False, skip_layer1: bool = False, custom_weights_path: str = None):
         super().__init__()
 
         self.backbone_name = backbone_name
@@ -48,8 +40,7 @@ class RD4AD(torch.nn.Module):
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
         self.AD_only_on_mask = AD_only_on_mask
-       # self.encoder, self.bn = resnet18(pretrained=True)
-       # self.decoder = de_resnet18(pretrained=False)
+        self.skip_layer1 = skip_layer1
 
         if backbone_name not in BACKBONE_MAP:
             raise ValueError(
@@ -57,8 +48,12 @@ class RD4AD(torch.nn.Module):
                 f"Supported backbones: {list(BACKBONE_MAP)}"
             )
         encoder_fn, decoder_fn = BACKBONE_MAP[backbone_name]
-        self.encoder, self.bn = encoder_fn(pretrained=True)
-        self.decoder = decoder_fn(pretrained=False)
+        self.encoder, self.bn = encoder_fn(
+            pretrained=custom_weights_path is None,
+            custom_weights_path=custom_weights_path,
+            skip_layer1=skip_layer1,
+        )
+        self.decoder = decoder_fn(pretrained=False, skip_layer1=skip_layer1)
 
 
 

@@ -155,9 +155,10 @@ class ResNet(nn.Module):
         groups: int = 1,
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[List[bool]] = None,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        skip_layer1: bool = False,
     ) -> None:
-        
+
         # Bottleneck, [3, 4, 6, 3],
 
         super(ResNet, self).__init__()
@@ -176,6 +177,7 @@ class ResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
+        self.skip_layer1 = skip_layer1
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
@@ -245,7 +247,8 @@ class ResNet(nn.Module):
         feature_c = self.layer3(feature_b)
         feature_d = self.layer4(feature_c)
 
-
+        if self.skip_layer1:
+            return [feature_b, feature_c]
         return [feature_a, feature_b, feature_c]
 
     def forward(self, x: Tensor) -> Tensor:
@@ -258,12 +261,20 @@ def _resnet(
     layers: List[int],
     pretrained: bool,
     progress: bool,
+    custom_weights_path: str = None,
     **kwargs: Any
 ) -> ResNet:
     #_resnet('wide_resnet50_2', Bottleneck, [3, 4, 6, 3],
     #               pretrained, progress, **kwargs)
     model = ResNet(block, layers, **kwargs)
-    if pretrained:
+    if custom_weights_path is not None:
+        state_dict = torch.load(custom_weights_path, map_location='cpu')
+        if 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+        elif 'model' in state_dict:
+            state_dict = state_dict['model']
+        model.load_state_dict(state_dict, strict=False)
+    elif pretrained:
         state_dict = load_state_dict_from_url(model_urls[arch],
                                               progress=progress)
         #for k,v in list(state_dict.items()):
@@ -395,6 +406,7 @@ class BN_layer(nn.Module):
                  groups: int = 1,
                  width_per_group: int = 64,
                  norm_layer: Optional[Callable[..., nn.Module]] = None,
+                 skip_layer1: bool = False,
                  ):
         super(BN_layer, self).__init__()
         if norm_layer is None:
@@ -404,13 +416,16 @@ class BN_layer(nn.Module):
         self.base_width = width_per_group
         self.inplanes = 256 * block.expansion
         self.dilation = 1
+        self.skip_layer1 = skip_layer1
+        self._n_features = 2 if skip_layer1 else 3
         self.bn_layer = self._make_layer(block, 512, layers, stride=2)
 
-        self.conv1 = conv3x3(64 * block.expansion, 128 * block.expansion, 2)
-        self.bn1 = norm_layer(128 * block.expansion)
+        if not skip_layer1:
+            self.conv1 = conv3x3(64 * block.expansion, 128 * block.expansion, 2)
+            self.bn1 = norm_layer(128 * block.expansion)
+            self.conv2 = conv3x3(128 * block.expansion, 256 * block.expansion, 2)
+            self.bn2 = norm_layer(256 * block.expansion)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(128 * block.expansion, 256 * block.expansion, 2)
-        self.bn2 = norm_layer(256 * block.expansion)
         self.conv3 = conv3x3(128 * block.expansion, 256 * block.expansion, 2)
         self.bn3 = norm_layer(256 * block.expansion)
 
@@ -435,12 +450,12 @@ class BN_layer(nn.Module):
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
-                conv1x1(self.inplanes*3, planes * block.expansion, stride),
+                conv1x1(self.inplanes * self._n_features, planes * block.expansion, stride),
                 norm_layer(planes * block.expansion),
             )
 
         layers = []
-        layers.append(block(self.inplanes*3, planes, stride, downsample, self.groups,
+        layers.append(block(self.inplanes * self._n_features, planes, stride, downsample, self.groups,
                             self.base_width, previous_dilation, norm_layer))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
@@ -451,16 +466,14 @@ class BN_layer(nn.Module):
         return nn.Sequential(*layers)
 
     def _forward_impl(self, x: Tensor) -> Tensor:
-        # See note [TorchScript super()]
-        #x = self.cbam(x)
-        l1 = self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x[0]))))))
-        l2 = self.relu(self.bn3(self.conv3(x[1])))
-        feature = torch.cat([l1,l2,x[2]],1)
+        if self.skip_layer1:
+            l2 = self.relu(self.bn3(self.conv3(x[0])))
+            feature = torch.cat([l2, x[1]], 1)
+        else:
+            l1 = self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x[0]))))))
+            l2 = self.relu(self.bn3(self.conv3(x[1])))
+            feature = torch.cat([l1, l2, x[2]], 1)
         output = self.bn_layer(feature)
-        #x = self.avgpool(feature_d)
-        #x = torch.flatten(x, 1)
-        #x = self.fc(x)
-
         return output.contiguous()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -548,7 +561,7 @@ def resnext101_32x8d(pretrained: bool = False, progress: bool = True, **kwargs: 
                    pretrained, progress, **kwargs)
 
 
-def wide_resnet50_2(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
+def wide_resnet50_2(pretrained: bool = False, progress: bool = True, custom_weights_path: str = None, **kwargs: Any) -> ResNet:
     r"""Wide ResNet-50-2 model from
     `"Wide Residual Networks" <https://arxiv.org/pdf/1605.07146.pdf>`_.
     The model is the same as ResNet except for the bottleneck number of channels
@@ -558,10 +571,11 @@ def wide_resnet50_2(pretrained: bool = False, progress: bool = True, **kwargs: A
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
+        custom_weights_path (str): If set, loads weights from this path instead of ImageNet
     """
     kwargs['width_per_group'] = 64 * 2
     return _resnet('wide_resnet50_2', Bottleneck, [3, 4, 6, 3],
-                   pretrained, progress, **kwargs), BN_layer(AttnBottleneck,3,**kwargs)
+                   pretrained, progress, custom_weights_path=custom_weights_path, **kwargs), BN_layer(AttnBottleneck,3,**kwargs)
 
 
 def wide_resnet101_2(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:

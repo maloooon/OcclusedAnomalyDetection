@@ -5,15 +5,6 @@ import torch
 from moviad.models.padim.padim import Padim
 from moviad.trainers.trainer import Trainer, TrainerResult
 
-SEED = 32
-import random
-import numpy as np
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 
 class TrainerPadim(Trainer):

@@ -9,21 +9,13 @@ from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtra
 from ...utilities.filters import filter_holes_batched, filter_specular_drupelets_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_darkness_mask
 from time import time
 
-SEED = 32
-import random
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 class STFPM(torch.nn.Module):
 
     DEFAULT_PARAMETERS = {
         "epochs": 100,
         "batch_size": 32,
-        "learning_rate": 0.4, # 0.2
+        "learning_rate": 0.4, # 0.2 ; # 0.4 og and currently ran all tests on that # 0.6 works better on seed 0 atleast (+2-3% in all metrics)
         "weight_decay": 1e-4,
         "momentum": 0.9,
     }
@@ -298,6 +290,7 @@ class STFPM(torch.nn.Module):
 
 
         if self.protrusion_damping_gamma > 0:
+            print("?")
             score_maps = suppress_removed_mask_regions(
                 score_maps, mask, mask_unfiltered,
                 influence_radius=self.protrusion_damping_radius,
