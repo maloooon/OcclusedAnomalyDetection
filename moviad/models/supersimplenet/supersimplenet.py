@@ -68,6 +68,7 @@ class SuperSimpleNet(nn.Module):
         scoring_mode = 'MAXMEAN_1',
         mask_border_filter_thickness = 0,
         AD_only_on_mask = True,
+        mask_dilation_radius: int = 0,
     ) -> None:
         super().__init__()
 
@@ -101,6 +102,7 @@ class SuperSimpleNet(nn.Module):
         self.scoring_mode = scoring_mode
         self.mask_border_filter_thickness = mask_border_filter_thickness
         self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
 
     def forward(
         self,
@@ -163,6 +165,7 @@ class SuperSimpleNet(nn.Module):
         anomaly_map, anomaly_score = self.segdec(adapted)
         anomaly_map = self.anomaly_map_generator(anomaly_map, final_size=output_size)
 
+        effective_mask = None
         if masks is not None and self.AD_only_on_mask:
             if masks.ndim == 3:
                 masks = masks.unsqueeze(1)
@@ -170,6 +173,9 @@ class SuperSimpleNet(nn.Module):
             effective_mask = torch.zeros_like(masks, dtype=torch.float32)
             for i in range(masks.shape[0]):
                 sample_mask = masks[i, 0].cpu().numpy().astype(np.uint8)
+                if self.mask_dilation_radius > 0:
+                    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                    sample_mask = cv.dilate(sample_mask, kernel)
                 if self.mask_border_filter_thickness > 0:
                     contours, _ = cv.findContours(
                         sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
@@ -189,18 +195,30 @@ class SuperSimpleNet(nn.Module):
             effective_mask = (effective_mask > 0).float()
             anomaly_map = anomaly_map * effective_mask
 
-        # Since paper provides that in unsupervised setting, which we are working on,
-        # taking the max of anomaly map as anomaly score provides better scores, we do the same
-        anomaly_map_flat = anomaly_map.view(anomaly_map.shape[0], -1)
-        anomaly_score = torch.max(anomaly_map_flat, dim=1).values
+        # Expose the final effective_mask (with dilation/border-filter applied) so
+        # the struct_core_collection loop can pass the identical mask to accumulate().
+        self._last_effective_mask = effective_mask
 
+        anomaly_map_flat = anomaly_map.view(anomaly_map.shape[0], -1)
+
+        # When a mask is active, background pixels are 0 — use masked_fill so they
+        # don't dominate the max (which would clamp all scores to 0 when the model
+        # outputs negative values inside the mask, which is normal for normal images).
+        if effective_mask is not None:
+            effective_mask_flat = effective_mask.view(effective_mask.shape[0], -1)
+            map_for_max = anomaly_map_flat.masked_fill(effective_mask_flat == 0, float('-inf'))
+            anomaly_score = torch.max(map_for_max, dim=1).values
+            mask_pixel_sum = effective_mask_flat.sum(dim=1).clamp(min=1)
+            mean_scores = (anomaly_map_flat * effective_mask_flat).sum(dim=1) / mask_pixel_sum
+        else:
+            anomaly_score = torch.max(anomaly_map_flat, dim=1).values
+            mean_scores = torch.mean(anomaly_map_flat, dim=1)
 
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-            anomaly_score = self.struct_core_instance.score(anomaly_map, anomaly_scor)
+            anomaly_score = self.struct_core_instance.score(anomaly_map, anomaly_score, mask=effective_mask)
         else:
             k = float(self.scoring_mode.split('_')[-1])
             max_scores = anomaly_score
-            mean_scores = torch.mean(anomaly_map_flat, dim=1)
             anomaly_score = k * max_scores + (1 - k) * mean_scores
 
 

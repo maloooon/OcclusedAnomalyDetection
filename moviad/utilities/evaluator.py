@@ -389,7 +389,7 @@ class Evaluator:
         fpr, tpr, pxl_roc_auc = 0,0,0#cal_pxl_roc(gt_masks_list, pred_masks)
 
         """F1 Score Image-level"""
-        img_f1 = cal_f1_img(pred_img_scores, true_img_scores)
+        img_f1, opt_thresh= cal_f1_img(pred_img_scores, true_img_scores) #  opt_thresh 
 
         """F1 Score Pixel-level"""
         pxl_f1 = 0#cal_f1_pxl(pred_masks, gt_masks_list)
@@ -415,7 +415,7 @@ class Evaluator:
             "pxl_au_pro": pxl_au_pro
         }
 
-        return metrics
+        return metrics, opt_thresh
 
            
     def evaluate_single_images(self, model):

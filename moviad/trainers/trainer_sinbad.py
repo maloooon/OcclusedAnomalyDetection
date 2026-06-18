@@ -75,6 +75,7 @@ class TrainerSINBAD(Trainer):
         # ---- Step 1: Collect per-image patch features ----
         all_patch_features = []  # list of [C, P] tensors
         all_patch_masks = []     # list of [P] bool tensors or None
+        all_raw_images = [] if self.model.use_raw_pixels else None  # list of [3, H, W] tensors
 
         print("SINBAD: Extracting patch features...")
         with torch.no_grad():
@@ -98,6 +99,8 @@ class TrainerSINBAD(Trainer):
                         all_patch_masks.append(patch_mask[b])  # [P]
                     else:
                         all_patch_masks.append(None)
+                    if all_raw_images is not None:
+                        all_raw_images.append(images[b].cpu())  # [3, H, W]
 
         n_train = len(all_patch_features)
         n_channels = all_patch_features[0].shape[0]
@@ -167,7 +170,43 @@ class TrainerSINBAD(Trainer):
         print(f"  Training scores — mean: {train_scores.mean():.4f}, "
               f"std: {train_scores.std():.4f}, max: {train_scores.max():.4f}")
 
-        # ---- Step 5: Save if requested ----
+        # ---- Step 5: Fit raw-pixel level (optional) ----
+        if self.model.use_raw_pixels:
+            H, W = self.model.input_size
+            # Stack all training images into [N, 3, H*W]
+            pixel_feats = torch.stack([img.reshape(3, H * W) for img in all_raw_images])
+
+            pixel_extractors = []
+            pixel_scorers = []
+
+            print(f"SINBAD: Fitting {self.model.n_pixel_repetitions} raw-pixel repetitions "
+                  f"(r={self.model.n_pixel_projections}, no whitening)...")
+            for _ in tqdm(range(self.model.n_pixel_repetitions)):
+                extractor = CumulativeSetFeatures(
+                    n_channels=3,
+                    n_projections=self.model.n_pixel_projections,
+                    n_quantiles=self.model.n_quantiles,
+                )
+                extractor.fit(pixel_feats)  # [N, 3, H*W]
+
+                descs = extractor.forward(pixel_feats)  # [N, n_proj*n_quant]
+
+                pix_scorer = MahalanobisScorer(
+                    shrinkage=self.model.shrinkage,
+                    mode=self.model.scoring_mode,
+                    use_whitening=False,
+                )
+                pix_scorer.fit(descs)
+
+                pixel_extractors.append(extractor)
+                pixel_scorers.append(pix_scorer)
+
+            self.model.pixel_extractors = pixel_extractors
+            self.model.pixel_scorers = pixel_scorers
+            print(f"  Raw-pixel level fitted ({len(pixel_extractors)} repetitions, "
+                  f"weight={self.model.pixel_weight})")
+
+        # ---- Step 7: Save if requested ----
     
         if self.save_path:
             save_path_pkl = self.save_path.replace('.pt', '.pkl').replace('.pth', '.pkl')
@@ -186,7 +225,7 @@ class TrainerSINBAD(Trainer):
 
 
         print("Starting Evaluation...")
-        # ---- Step 6: Evaluate ----
+        # ---- Step 8: Evaluate ----
         self.model.eval()
 
         # Move to GPU for feature extraction during eval
@@ -205,6 +244,8 @@ class TrainerSINBAD(Trainer):
         # Cleanup
         del all_patch_features, all_patch_masks, all_fg_patches, all_fg_concat
         del train_descriptors
+        if all_raw_images is not None:
+            del all_raw_images
         torch.cuda.empty_cache()
 
         return TrainerResult(**metrics)

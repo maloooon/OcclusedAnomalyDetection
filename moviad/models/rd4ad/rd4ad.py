@@ -4,6 +4,7 @@ import torch
 from torchvision.transforms import GaussianBlur
 import torch.nn.functional as F
 import numpy as np
+import cv2 as cv
 
 
 
@@ -29,7 +30,7 @@ class RD4AD(torch.nn.Module):
         "betas": (0.5,0.999),
     }
 
-    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = False, skip_layer1: bool = False, custom_weights_path: str = None):
+    def __init__(self, backbone_name, device, input_size = (224, 224), struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = False, skip_layer1: bool = False, custom_weights_path: str = None, mask_dilation_radius: int = 0):
         super().__init__()
 
         self.backbone_name = backbone_name
@@ -41,6 +42,7 @@ class RD4AD(torch.nn.Module):
         self.mask_border_filter_thickness = mask_border_filter_thickness
         self.AD_only_on_mask = AD_only_on_mask
         self.skip_layer1 = skip_layer1
+        self.mask_dilation_radius = mask_dilation_radius
 
         if backbone_name not in BACKBONE_MAP:
             raise ValueError(
@@ -48,6 +50,7 @@ class RD4AD(torch.nn.Module):
                 f"Supported backbones: {list(BACKBONE_MAP)}"
             )
         encoder_fn, decoder_fn = BACKBONE_MAP[backbone_name]
+        print("USING BACKBONE:", backbone_name)
         self.encoder, self.bn = encoder_fn(
             pretrained=custom_weights_path is None,
             custom_weights_path=custom_weights_path,
@@ -161,7 +164,7 @@ class RD4AD(torch.nn.Module):
 
         # --- Apply raspberry mask with contour-based border exclusion ---
         device = anomaly_map.device
-
+        effective_mask = None
         if mask is not None:
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
@@ -170,6 +173,10 @@ class RD4AD(torch.nn.Module):
 
             for i in range(mask.shape[0]):
                 sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
+
+                if self.mask_dilation_radius > 0:
+                    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                    sample_mask = cv.dilate(sample_mask, kernel)
 
                 if border_thickness > 0:
                     contours, _ = cv.findContours(
@@ -205,8 +212,9 @@ class RD4AD(torch.nn.Module):
         flat = anomaly_map.view(anomaly_map.size(0), -1)
         anomaly_scores = torch.max(flat, dim=1)[0]
 
+        self._last_effective_mask = effective_mask if self.AD_only_on_mask else None
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-            anomaly_scores = self.struct_core_instance.score(anomaly_map, anomaly_scores)
+            anomaly_scores = self.struct_core_instance.score(anomaly_map, anomaly_scores, mask=self._last_effective_mask)
         else:
             k = float(self.scoring_mode.split('_')[-1])
             max_scores = anomaly_scores

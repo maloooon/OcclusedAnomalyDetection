@@ -426,6 +426,8 @@ def suppress_removed_mask_regions(
     Returns:
         score_maps modified in-place.
     """
+    if score_maps.ndim == 3:
+        score_maps = score_maps.unsqueeze(1)
     B, _, H, W = score_maps.shape
     device = score_maps.device
 

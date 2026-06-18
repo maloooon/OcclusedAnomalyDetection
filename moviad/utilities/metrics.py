@@ -262,7 +262,7 @@ def cal_f1_img(img_scores: np.ndarray, gt_list: list) -> float:
 
     print("Optimal threshold :" ,thresholds[np.argmax(f1)])
 
-    return np.max(f1)
+    return np.max(f1), thresholds[np.argmax(f1)]
 
 
 def cal_f1_pxl(scores: np.ndarray, gt_masks: np.ndarray) -> float:

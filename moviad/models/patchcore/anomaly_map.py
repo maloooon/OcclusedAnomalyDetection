@@ -74,4 +74,5 @@ class AnomalyMapGenerator(nn.Module):
         return self.compute_anomaly_map(patch_scores, image_size)
 
     def rescale(x):
+        #return x
         return (x - x.min()) / (x.max() - x.min())

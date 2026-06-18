@@ -20,7 +20,7 @@ from moviad.models.components.cfa.descriptor import Descriptor
 from moviad.utilities.custom_feature_extractor_trimmed import CustomFeatureExtractor
 from moviad.utilities.get_sizes import *
 
-
+from ...utilities.filters import filter_holes_batched, filter_specular_drupelets_batched, compute_hole_mask_patchgrid, suppress_removed_mask_regions, compute_darkness_mask
 
 class CFA(nn.Module):
 
@@ -35,7 +35,10 @@ class CFA(nn.Module):
             scoring_mode = 'MAXMEAN_1',
             filter_post = 'NONE',
             mask_border_filter_thickness = 0,
-            AD_only_on_mask = False
+            AD_only_on_mask = False,
+            mask_dilation_radius: int = 0,
+            protrusion_damping_radius: int = 0,
+            protrusion_damping_gamma: float = 0
         ):
 
         """
@@ -76,6 +79,9 @@ class CFA(nn.Module):
         self.feature_maps_shape: tuple = None # only for model footprint
 
         self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
+        self.protrusion_damping_radius = protrusion_damping_radius
+        self.protrusion_damping_gamma = protrusion_damping_gamma
 
     def initialize_memory_bank(self, training_dataloader: DataLoader):
         """
@@ -190,6 +196,7 @@ class CFA(nn.Module):
             device = heatmaps.device
 
             # --- Apply raspberry mask with contour-based border exclusion ---
+            effective_mask = None
             if mask is not None:
                 if mask.ndim == 3:
                     mask = mask.unsqueeze(1)
@@ -201,7 +208,9 @@ class CFA(nn.Module):
                 for i in range(mask.shape[0]):
                     sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
 
-
+                    if self.mask_dilation_radius > 0:
+                        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                        sample_mask = cv.dilate(sample_mask, kernel)
 
                     if self.mask_border_filter_thickness > 0:
                         contours, _ = cv.findContours(
@@ -225,20 +234,36 @@ class CFA(nn.Module):
                 effective_mask = effective_mask.to(device)
                 curr_heatmaps_shape = heatmaps.shape
 
-            if self.AD_only_on_mask:
-                heatmaps = heatmaps * effective_mask
+
        
                 
 
 
-            # Filter holes
+
+
             if 'HOLE_DARKNESS' in self.filter_post:
                 thresh_depth, thresh_dark = self.filter_post.split('_')[2:4]
-                heatmaps = filter_holes_batched(
-                    heatmaps, batch, batch_og, mask_og, depth_og,
+                post_mask_filtered = filter_holes_batched(
+                    batch_og, mask_og, depth_og,
                     depth_threshold_percentile=int(thresh_depth),
-                    brightness_threshold_percentile=int(thresh_dark)
+                    brightness_threshold_percentile=int(thresh_dark),
+                    dilation_radius = 15
+                ).to(effective_mask.device)
+
+
+            if self.AD_only_on_mask:
+                heatmaps = heatmaps * effective_mask
+
+
+            if self.protrusion_damping_gamma > 0:
+                heatmaps = suppress_removed_mask_regions(
+                    heatmaps, mask, mask_unfiltered,
+                    influence_radius=self.protrusion_damping_radius,
+                    gamma=self.protrusion_damping_gamma,
+                    removed_mask = post_mask_filtered if post_mask_filtered is not None else None
                 )
+                # Squeeze 2nd dim here
+                heatmaps = heatmaps.squeeze(1)
                 
 
             # Compute per-image anomaly score
@@ -249,8 +274,9 @@ class CFA(nn.Module):
             
             anomaly_scores = torch.max(flat, dim=1)[0]
 
+            self._last_effective_mask = effective_mask if self.AD_only_on_mask else None
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-                anomaly_scores = self.struct_core_instance.score(heatmaps, anomaly_scores)
+                anomaly_scores = self.struct_core_instance.score(heatmaps, anomaly_scores, mask=self._last_effective_mask)
             else:
                 k = float(self.scoring_mode.split('_')[-1])
                 max_scores = anomaly_scores

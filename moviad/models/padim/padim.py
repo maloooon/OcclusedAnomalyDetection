@@ -79,7 +79,8 @@ class Padim(nn.Module):
             scoring_mode = 'MAXMEAN_1',
             filter_post = 'NONE',
             mask_border_filter_thickness = 0,
-            AD_only_on_mask = False
+            AD_only_on_mask = False,
+            mask_dilation_radius: int = 0,
     ):
         """
         Args:
@@ -118,6 +119,7 @@ class Padim(nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.mask_dilation_radius = mask_dilation_radius
 
     @staticmethod
     def embedding_concat(x, y):
@@ -225,6 +227,7 @@ class Padim(nn.Module):
         score_map_t = torch.from_numpy(score_map).unsqueeze(1).float()  # (B, 1, H, W)
         device = score_map_t.device
 
+        effective_mask = None
         if mask is not None:
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
@@ -234,6 +237,10 @@ class Padim(nn.Module):
 
             for i in range(mask.shape[0]):
                 sample_mask = mask_np[i, 0].numpy().astype(np.uint8)
+
+                if self.mask_dilation_radius > 0:
+                    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                    sample_mask = cv.dilate(sample_mask, kernel)
 
                 if self.mask_border_filter_thickness > 0:
                     contours, _ = cv.findContours(
@@ -266,8 +273,9 @@ class Padim(nn.Module):
         flat = score_map_t.view(score_map_t.size(0), -1)
         anomaly_scores = torch.max(flat, dim=1)[0]
 
+        self._last_effective_mask = effective_mask if self.AD_only_on_mask else None
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-            anomaly_scores = self.struct_core_instance.score(score_map_t, anomaly_scores)
+            anomaly_scores = self.struct_core_instance.score(score_map_t, anomaly_scores, mask=self._last_effective_mask)
         else:
             k = float(self.scoring_mode.split('_')[-1])
             max_scores = anomaly_scores

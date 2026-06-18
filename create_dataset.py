@@ -991,10 +991,10 @@ def main():
     SHARED_TEST_SET = True
 
     # --- Config ---
-    IMG_SIZE = 266
-    UNBLURRED = False
-    SPECULAR_SUPPRESSION = False
-    CLEAN_PROTRUSIONS = False
+    IMG_SIZE = 256
+    UNBLURRED = True
+    SPECULAR_SUPPRESSION = True
+    CLEAN_PROTRUSIONS = True
     FILTER_HOLES = False
     HOLES_DEPTH_THRESH = 40
     HOLES_BRIGHTNESS_THRESH = 40

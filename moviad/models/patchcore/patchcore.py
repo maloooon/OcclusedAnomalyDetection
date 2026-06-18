@@ -40,7 +40,7 @@ class PatchCore(nn.Module):
         protrusion_damping_radius: int = 0,
         protrusion_damping_gamma: float = 1,
         AD_only_on_mask = True,
-
+        mask_dilation_radius: int = 0,
     ) -> None:
 
         """
@@ -65,6 +65,7 @@ class PatchCore(nn.Module):
         self.protrusion_damping_radius = protrusion_damping_radius
         self.protrusion_damping_gamma = protrusion_damping_gamma
         self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
 
 
         self.cls_token_viz_bool = cls_token_viz_bool
@@ -222,13 +223,16 @@ class PatchCore(nn.Module):
             # reshape to batch dimension 
             patch_scores = patch_scores.reshape((batch_size, -1))
             locations = locations.reshape((batch_size, -1))
+
+
     
             # --------------------------------------------------------- #
+            effective_mask = None
             if mask is not None:
                 # Ensure (batch_size, 1, H, W)
                 if mask.ndim == 3:
                     mask = mask.unsqueeze(1)
-    
+
                 # Resize mask to match patch grid dimensions (width, height)
                 mask_resized = torch.nn.functional.interpolate(
                     mask.float(), size=(width, height), mode="nearest"
@@ -239,7 +243,11 @@ class PatchCore(nn.Module):
     
                 for i in range(mask_resized.shape[0]):
                     sample_mask = mask_resized[i, 0].cpu().numpy().astype(np.uint8)  # (width, height)
-    
+
+                    if self.mask_dilation_radius > 0:
+                        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                        sample_mask = cv.dilate(sample_mask, kernel)
+
                     if self.mask_border_filter_thickness > 0:
                         # Find external contours of the raspberry region
                         contours, _ = cv.findContours(
@@ -291,6 +299,7 @@ class PatchCore(nn.Module):
 
             if self.AD_only_on_mask:
                 effective_mask_flat = effective_mask.reshape(batch_size, -1)
+
                 patch_scores = patch_scores * effective_mask_flat
 
             # compute the anomaly score of the images
@@ -302,10 +311,14 @@ class PatchCore(nn.Module):
             # get the anomaly map
             anomaly_maps = self.anomaly_map_generator(patch_scores, image_size = self.input_size)
 
-    
+            # Resize to input size again for structcore
+            effective_mask_img = F.interpolate(effective_mask, size=self.input_size, mode='nearest') if (effective_mask is not None and self.AD_only_on_mask) else None
+            self._last_effective_mask = effective_mask_img
+
+
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-            
-                pred_scores = self.struct_core_instance.score(anomaly_maps, pred_scores)
+
+                pred_scores = self.struct_core_instance.score(anomaly_maps, pred_scores, mask=self._last_effective_mask)
 
             
 

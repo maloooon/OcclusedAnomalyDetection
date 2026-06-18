@@ -65,17 +65,16 @@ class StructCore:
         self._descriptors: list[Tensor] = []     # list of (B, 3) tensors
         self._base_scores: list[Tensor] = []     # list of (B,)  tensors
 
-    def _compute_descriptor(self, anomaly_map: Tensor) -> Tensor:
+    def _compute_descriptor(self, anomaly_map: Tensor, mask: Tensor | None = None) -> Tensor:
         """
-        Compute the 3D structural descriptor θ(S) from an anomaly map.
-
-        The descriptor summarizes the anomaly map along three axes:
-            (i)  Global dispersion  : std over all pixel scores
-            (ii) Tail concentration : mean of top k% pixel scores
-            (iii) Spatial roughness : total variation normalized by map size
+        Compute the structural descriptor θ(S) from an anomaly map.
 
         Args:
             anomaly_map (Tensor): Pixel-level anomaly map, shape (B, 1, H, W).
+            mask (Tensor | None): Optional binary ROI mask, shape (B, 1, H, W) or (B, H, W).
+                When provided, all three descriptors (sigma, topk_mean, TV) are computed
+                exclusively over mask pixels so that background zeros do not contaminate
+                any of the statistics.
 
         Returns:
             Tensor: Structural descriptor of shape (B, 3).
@@ -87,40 +86,46 @@ class StructCore:
 
         # Flatten for per-image statistics: (B, H*W)
         s_flat = S.reshape(B, -1)
-        N = s_flat.shape[1]  # total number of pixels per map
+        N = s_flat.shape[1]
 
-        # ------------------------------------------------------------------
-        # (i) Global dispersion.
-        # Normal images have low, uniform scores -> low std.
-        # Anomalous images have elevated responses in specific regions -> high std.
-        # ------------------------------------------------------------------
-        sigma = s_flat.std(dim=1)  # (B,)
+        if mask is not None:
+            if mask.ndim == 4:
+                mask = mask.squeeze(1)                     # (B, H, W)
+            mask_sq = (mask > 0).float()                   # (B, H, W)
+            mask_flat = mask_sq.reshape(B, -1).bool()      # (B, H*W)
+            N_mask = mask_flat.sum(dim=1).float().clamp(min=1)  # (B,)
 
-        # ------------------------------------------------------------------
-        # (ii) Tail concentration.
-        # Mean of the top k% pixel scores. More robust than a single maximum
-        # because it averages over a small region rather than one noisy peak.
-        # ------------------------------------------------------------------
-        k = max(1, int(N * self.top_k_ratio))       # at least 1 pixel
-        topk_vals, _ = torch.topk(s_flat, k, dim=1) # (B, k)
-        topk_mean = topk_vals.mean(dim=1)            # (B,)
+            sigmas, topk_means = [], []
+            for b in range(B):
+                s_b = s_flat[b][mask_flat[b]]
+                if s_b.numel() == 0:
+                    s_b = s_flat[b]
+                sigmas.append(s_b.std(correction=0))
+                k = max(1, int(s_b.numel() * self.top_k_ratio))
+                topk_means.append(torch.topk(s_b, k).values.mean())
+            sigma = torch.stack(sigmas)
+            topk_mean = torch.stack(topk_means)
 
-        # ------------------------------------------------------------------
-        # (iii) Spatial roughness via total variation.
-        # Measures how much the score changes between neighboring pixels.
-        # Anomalies produce spatially structured elevated regions with
-        # characteristic boundary patterns, distinct from random noise.
-        # Normalized by N to be resolution-independent.
-        # ------------------------------------------------------------------
-        diff_h = (S[:, 1:, :] - S[:, :-1, :]).abs().sum(dim=(1, 2))  # vertical   (B,)
-        diff_w = (S[:, :, 1:] - S[:, :, :-1]).abs().sum(dim=(1, 2))  # horizontal (B,)
-        tv = (diff_h + diff_w) / N                                     # (B,)
+            # TV: only adjacent pairs where both pixels are inside the mask
+            mask_h = mask_sq[:, 1:, :].bool() & mask_sq[:, :-1, :].bool()
+            mask_w = mask_sq[:, :, 1:].bool() & mask_sq[:, :, :-1].bool()
+            diff_h = ((S[:, 1:, :] - S[:, :-1, :]).abs() * mask_h.float()).sum(dim=(1, 2))
+            diff_w = ((S[:, :, 1:] - S[:, :, :-1]).abs() * mask_w.float()).sum(dim=(1, 2))
+            tv = (diff_h + diff_w) / N_mask
+        else:
+            sigma = s_flat.std(dim=1)
+            k = max(1, int(N * self.top_k_ratio))
+            topk_vals, _ = torch.topk(s_flat, k, dim=1)
+            topk_mean = topk_vals.mean(dim=1)
+            diff_h = (S[:, 1:, :] - S[:, :-1, :]).abs().sum(dim=(1, 2))
+            diff_w = (S[:, :, 1:] - S[:, :, :-1]).abs().sum(dim=(1, 2))
+            tv = (diff_h + diff_w) / N
 
-        # Stack into a single descriptor per image: (B, 3)
-        #sigma, topk_mean, tv
-        return torch.stack([topk_mean], dim=1)
 
-    def accumulate(self, anomaly_map: Tensor, base_score: Tensor) -> None:
+        # sigma, topk_mean, tv
+        return torch.stack([sigma, topk_mean, tv], dim=1)
+
+    def accumulate(self, anomaly_map: Tensor, base_score: Tensor, mask: Tensor | None = None) -> None:
         """
         Accumulate structural descriptors and base scores from train-good samples.
 
@@ -132,7 +137,7 @@ class StructCore:
             anomaly_map (Tensor): Pixel-level anomaly map, shape (B, 1, H, W).
             base_score  (Tensor): Image-level base score, i.e. in general the MAX anomaly score of the anomaly map shape (B,)
         """
-        descriptor = self._compute_descriptor(anomaly_map)
+        descriptor = self._compute_descriptor(anomaly_map, mask=mask)
         self._descriptors.append(descriptor.detach().cpu())
         self._base_scores.append(base_score.detach().cpu())
 
@@ -193,7 +198,7 @@ class StructCore:
         print(f"[StructCore] Descriptor std  : {self.std}")
         print(f"[StructCore] Auto lambda      : {self.auto_lambda:.4f}")
 
-    def score(self, anomaly_map: Tensor, base_score: Tensor) -> Tensor:
+    def score(self, anomaly_map: Tensor, base_score: Tensor, mask: Tensor | None = None) -> Tensor:
         """
         Compute the StructCore hybrid image-level anomaly score.
 
@@ -220,14 +225,14 @@ class StructCore:
 
         device = anomaly_map.device
 
-        
+
         # Move fitted statistics to same device as input
         mean        = self.mean.to(device)         # (3,)
         std         = self.std.to(device)          # (3,)
         auto_lambda = self.auto_lambda.to(device)  # scalar
 
         # Compute structural descriptor for the test batch
-        descriptor = self._compute_descriptor(anomaly_map)  # (B, 3)
+        descriptor = self._compute_descriptor(anomaly_map, mask=mask)  # (B, 3)
 
         # Diagonal Mahalanobis distance: standardize each dimension, take L2 norm
         # Measures how far the test descriptor is from the normal descriptor distribution

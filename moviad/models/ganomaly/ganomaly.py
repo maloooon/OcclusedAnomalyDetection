@@ -50,6 +50,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+import cv2
+import numpy as np
+
 
 
 class Encoder(nn.Module):
@@ -452,7 +455,9 @@ class Ganomaly(nn.Module):
         struct_core_instance = None,
         scoring_mode = 'MAXMEAN_1',
         filter_post = 'NONE',
-        mask_border_filter_thickness = 0
+        mask_border_filter_thickness = 0,
+        AD_only_on_mask: bool = False,
+        mask_dilation_radius: int = 0,
     ) -> None:
         super().__init__()
 
@@ -460,6 +465,8 @@ class Ganomaly(nn.Module):
         self.scoring_mode = scoring_mode
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
+        self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
 
         self.generator: Generator = Generator(
             input_size=input_size,
@@ -535,6 +542,7 @@ class Ganomaly(nn.Module):
                 - Batch containing anomaly scores
         """
 
+        mask = None
         if (isinstance(batch, tuple)):
             if len(batch) == 6:
                 batch, mask, mask_unfiltered, batch_og, mask_og, depth_og = batch
@@ -559,7 +567,26 @@ class Ganomaly(nn.Module):
         flat = anomaly_maps.view(anomaly_maps.shape[0], -1)
 
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-            anomaly_scores = self.struct_core_instance.score(anomaly_maps, scores)
+            if self.AD_only_on_mask and mask is not None:
+                m = mask.float()
+                if m.ndim == 3:
+                    m = m.unsqueeze(1)
+                m_resized = F.interpolate(m, size=anomaly_maps.shape[-2:], mode='nearest')  # [B, 1, H, W]
+                if self.mask_dilation_radius > 0:
+                    kernel = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE,
+                        (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1),
+                    )
+                    dilated = []
+                    for b in range(m_resized.shape[0]):
+                        m_np = m_resized[b, 0].cpu().numpy().astype(np.uint8)
+                        dilated.append(torch.from_numpy(cv2.dilate(m_np, kernel).astype(np.float32)))
+                    m_resized = torch.stack(dilated).unsqueeze(1).to(anomaly_maps.device)
+                self._last_effective_mask = m_resized
+                anomaly_scores = self.struct_core_instance.score(anomaly_maps * m_resized, scores, mask=m_resized)
+            else:
+                self._last_effective_mask = None
+                anomaly_scores = self.struct_core_instance.score(anomaly_maps, scores)
         else:
             k = float(self.scoring_mode.split('_')[-1])
             max_scores = scores 

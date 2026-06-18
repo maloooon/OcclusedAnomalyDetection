@@ -30,7 +30,8 @@ class STFPM(torch.nn.Module):
         mask_border_filter_thickness = 0,
         protrusion_damping_radius: int = 0,
         protrusion_damping_gamma: float = 1,
-        AD_only_on_mask = True
+        AD_only_on_mask = True,
+        mask_dilation_radius: int = 0,
     ):
         super().__init__()
         self.teacher = teacher
@@ -42,6 +43,7 @@ class STFPM(torch.nn.Module):
         self.protrusion_damping_radius = protrusion_damping_radius
         self.protrusion_damping_gamma = protrusion_damping_gamma
         self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
 
     def forward(self, batch: torch.Tensor):
 
@@ -215,7 +217,7 @@ class STFPM(torch.nn.Module):
             score_maps = score_maps * sm
 
         # --- Apply raspberry mask with contour-based border exclusion ---
-        
+        effective_mask = None
         if mask is not None:
             # Ensure (B, 1, H, W)
             if mask.ndim == 3:
@@ -227,6 +229,10 @@ class STFPM(torch.nn.Module):
 
             for i in range(mask.shape[0]):
                 sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)  # (H, W)
+
+                if self.mask_dilation_radius > 0:
+                    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                    sample_mask = cv.dilate(sample_mask, kernel)
 
                 if border_thickness > 0:
                     # Find external contours of the raspberry region
@@ -263,7 +269,7 @@ class STFPM(torch.nn.Module):
                 batch_og, mask_og, depth_og,
                 depth_threshold_percentile=int(thresh_depth),
                 brightness_threshold_percentile=int(thresh_dark),
-                dilation_radius = 0
+                dilation_radius = 15
             ).to(effective_mask.device)
            # effective_mask = effective_mask * (1.0 - hole_mask_patch)
 
@@ -290,7 +296,6 @@ class STFPM(torch.nn.Module):
 
 
         if self.protrusion_damping_gamma > 0:
-            print("?")
             score_maps = suppress_removed_mask_regions(
                 score_maps, mask, mask_unfiltered,
                 influence_radius=self.protrusion_damping_radius,
@@ -309,8 +314,9 @@ class STFPM(torch.nn.Module):
         anomaly_scores = torch.max(flat, dim=1)[0]
 
 
+        self._last_effective_mask = effective_mask if self.AD_only_on_mask else None
         if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-            anomaly_scores = self.struct_core_instance.score(score_maps, anomaly_scores)
+            anomaly_scores = self.struct_core_instance.score(score_maps, anomaly_scores, mask=self._last_effective_mask)
 
 
 

@@ -131,7 +131,8 @@ def apply_specular_suppression(image, mask, visualize=True, inpainting=True,
        # result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
         result_title = "Zeroed out"
     
-    mask[dilated > 0] = 0
+    if not inpainting:
+        mask[dilated > 0] = 0
 
     # Visualize filtered mask
    # mask = mask.astype(np.uint8) * 255 # NOTE : need this ??? 

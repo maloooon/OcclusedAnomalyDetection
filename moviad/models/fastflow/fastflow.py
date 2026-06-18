@@ -14,15 +14,14 @@ from scipy.stats import special_ortho_group
 import warnings
 
 
-def create_fastflow(img_shape, backbone_name, device, struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = True):
-    backbone_name = "wide_resnet50_2"
-
-    fast_flow_model = CompleteFastFlowModel(backbone_name,input_size= img_shape, normalize = True, struct_core_instance = struct_core_instance, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask)
-    fast_flow_module = FastflowModel(input_size = img_shape,flow_steps=8,conv3x3_only=False,hidden_ratio=1.0,channels=fast_flow_model.channels,scales=fast_flow_model.scales)
+def create_fastflow(img_shape, backbone_name, device, struct_core_instance = None, scoring_mode = 'MAXMEAN_1', filter_post = 'NONE', mask_border_filter_thickness = 0, AD_only_on_mask = True, custom_weights_path = None, mask_dilation_radius: int = 0):
+    fast_flow_model = CompleteFastFlowModel(backbone_name,input_size= img_shape, normalize = True, struct_core_instance = struct_core_instance, scoring_mode = scoring_mode, filter_post = filter_post, mask_border_filter_thickness = mask_border_filter_thickness, AD_only_on_mask = AD_only_on_mask, custom_weights_path = custom_weights_path, mask_dilation_radius = mask_dilation_radius)
+    flow_steps = 8 if backbone_name in ["resnet18", "wide_resnet50_2", "mobilenet_v2"] else 20
+    fast_flow_module = FastflowModel(input_size = img_shape,flow_steps=flow_steps,conv3x3_only=False,hidden_ratio=1.0,channels=fast_flow_model.channels,scales=fast_flow_model.scales)
     fast_flow_model.fast_flow_module = fast_flow_module
 
     fast_flow_model.feature_extractor = fast_flow_model.feature_extractor.to(device)
-    if backbone_name in ["resnet18", "wide_resnet50_2"]:
+    if backbone_name in ["resnet18", "wide_resnet50_2", "mobilenet_v2"]:
         fast_flow_model.norms = fast_flow_model.norms.to(device)
     fast_flow_model.fast_flow_module  = fast_flow_model.fast_flow_module.to(device)
     fast_flow_model.device = device
@@ -596,18 +595,28 @@ class AnomalyMapGenerator(nn.Module):
 
 
 class CompleteFastFlowModel(nn.Module):
-    def __init__(self,backbone_name,input_size,normalize, struct_core_instance, scoring_mode, filter_post, mask_border_filter_thickness, AD_only_on_mask = True):
+    def __init__(self,backbone_name,input_size,normalize, struct_core_instance, scoring_mode, filter_post, mask_border_filter_thickness, AD_only_on_mask = True, custom_weights_path = None, mask_dilation_radius: int = 0):
         super().__init__()
 
         if backbone_name in ["cait_m48_448", "deit_base_distilled_patch16_384"]:
-            feature_extractor = timm.create_model(backbone_name, pretrained=True)
-        elif backbone_name in ["resnet18", "wide_resnet50_2"]:
+            feature_extractor = timm.create_model(backbone_name, pretrained=custom_weights_path is None)
+        elif "dino" in backbone_name:
+            feature_extractor = torch.hub.load('facebookresearch/dinov2', backbone_name, pretrained=custom_weights_path is None)
+        elif backbone_name in ["resnet18", "wide_resnet50_2", "mobilenet_v2"]:
+            if backbone_name == "mobilenet_v2":
+                out_indices = [3,6,13]
+            else:
+                out_indices = [1,2,3]
             feature_extractor = timm.create_model(
                 backbone_name,
-                pretrained=True,
+                pretrained=custom_weights_path is None,
                 features_only=True,
-                out_indices=[1,2,3], # LAYER SELECTION !
+                out_indices=out_indices, # LAYER SELECTION !
             )
+
+        if custom_weights_path is not None:
+            state_dict = torch.load(custom_weights_path, map_location='cpu')
+            feature_extractor.load_state_dict(state_dict, strict=False)
 
        
         self.input_size = input_size
@@ -619,11 +628,18 @@ class CompleteFastFlowModel(nn.Module):
         self.filter_post = filter_post
         self.mask_border_filter_thickness = mask_border_filter_thickness
         self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
 
         if backbone_name in ["cait_m48_448", "deit_base_distilled_patch16_384"]:
             channels = [768]
             scales = [16]
-        elif backbone_name in ["resnet18", "wide_resnet50_2"]:
+        elif "dino" in backbone_name:
+            patch_size = self.feature_extractor.patch_embed.patch_size
+            if isinstance(patch_size, tuple):
+                patch_size = patch_size[0]
+            channels = [self.feature_extractor.embed_dim]
+            scales = [patch_size]
+        elif backbone_name in ["resnet18", "wide_resnet50_2", "mobilenet_v2"]:
             channels = self.feature_extractor.feature_info.channels()
             scales = self.feature_extractor.feature_info.reduction()
 
@@ -632,7 +648,7 @@ class CompleteFastFlowModel(nn.Module):
             self.norms = nn.ModuleList()
             for channel, scale in zip(channels, scales):
                 if not normalize:
-                    self.norms.append( nn.Identity() ) 
+                    self.norms.append( nn.Identity() )
                 else:
                     self.norms.append(
                         nn.LayerNorm(
@@ -643,7 +659,7 @@ class CompleteFastFlowModel(nn.Module):
         else:
             raise ValueError(
                 f"Backbone {backbone_name} is not supported. List of available backbones are "
-                "[cait_m48_448, deit_base_distilled_patch16_384, resnet18, wide_resnet50_2]."
+                "[cait_m48_448, deit_base_distilled_patch16_384, resnet18, wide_resnet50_2, mobilenet_v2, dino*]."
             )
 
         # freeze the feature extractor
@@ -681,8 +697,7 @@ class CompleteFastFlowModel(nn.Module):
             # print("get_cait_features")
             features = self._get_cait_features(input_tensor)
         elif "dino" in self.backbone_name:
-            # Uses internally custom_feature_extractor_trimmed, which we adjusted for dino
-            features, cls_tokens = self._get_cnn_features(input_tensor)
+            features = self._get_dinov2_features(input_tensor)
         else:
             # print("get_cnn_features")
             features = self._get_cnn_features(input_tensor)
@@ -692,6 +707,7 @@ class CompleteFastFlowModel(nn.Module):
         if not self.training:
             anomaly_maps = self.anomaly_map_generator(hidden_variables)
 
+            effective_mask = None
             if mask is not None and self.AD_only_on_mask:
                 if mask.ndim == 3:
                     mask = mask.unsqueeze(1)
@@ -699,6 +715,9 @@ class CompleteFastFlowModel(nn.Module):
                 effective_mask = torch.zeros_like(mask, dtype=torch.float32)
                 for i in range(mask.shape[0]):
                     sample_mask = mask[i, 0].cpu().numpy().astype(np.uint8)
+                    if self.mask_dilation_radius > 0:
+                        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                        sample_mask = cv.dilate(sample_mask, kernel)
                     if self.mask_border_filter_thickness > 0:
                         contours, _ = cv.findContours(
                             sample_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
@@ -716,20 +735,31 @@ class CompleteFastFlowModel(nn.Module):
                         inner_mask.astype(np.float32)
                     ).to(device)
                 effective_mask = (effective_mask > 0).float()
-                # FastFlow scores are in [-1, 0): closer to 0 = more anomalous.
-                # Set outside-mask pixels to -1 (least anomalous) so max/mean
-                # reflect only the inside-mask region, analogous to STFPM's zeroing.
+                # Keep background at -1 for visualization (FastFlow values are in (-1, 0]).
                 anomaly_maps = anomaly_maps * effective_mask + (effective_mask - 1)
 
+            # Expose for struct_core_collection loop (same mask, with dilation/border-filter).
+            self._last_effective_mask = effective_mask
+
             anomaly_maps_flat = anomaly_maps.view(anomaly_maps.shape[0], -1)
-            anomaly_scores = anomaly_maps_flat.max(dim=1).values
+
+            if effective_mask is not None:
+                effective_mask_flat = effective_mask.view(effective_mask.shape[0], -1)
+                # masked_fill(-inf) ensures background pixels can't influence the max,
+                # and the weighted mean only averages over inside-mask pixels.
+                map_for_max = anomaly_maps_flat.masked_fill(effective_mask_flat == 0, float('-inf'))
+                anomaly_scores = map_for_max.max(dim=1).values
+                mask_pixel_sum = effective_mask_flat.sum(dim=1).clamp(min=1)
+                mean_scores = (anomaly_maps_flat * effective_mask_flat).sum(dim=1) / mask_pixel_sum
+            else:
+                anomaly_scores = anomaly_maps_flat.max(dim=1).values
+                mean_scores = torch.mean(anomaly_maps_flat, dim=1)
 
             if self.struct_core_instance is not None and self.scoring_mode == 'STRUCTCORE':
-                anomaly_scores = self.struct_core_instance.score(anomaly_maps, anomaly_scores)
+                anomaly_scores = self.struct_core_instance.score(anomaly_maps, anomaly_scores, mask=effective_mask)
             else:
                 k = float(self.scoring_mode.split('_')[-1])
                 max_scores = anomaly_scores
-                mean_scores = torch.mean(anomaly_maps_flat, dim=1)
                 anomaly_scores = k * max_scores + (1 - k) * mean_scores
 
             return_val = (anomaly_maps, anomaly_scores)
@@ -767,6 +797,9 @@ class CompleteFastFlowModel(nn.Module):
                     sample_anomaly_map_fig = ((sample_anomaly_map - sample_anomaly_map.min()) / (sample_anomaly_map.max() - sample_anomaly_map.min()) * 255).astype(np.uint8)
                     cv.imwrite(f"sample_anomaly_map_{i}.png", sample_anomaly_map_fig)
 
+                    if self.mask_dilation_radius > 0:
+                        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1))
+                        sample_mask = cv.dilate(sample_mask, kernel)
 
                     if self.mask_border_filter_thickness > 0:
                         contours, _ = cv.findContours(
@@ -862,6 +895,27 @@ class CompleteFastFlowModel(nn.Module):
         features = [feature]
         return features
 
+    def _get_dinov2_features(self, input_tensor: Tensor) -> List[Tensor]:
+        """Get DINOv2 (facebookresearch hub) features.
+
+        Args:
+            input_tensor (Tensor): Input Tensor.
+
+        Returns:
+            List[Tensor]: List of features.
+        """
+        with torch.no_grad():
+            output = self.feature_extractor.forward_features(input_tensor)
+            # x_norm_patchtokens already excludes cls and register tokens
+            feature = output['x_norm_patchtokens']  # [B, N_patches, embed_dim]
+            batch_size, _, num_channels = feature.shape
+            patch_size = self.feature_extractor.patch_embed.patch_size
+            if isinstance(patch_size, tuple):
+                patch_size = patch_size[0]
+            feature = feature.permute(0, 2, 1)
+            feature = feature.reshape(batch_size, num_channels, self.input_size[0] // patch_size, self.input_size[1] // patch_size)
+            return [feature]
+
     def _get_vit_features(self, input_tensor: Tensor) -> List[Tensor]:
         """Get Vision Transformers (ViT) features.
 
@@ -889,10 +943,14 @@ class CompleteFastFlowModel(nn.Module):
         for i in range(8):  # paper Table 6. Block Index = 7
             feature = self.feature_extractor.blocks[i](feature)
         feature = self.feature_extractor.norm(feature)
-        feature = feature[:, 2:, :]
+        n_prefix = 1 if self.feature_extractor.dist_token is None else 2
+        feature = feature[:, n_prefix:, :]
         batch_size, _, num_channels = feature.shape
         feature = feature.permute(0, 2, 1)
-        feature = feature.reshape(batch_size, num_channels, self.input_size[0] // 16, self.input_size[1] // 16)
+        patch_size = self.feature_extractor.patch_embed.patch_size
+        if isinstance(patch_size, tuple):
+            patch_size = patch_size[0]
+        feature = feature.reshape(batch_size, num_channels, self.input_size[0] // patch_size, self.input_size[1] // patch_size)
         features = [feature]
         return features
 

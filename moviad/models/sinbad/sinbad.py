@@ -44,17 +44,22 @@ class CumulativeSetFeatures:
         self.min_vals = None
         self.max_vals = None
 
-    def fit(self, X: torch.Tensor):
+    def fit(self, X: torch.Tensor, max_fit_samples: int = 1_000_000):
         """
         Compute quantile thresholds from training data.
 
         Args:
             X: [N, C, P] training patch features
+            max_fit_samples: subsample projected values to this count before
+                calling torch.quantile, which fails on inputs > ~16M elements
         """
         # Project: [N, n_proj, P]
         a = F.conv1d(X, self.projections)
         # Reshape to [N*P, n_proj] for quantile computation
         a = a.permute(0, 2, 1).reshape(-1, self.n_projections)
+        if a.shape[0] > max_fit_samples:
+            idx = torch.randperm(a.shape[0])[:max_fit_samples]
+            a = a[idx]
         self.min_vals = torch.quantile(a, 0.01, dim=0)
         self.max_vals = torch.quantile(a, 0.99, dim=0)
 
@@ -97,17 +102,23 @@ class MahalanobisScorer:
     simpler, dependency-light implementation. The original also does
     kNN with k=1 after whitening, which is equivalent to Mahalanobis
     distance to the nearest training sample. We provide both options.
+
+    use_whitening=False disables covariance estimation and falls back to
+    plain L2 distance — used for the raw-pixel level per the paper
+    ("no whitening due to the low number of channels").
     """
 
-    def __init__(self, shrinkage: float = 0.1, mode: str = 'knn'):
+    def __init__(self, shrinkage: float = 0.1, mode: str = 'knn', use_whitening: bool = True):
         """
         Args:
             shrinkage: Regularization parameter for ShrunkCovariance
             mode: 'knn' (distance to nearest train sample, like original SINBAD)
                   or 'mean' (distance to training mean, simpler)
+            use_whitening: If False, skip covariance estimation and use plain L2
         """
         self.shrinkage = shrinkage
         self.mode = mode
+        self.use_whitening = use_whitening
         self.cov_inv = None
         self.train_descriptors_whitened = None
         self.train_mean = None
@@ -120,18 +131,20 @@ class MahalanobisScorer:
         Args:
             descriptors: [N_train, D] training set descriptors
         """
-        cov = ShrunkCovariance(shrinkage=self.shrinkage).fit(descriptors).covariance_
-        try:
-            self.cov_inv = np.linalg.inv(cov)
-        except np.linalg.LinAlgError:
-            self.cov_inv = np.linalg.pinv(cov)
-
         self.train_mean = descriptors.mean(axis=0)
 
+        if self.use_whitening:
+            cov = ShrunkCovariance(shrinkage=self.shrinkage).fit(descriptors).covariance_
+            try:
+                self.cov_inv = np.linalg.inv(cov)
+            except np.linalg.LinAlgError:
+                self.cov_inv = np.linalg.pinv(cov)
+
         if self.mode == 'knn':
-            # Whiten training descriptors for L2-based kNN
-            self.train_descriptors_whitened = descriptors @ self.cov_inv #descriptors.dot(self.cov_inv) #
-            
+            if self.use_whitening:
+                self.train_descriptors_whitened = descriptors @ self.cov_inv
+            else:
+                self.train_descriptors_whitened = descriptors
 
     def score(self, descriptors: np.ndarray) -> np.ndarray:
         """
@@ -144,28 +157,27 @@ class MahalanobisScorer:
             scores: [N_test] anomaly scores (higher = more anomalous)
         """
         if self.mode == 'mean':
-            # Mahalanobis distance to training mean
             diff = descriptors - self.train_mean
-            # (x - mu)^T Sigma^{-1} (x - mu)
-            scores = np.sum(diff @ self.cov_inv * diff, axis=1)
+            if self.use_whitening:
+                scores = np.sum(diff @ self.cov_inv * diff, axis=1)
+            else:
+                scores = np.sum(diff * diff, axis=1)
             return scores
 
         elif self.mode == 'knn':
             # TODO : fix. in OG done via faiss, see if we can also just implement faiss here to match original
-            # Distance to nearest training sample in whitened space (like original SINBAD)
-            whitened_test = descriptors @ self.cov_inv
-            # Brute-force 1-NN in whitened space
-            # For ~3000 train × ~1000 test × 5000 dims, this is manageable
-            # If memory is an issue, batch this
+            # Distance to nearest training sample in whitened (or plain) space
+            if self.use_whitening:
+                test_projected = descriptors @ self.cov_inv
+            else:
+                test_projected = descriptors
 
             # in OG K is still a parameter, but it is set to 1 (i.e. we just search the closest neighbour) (see Appendix in paper)
             scores = np.zeros(len(descriptors))
             batch_size = 128
             for i in range(0, len(descriptors), batch_size):
-                batch = whitened_test[i:i + batch_size] # Grab a batch of test descriptors
-                # [batch, D] vs [N_train, D] -> [batch, N_train]
+                batch = test_projected[i:i + batch_size]
                 dists = np.sum((batch[:, None, :] - self.train_descriptors_whitened[None, :, :]) ** 2, axis=2)
-                
                 scores[i:i + batch_size] = dists.min(axis=1)
             return scores
 
@@ -221,6 +233,12 @@ class SINBAD(nn.Module):
         n_quantiles: int = 5,
         shrinkage: float = 0.1,
         scoring_mode: str = 'knn',
+        use_raw_pixels: bool = False,
+        pixel_weight: float = 0.1,
+        n_pixel_projections: int = 10,
+        n_pixel_repetitions: int = 32,
+        AD_only_on_mask: bool = False,
+        mask_dilation_radius: int = 0,
     ):
         super().__init__()
 
@@ -231,10 +249,20 @@ class SINBAD(nn.Module):
         self.n_quantiles = n_quantiles
         self.shrinkage = shrinkage
         self.scoring_mode = scoring_mode
+        self.use_raw_pixels = use_raw_pixels
+        self.pixel_weight = pixel_weight
+        self.n_pixel_projections = n_pixel_projections
+        self.n_pixel_repetitions = n_pixel_repetitions
+        self.AD_only_on_mask = AD_only_on_mask
+        self.mask_dilation_radius = mask_dilation_radius
 
         # These are set during training
         self.set_feature_extractor: CumulativeSetFeatures | None = None
         self.scorer: MahalanobisScorer | None = None
+
+        # Raw-pixel level (fitted only when use_raw_pixels=True)
+        self.pixel_extractors: list[CumulativeSetFeatures] | None = None
+        self.pixel_scorers: list[MahalanobisScorer] | None = None
 
         # Determined from the first forward pass
         self._n_channels: int | None = None
@@ -258,6 +286,9 @@ class SINBAD(nn.Module):
                 batch_og, mask_og, depth_og = None, None, None
             elif len(input_tensor) == 6:
                 input_tensor, mask, mask_unfiltered, batch_og, mask_og, depth_og = input_tensor
+
+        # Keep CPU copy of raw input for the pixel level before device transfer
+        raw_input = input_tensor.cpu() if self.use_raw_pixels else None
 
         # Extract features
         with torch.no_grad():
@@ -286,11 +317,9 @@ class SINBAD(nn.Module):
         self._n_channels = C
 
         if self.training:
-            # Return [B, C, H*W] for trainer to collect
-            # Also return mask info so trainer can filter
             patch_features = embedding.reshape(B, C, H * W).cpu()
-
-            return patch_features, None
+            patch_mask = self._make_patch_mask(mask, H, W, B) if (self.AD_only_on_mask and mask is not None) else None
+            return patch_features, patch_mask
 
         else:
             # Eval mode: compute set descriptors and score
@@ -299,14 +328,53 @@ class SINBAD(nn.Module):
 
             patch_features = embedding.reshape(B, C, H * W).cpu()
 
-            descriptors = self.set_feature_extractor.forward(patch_features)
+            if self.AD_only_on_mask and mask is not None:
+                patch_mask = self._make_patch_mask(mask, H, W, B)
+                descriptors = self._compute_masked_descriptors(patch_features, patch_mask)
+            else:
+                descriptors = self.set_feature_extractor.forward(patch_features)
 
             # Score
             pred_scores = self.scorer.score(descriptors)
+
+            # Raw-pixel level: 32 independent low-projection runs, take median
+            if self.use_raw_pixels and self.pixel_extractors is not None:
+                H, W = self.input_size
+                pixel_features = raw_input.reshape(B, 3, H * W)  # [B, 3, H*W]
+
+                rep_scores = []
+                for extractor, scorer in zip(self.pixel_extractors, self.pixel_scorers):
+                    descs = extractor.forward(pixel_features)
+                    rep_scores.append(scorer.score(descs))
+
+                pixel_scores = np.median(np.stack(rep_scores, axis=1), axis=1)  # [B]
+                pred_scores = pred_scores + self.pixel_weight * pixel_scores
+
             pred_scores = torch.tensor(pred_scores, dtype=torch.float32)
 
             # No anomaly maps
             return (pred_scores,)
+
+    def _make_patch_mask(self, mask: Tensor, H: int, W: int, B: int) -> Tensor:
+        """Interpolate image-level mask to feature grid, optionally dilate, return [B, P] bool."""
+        import cv2
+        m = mask.float()
+        if m.ndim == 3:
+            m = m.unsqueeze(1)
+        feat_mask = F.interpolate(m, size=(H, W), mode='nearest').squeeze(1)  # [B, H, W]
+
+        if self.mask_dilation_radius > 0:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * self.mask_dilation_radius + 1, 2 * self.mask_dilation_radius + 1),
+            )
+            dilated = []
+            for b in range(B):
+                m_np = feat_mask[b].cpu().numpy().astype(np.uint8)
+                dilated.append(torch.from_numpy(cv2.dilate(m_np, kernel).astype(np.float32)))
+            feat_mask = torch.stack(dilated)
+
+        return feat_mask.reshape(B, H * W).bool().cpu()  # [B, P]
 
     def _compute_masked_descriptors(self, patch_features: Tensor, patch_mask: Tensor) -> np.ndarray:
         """
@@ -382,7 +450,7 @@ class SINBAD(nn.Module):
 
     def state_dict_sinbad(self):
         """Custom state dict for saving (nn.Module state_dict won't capture our objects)."""
-        return {
+        state = {
             'n_projections': self.n_projections,
             'n_quantiles': self.n_quantiles,
             'shrinkage': self.shrinkage,
@@ -394,7 +462,24 @@ class SINBAD(nn.Module):
             'cov_inv': self.scorer.cov_inv if self.scorer else None,
             'train_mean': self.scorer.train_mean if self.scorer else None,
             'train_descriptors_whitened': self.scorer.train_descriptors_whitened if self.scorer else None,
+            'use_raw_pixels': self.use_raw_pixels,
+            'pixel_weight': self.pixel_weight,
+            'n_pixel_projections': self.n_pixel_projections,
+            'n_pixel_repetitions': self.n_pixel_repetitions,
+            'pixel_extractors': None,
+            'pixel_scorers': None,
         }
+        if self.use_raw_pixels and self.pixel_extractors is not None:
+            state['pixel_extractors'] = [
+                {'projections': e.projections, 'min_vals': e.min_vals, 'max_vals': e.max_vals}
+                for e in self.pixel_extractors
+            ]
+            state['pixel_scorers'] = [
+                {'train_mean': s.train_mean, 'cov_inv': s.cov_inv,
+                 'train_descriptors_whitened': s.train_descriptors_whitened}
+                for s in self.pixel_scorers
+            ]
+        return state
 
     def load_sinbad(self, state: dict):
         """Load from custom state dict."""
@@ -415,3 +500,24 @@ class SINBAD(nn.Module):
         self.scorer.cov_inv = state['cov_inv']
         self.scorer.train_mean = state['train_mean']
         self.scorer.train_descriptors_whitened = state['train_descriptors_whitened']
+
+        self.use_raw_pixels = state.get('use_raw_pixels', False)
+        self.pixel_weight = state.get('pixel_weight', 0.1)
+        self.n_pixel_projections = state.get('n_pixel_projections', 10)
+        self.n_pixel_repetitions = state.get('n_pixel_repetitions', 32)
+
+        if self.use_raw_pixels and state.get('pixel_extractors') is not None:
+            self.pixel_extractors = []
+            self.pixel_scorers = []
+            for e_state, s_state in zip(state['pixel_extractors'], state['pixel_scorers']):
+                e = CumulativeSetFeatures(3, self.n_pixel_projections, self.n_quantiles)
+                e.projections = e_state['projections']
+                e.min_vals = e_state['min_vals']
+                e.max_vals = e_state['max_vals']
+                self.pixel_extractors.append(e)
+
+                s = MahalanobisScorer(self.shrinkage, self.scoring_mode, use_whitening=False)
+                s.train_mean = s_state['train_mean']
+                s.cov_inv = s_state['cov_inv']
+                s.train_descriptors_whitened = s_state['train_descriptors_whitened']
+                self.pixel_scorers.append(s)
