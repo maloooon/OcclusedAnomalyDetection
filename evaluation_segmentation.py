@@ -4,6 +4,8 @@ from scipy.optimize import linear_sum_assignment
 import cv2 
 import pickle
 
+# Evaluation of segmentation models (SAM models, YOLO is in pseudo_label_training.py)
+
 def calculate_segmentation_metrics(pred_masks, gt_masks, iou_threshold=0.5, mode = 'pixels'):
     """
     Calculate instance segmentation metrics for multiple objects.
@@ -237,7 +239,6 @@ def _extract_masks(data, extract_grades_bool = False):
     return all_gt_masks_ids
 
 
-# AP calculation
 
 def _compute_iou_matrix(pred_masks, gt_masks):
     """Compute full IoU matrix between predicted and GT masks for one image."""
@@ -250,6 +251,9 @@ def _compute_iou_matrix(pred_masks, gt_masks):
         for j in range(n_gt):
             iou_matrix[i, j] = calculate_mask_iou(pred_masks[i], gt_masks[j])
     return iou_matrix
+
+
+# AP COCO style calculations
 
 def _greedy_match_at_threshold(iou_matrix, confidence_order, iou_threshold):
     """
@@ -503,9 +507,7 @@ def main():
     print(f"  Average Recall: {avg_recall / n_samples}")
 
 
-    # =========================================================================
-    # AP / mAP metrics (COCO-style, pooled across all images)
-    # =========================================================================
+    # AP metrics
     print("\n" + "=" * 60)
     print("COCO-style AP Metrics (mask IoU, single class)")
     print("=" * 60)

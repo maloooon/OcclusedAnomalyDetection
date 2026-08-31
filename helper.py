@@ -126,8 +126,6 @@ def overlay_raspberries(folder_path, output_path=None):
     
     return canvas_rgb
 
-
-
 def apply_random_transform(img, mask, depth, mask_unfiltered=None,
                            scale_range=(0.5, 0.8),
                            rotation_range=(-180, 180)):

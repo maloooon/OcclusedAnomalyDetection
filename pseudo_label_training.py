@@ -1,8 +1,4 @@
-# Our aim is to create a much smaller model for segmentation, specific for our task of segmenting raspberries, such that we can have fast inference times.
-# The initial idea is Model Distillation , but since this can add quite some complexity, we first try with an easier approach : 
-# Train a smaller model on pseudo-labels (in this case segmentation masks) provided by a large model (e.g. SAM3) and then evaluate on the GT test set :
-# See how good performance is 
-
+# YOLO-seg model pipeline
 
 from datasets import load_dataset
 import numpy as np
@@ -30,8 +26,8 @@ def _convex_hull_polygon(poly):
     except Exception:
         return poly
 
-
 def setup_yolo_dataset_structure_extended(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, N_VAL_SAMPLES):
+    # This is essentially for when we want to also cutoff a test set (i.e. we have train and validation for YOLO training)
 
     images_dir_train = Path("../../disk/YOLO_dataset_extended/images/train")
     images_dir_val   = Path("../../disk/YOLO_dataset_extended/images/val")
@@ -95,7 +91,14 @@ def setup_yolo_dataset_structure_extended(all_imgs, all_pred_xyn, all_pred_ids, 
 
         label_file.write_text("\n".join(lines))
 
-def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, mode="raspberry"):
+def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, mode="raspberry", train_labels=None):
+    """Build the YOLO folder/label structure for training and validation.
+
+    By default the training split uses pseudo-labels (`all_pred_xyn`) and the
+    validation split uses ground-truth labels (`val_labels`).  Pass
+    `train_labels` to replace the pseudo-labels with actual GT annotations for
+    the training split as well (upper-bound / oracle experiment).
+    """
 
     # Adjust to YOLO format : https://docs.ultralytics.com/datasets/segment/#ultralytics-yolo-format
 
@@ -132,16 +135,16 @@ def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_label
         img.save(img_path)
 
     img_paths = sorted(list(images_dir_train.glob("*.png"))) + sorted(list(images_dir_val.glob("*.png")))
-    polygons_per_image = all_pred_xyn
-
-    # Replace the above with the GT labels for the val set, since we want to evaluate on the GT labels, not on the predicted masks
-    # val_labels is a list of lists of polygons, where the outer list is over images and the inner list is over objects in the image
-    # Turn into the same format as polygons_per_image, which is a list of lists of numpy arrays
 
     val_labels = [[np.array(label) for label in sample_labels] for sample_labels in val_labels]
 
-    # Now replace
-    polygons_per_image = polygons_per_image[:N_TRAIN_SAMPLES] + val_labels
+    if train_labels is not None:
+        # GT labels for training (oracle / upper-bound experiment)
+        train_labels = [[np.array(label) for label in sample_labels] for sample_labels in train_labels]
+        polygons_per_image = train_labels + val_labels
+    else:
+        # Default: pseudo-labels for training, GT for validation
+        polygons_per_image = all_pred_xyn[:N_TRAIN_SAMPLES] + val_labels
 
     labels_dir_train = base_dir / "labels/train"
     labels_dir_val   = base_dir / "labels/val"
@@ -199,10 +202,9 @@ def setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_label
     )
     (base_dir / f"{class_name}-seg.yaml").write_text(yaml_content)
 
-
 def evaluate_yolo_iou(model, val_data, val_labels, device=2,
-                      filter_red=(True, 0.3),
-                      filter_bboxes=(True, None, 3.0),
+                      filter_red=(False, 0.3),
+                      filter_bboxes=(False, None, 3.0),
                       filter_masks_shapes=(False, 0.85),
                       filter_masks_sizes=(False, 0.2, None),
                       filter_holes_islands=False,
@@ -398,12 +400,12 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
         print("-----------------------------------------------")
 
 def run_yolo_and_store_masks(model, filepath, device=2,
-                             filter_red=(True, 0.3),
-                             filter_bboxes=(True, None, 3.0),
+                             filter_red=(False, 0.3),
+                             filter_bboxes=(False, None, 3.0),
                              filter_masks_shapes=(False, 0.85),
                              filter_masks_sizes=(False, 0.2, None),
-                             filter_holes_islands=True,
-                             filter_overlap_masks=(True, 'new')):
+                             filter_holes_islands=False,
+                             filter_overlap_masks=(False, 'new')):
 
     masks_list = []
     xyn_list = []
@@ -533,6 +535,7 @@ def main():
   #  N_TEST_SAMPLES = 20
 
     # Load GT masks for evaluation later on
+    train_data = list(ds['train'])
     val_data = list(ds['valid'])
     
     
@@ -543,6 +546,11 @@ def main():
 
     # Do not record the raspberry grade, since we are only interested in segmentation performance for now, not classification performance
     val_labels = [[label[1:] for label in sample_labels] for sample_labels in val_labels]
+
+    # GT labels for the training split (oracle / upper-bound experiment)
+    train_labels = [sample['labels'] for sample in train_data]
+    train_labels = [[label for label in sample_labels if label[0] != 0] for sample_labels in train_labels]
+    train_labels = [[label[1:] for label in sample_labels] for sample_labels in train_labels]
 
     ## Load predicted masks
     PRED_MASKS_FILE = '../../nvme1/thesis/saved_masks/sam3/masks.pkl'
@@ -560,54 +568,54 @@ def main():
     all_pred_xyn = [masks_and_xyn_and_imgs[1] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
     all_conf_scores = [masks_and_xyn_and_imgs[2] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
     all_imgs = [masks_and_xyn_and_imgs[3] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
-   # all_imgs = [masks_and_xyn_and_imgs[2] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids]
 
 
-  #  setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES)
- #   setup_yolo_dataset_structure_extended(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, N_VAL_SAMPLES)
+    
 
+
+    # Option A: train on pseudo-labels from the large model (default)
+    setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES)
+
+    # Option B: train on actual ground-truth labels (oracle / upper-bound experiment)
+   # setup_yolo_dataset_structure(all_imgs, all_pred_xyn, all_pred_ids, val_labels, N_TRAIN_SAMPLES, train_labels=train_labels)
 
 
     # Load a model
-  #  model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
+    model = YOLO("../../disk/pretrained_models/yolo26n-seg.pt")  # Load pretrained model
     # Train the model
-    #imgsz=[1280,800]
-  #  results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz= 640, name = "yolo26n-seg-pseudo-labels-frozen24", device = 2, freeze= 23)
+    results = model.train(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", epochs=100, imgsz= 640, name = "yolo26n-seg-gt-frozen-0", device = 2, freeze= 0)
 
     # Load trained model
-    model = YOLO("../../disk/pretrained_models/yolo26n-seg-pseudo-labels-best-640-input-frozen22.pt") 
-    #print(len(model.model.model)) # num layers
+    model = YOLO("../../disk/pretrained_models/yolo26n-seg-gt-best-640-input-frozen-0.pt") 
     #metrics = model.val(data="../../disk/YOLO_dataset/RaspGrade-seg.yaml", device = 2)
-    #print(metrics.seg.f1)
-#    evaluate_yolo_iou(model, val_data, val_labels, device=2, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (False, 0.3), filter_holes_islands = False, filter_overlap_masks = (False, 'new'))
+    evaluate_yolo_iou(model, val_data, val_labels, device=2, filter_bboxes = (False, None, 3.0), filter_masks_shapes = (False, 0.85), filter_masks_sizes = (False, 0.2, None), filter_red = (False, 0.3), filter_holes_islands = False, filter_overlap_masks = (False, 'new'))
 
-   # run_yolo_and_store_masks(model, filepath="../../nvme1/thesis/saved_masks/yolo_640", device=2)
-
+    run_yolo_and_store_masks(model, filepath="../../nvme1/thesis/saved_masks/yolo_640", device=2)
 
 
 
 
 
-    # -------------------------------------------------------------------------
-    # Punnet training
-    # -------------------------------------------------------------------------
+
+    '''
+    # YOLO for detecting the punnet class
 
     # GT val labels for punnet: keep only class-0 entries, then strip the class index
-    val_labels_punnet = [sample['labels'] for sample in val_data]
-    val_labels_punnet = [[label for label in sample_labels if label[0] == 0] for sample_labels in val_labels_punnet]
-    val_labels_punnet = [[label[1:] for label in sample_labels] for sample_labels in val_labels_punnet]
+    #val_labels_punnet = [sample['labels'] for sample in val_data]
+    #val_labels_punnet = [[label for label in sample_labels if label[0] == 0] for sample_labels in val_labels_punnet]
+    #val_labels_punnet = [[label[1:] for label in sample_labels] for sample_labels in val_labels_punnet]
 
     # Load predicted punnet masks (produced by SAM3 on the punnet class)
-    PUNNET_MASKS_FILE = '../../disk/saved_masks/SAM3_punnet/masks.pkl'
-    with open(PUNNET_MASKS_FILE, 'rb') as f:
-        pred_data_punnet = pickle.load(f)
+    #PUNNET_MASKS_FILE = '../../disk/saved_masks/SAM3_punnet/masks.pkl'
+    #with open(PUNNET_MASKS_FILE, 'rb') as f:
+    #    pred_data_punnet = pickle.load(f)
 
-    all_pred_masks_ids_punnet = [(pred_data_punnet[key], key) for key in pred_data_punnet.keys()]
-    all_pred_masks_ids_punnet.sort(key=lambda x: x[1])
+    #all_pred_masks_ids_punnet = [(pred_data_punnet[key], key) for key in pred_data_punnet.keys()]
+    #all_pred_masks_ids_punnet.sort(key=lambda x: x[1])
 
-    all_pred_ids_punnet    = [img_id for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
-    all_pred_xyn_punnet    = [masks_and_xyn_and_imgs[1] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
-    all_imgs_punnet        = [masks_and_xyn_and_imgs[3] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
+    #all_pred_ids_punnet    = [img_id for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
+    #all_pred_xyn_punnet    = [masks_and_xyn_and_imgs[1] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
+    #all_imgs_punnet        = [masks_and_xyn_and_imgs[3] for masks_and_xyn_and_imgs, img_id in all_pred_masks_ids_punnet]
 
    # setup_yolo_dataset_structure(all_imgs_punnet, all_pred_xyn_punnet, all_pred_ids_punnet, val_labels_punnet, N_TRAIN_SAMPLES, mode="punnet")
 
@@ -618,22 +626,7 @@ def main():
     # Load trained punnet model and evaluate
   #  model_punnet = YOLO("../../disk/pretrained_models/yolo26n-seg-punnet-pseudo-labels-best.pt")
   #  evaluate_yolo_iou(model_punnet, val_data, val_labels_punnet, device=2)
-
-
-    # Get inference time by evaluating on 5 random samples in /home/marlon_helbing/disk/YOLO_dataset/images/val
-
-   # import time 
-   # val_img_paths = sorted(list(Path("../../disk/YOLO_dataset/images/val").glob("*.png")))
-   # sample_paths = np.random.choice(val_img_paths, size=5, replace=False)
-    
-   # for i, img_path in enumerate(sample_paths):
-   #     if i == 1:  # Skip the first one to avoid including any potential model loading time
-   #         start_time = time.time()
-   #     model.predict(img_path, device = 2)
-   # end_time = time.time()
-   # avg_inference_time = (end_time - start_time) / (len(sample_paths) -1)
-   # print(f"Average inference time on GPU for 5 samples: {avg_inference_time:.4f} seconds")
-         
+    '''
 
 
 

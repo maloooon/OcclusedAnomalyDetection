@@ -17,6 +17,7 @@ from transformers import pipeline
 import torch
 import matplotlib.cm as cm
 import cv2
+import time
 
 
 
@@ -284,7 +285,10 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
 
 
             if clean_protrusions_bool:
+                _t0 = time.perf_counter()
                 masked_img_processed, mask_processed, depth_processed = clean_protrusions(masked_img_processed, mask_processed, depth_processed)
+                if idx == 0: # just exemplary for first sample
+                    print(f"[timing] clean_protrusions: {time.perf_counter() - _t0:.4f}s per sample")
 
 
 
@@ -550,7 +554,7 @@ def apply_filters(dataset_path,
                   size_filtering=False, size_filtering_factor=1.5,
                   darkness_filtering=False, darkness_threshold=80, max_dark_ratio=0.3):
     """
-    Post-hoc filtering on a fully created and split dataset. Modifies the dataset IN-PLACE.
+    Post-hoc filtering on a fully created and split dataset.
 
     After this function runs:
       - filtered-out images are saved to {parent}/filtered/{size,darkness}/ for inspection
@@ -992,15 +996,15 @@ def main():
 
     # --- Config ---
     IMG_SIZE = 256
-    UNBLURRED = True
-    SPECULAR_SUPPRESSION = True
-    CLEAN_PROTRUSIONS = True
-    FILTER_HOLES = False
+    UNBLURRED = True # Whether to unblur
+    SPECULAR_SUPPRESSION = True # Whether to suppress specular highlights (meaning strong light reflections)
+    CLEAN_PROTRUSIONS = True # Whether to remove small sharp protrusions around the mask
+    FILTER_HOLES = False # Whether to remove holes in the mask (didn't work and lead to worse results, so disabled)
     HOLES_DEPTH_THRESH = 40
     HOLES_BRIGHTNESS_THRESH = 40
-    SEED = 42
+    SEED = 0
 
-    SIZE_FILTERING = False
+    SIZE_FILTERING = False # Fully filter out too small samples
     SIZE_FILTERING_FACTOR = 1.5
     DARKNESS_FILTERING = False # Fully filters out too dark samples
     DARKNESS_THRESHOLD = 80
@@ -1072,7 +1076,7 @@ def main():
 
     all_pred_masks_ids = [(pred_data[key], key) for key in pred_data.keys()]
 
-    # Sort by ID (unchanged)
+    # Sort by ID
     all_imgs_ids.sort(key=lambda x: x[1])
     all_pred_masks_ids.sort(key=lambda x: x[1])
     all_gt_masks_ids.sort(key=lambda x: x[1])
@@ -1093,7 +1097,7 @@ def main():
     all_ids = [img_id for _, img_id in all_pred_masks_ids]
 
 
-    # --- Step 1: Create full unfiltered dataset ---
+    #Create full unfiltered dataset 
 
     masks = all_gt_masks if CREATE_BASED_ON == 'gt' else all_pred_masks
 
@@ -1105,7 +1109,7 @@ def main():
         filter_holes_depth_thresh=HOLES_DEPTH_THRESH, filter_holes_brightness_thresh=HOLES_BRIGHTNESS_THRESH
     )
 
-    # --- Step 2: Create split ---
+    #Create split
     if SHARED_TEST_SET and CREATE_BASED_ON != 'gt':
         # Assign test/train based on GT split membership, not randomly.
         data_split_aligned_to_gt(
@@ -1121,7 +1125,7 @@ def main():
             seed=SEED,
         )
 
-    # --- Step 3: Apply filters post-hoc if requested ---
+    # Apply filters
     if SIZE_FILTERING or DARKNESS_FILTERING:
         apply_filters(
             dataset_path=f'{SAVE_PATH}/processed',
@@ -1132,7 +1136,7 @@ def main():
             max_dark_ratio=MAX_DARK_RATIO,
         )
 
-    # --- Step 4: Shared test set bookkeeping (after filtering) ---
+    # Shared test set after filtering
     if SHARED_TEST_SET:
         if CREATE_BASED_ON == 'gt':
             # Save canonical test stems after filtering so stems reflect only

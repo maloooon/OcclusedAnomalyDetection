@@ -3,8 +3,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+# FULLY UPDATED
 
-
+# INITIAL INITIAL ANALYSIS TOOL
 
 def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, debug=False):
     """
@@ -12,7 +13,7 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
     
     Args:
         sample: Dictionary containing data
-        show_segmentation_mask: Whether to overlay segmentation masks
+        show_segmentation_mask: Whether to overlay segmentation masks (class 0 / punnet is not drawn; each raspberry is drawn in a different color)
         show_classes: Whether to show class labels at mask centers
         debug: Print debug information about label structure
     """
@@ -37,20 +38,20 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
         
         font = ImageFont.load_default()
         
-        colors = [
-            (200, 200, 200, 80),   # Class 0: Gray (punnet)
-            (139, 69, 19, 120),     # Class 1: Brown
-            (220, 20, 60, 120),     # Class 2: Red
-            (255, 182, 193, 120),   # Class 3: Pink
-            (154, 205, 50, 120),    # Class 4: Yellow-green
-            (128, 0, 128, 120)      # Class 5: Purple 
+        # Generate one distinct color per raspberry instance (class 0 / punnet excluded)
+        n_raspberries = sum(1 for l in labels if int(l[0]) > 0)
+        cmap = plt.cm.get_cmap('hsv', n_raspberries + 1)
+        instance_colors = [
+            tuple(int(c * 255) for c in cmap(i)[:3]) + (120,)
+            for i in range(n_raspberries)
         ]
 
         # Sort labels: draw class 0 (box) first, then others
         # This ensures the box doesn't overlay the raspberries
         sorted_labels = sorted(enumerate(labels), key=lambda x: (0 if int(x[1][0]) == 0 else 1, x[0]))
-        
+
         drawn_count = 0
+        raspberry_idx = 0
         for original_idx, label_data in sorted_labels:
             
             if debug:
@@ -97,9 +98,10 @@ def visualize_sample(sample, show_segmentation_mask=False, show_classes=False, d
                 min_y, max_y = min(ys), max(ys)
                 print(f"  Bonnet bounding box: ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})")
             
-            # Draw segmentation mask
-            if show_segmentation_mask:
-                color = colors[class_id % len(colors)]
+            # Draw segmentation mask (skip class 0 / punnet; each instance gets its own color)
+            if show_segmentation_mask and class_id > 0:
+                color = instance_colors[raspberry_idx]
+                raspberry_idx += 1
                 try:
                     draw.polygon(polygon_points, fill=color, outline=color[:3] + (255,))
                     if debug:
@@ -189,7 +191,6 @@ def distribution_of_grades(samples):
     plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
     plt.show()
     
-
 def save_all_imgs(ds):
     """
     Save all images from the dataset to disk for manual inspection.

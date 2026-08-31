@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import os
 import random 
 
+# More or less a playground for figuring out what manipulations on the raspberries can lead to better AD model performances
+
 def edge_smoothing(image, mask, ksize=(5, 5), sigma=3, thickness=5):
     """
     Smooth out edges of segmented raspberries by applying gaussian filtering
@@ -728,7 +730,6 @@ def filter_darkness(image, mask, brightness_threshold_percentile=30, visualize=F
         plt.close()
 
     return image, mask_filtered
-
 
 def overlay_mask_on_image(image, mask):
     # Create a red mask

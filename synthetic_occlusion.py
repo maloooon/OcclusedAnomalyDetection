@@ -6,65 +6,90 @@ from pathlib import Path
 import pickle
 from PIL import Image
 
-class SyntheticOcclusion:
-    def __init__(self, base_path, sample_folders=None):
-        """
-        Args:
-            base_path: Path to dataset_single_objects/GT/processed/
-            sample_folders: List of folder names (e.g., ['img001', 'img002']) 
-                          If None, loads all folders
-        """
-        base_path = Path(base_path)
-        
-        # Get all sample folders if not specified
-        if sample_folders is None:
-            sample_folders = sorted([d.name for d in base_path.iterdir() if d.is_dir()])
-        
-        all_masks = []
-        all_images = []
-        all_grades = []
-        
-        for folder in sample_folders:
-            folder_path = base_path / folder
-            npz_files = list(folder_path.glob('*.npz'))
-            pkl_files = list(folder_path.glob('*.pkl'))
-            data = None
-            npz_b = False
-            if npz_files:
-                npz_b = True
-                data_path = npz_files[0]
-                data = np.load(data_path, allow_pickle=True)
-            elif pkl_files:
-                data_path = pkl_files[0]
-                with open(data_path, 'rb') as f:
-                    data = pickle.load(f)
-            else:
-                print(f"Warning: No .npz or .pkl file found in {folder_path}, skipping")
-                continue
+### Synthetic occlusion approach
 
-            if npz_b == True:
-                all_masks.append(data['masks'])
-                all_images.append(data['images'])
-                all_grades.append(data['grades'])
-            else:
-                # pkl file stores differently 
-                masks = np.array([item['mask'] for item in data])
-                images = np.array([item['image'] for item in data])
-                grades = np.array([item['grade'] for item in data])
-                
-                all_masks.append(masks)
-                all_images.append(images)
-                all_grades.append(grades)
-        
-        # Combine all samples
-        self.masks = np.concatenate(all_masks, axis=0)
-        self.images = np.concatenate(all_images, axis=0)
-        self.grades = np.concatenate(all_grades, axis=0)
-        
-       # print(f"Loaded {len(sample_folders)} samples")
-        print(f"Total masks shape: {self.masks.shape}")
-        print(f"Total images shape: {self.images.shape}")
-        print(f"Total grades shape: {self.grades.shape}")
+
+# NOT USED IN THE END
+"""
+    def single_raspberry_occlusion(self, 
+                                wanted_size_range=None,
+                                randomize_scale_bool=(False, 0.2, 2.0), 
+                                randomize_rotation_bool=(False, -30, 30),
+                                visualize_bool = True,
+                                reassign_source_target_bool = False,
+                                sampling_mode = 'uniform',
+                                chosen_initial_raspberry = None):
+        '''
+        Occlusion of 2 single raspberries.
+        Based on the idea of Copy & Paste as in Ghiasi et al., 
+        "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
+
+        Args:
+            wanted_size_range (tuple) : (min_pixels_factor, max_pixels_factor) range for the remaining
+                                        visible area of the target raspberry
+            randomize_scale_bool (tuple) : If first element is True, randomly scale the source 
+                                        raspberry by a factor sampled uniformly from the range
+                                        defined by the second and third elements of the tuple.
+            randomize_rotation_bool (tuple) : If first element is True, randomly rotate the source
+                                            raspberry by an angle sampled uniformly from the range
+                                            defined by the second and third elements of the tuple.
+            visualize_bool (bool) : Whether to visualize the occlusion process.
+            reassign_source_target_bool (bool) : Reassign source and target raspberries such that
+                                                source is always larger than target. (i.e. realistic, 
+                                                since the larger raspberry is typically more prominent in the image)
+            sampling_mode (str) : ('N_largest', N) or 'uniform' sampling of raspberries
+            chosen_initial_raspberry (tuple) : If not None, specifies the image and mask (as tuple) of the initial raspberry to use as target. 
+                                             The other raspberry will be sampled randomly from the dataset.
+                                             This is used during the Dataset call for the AD model : This way, we can
+                                             apply synthetic occlusion to the current image of the dataset and therefore
+                                             achieve more randomness during training (i.e. always new occlusion patterns)
+
+
+        Workflow : 
+        1. Select two raspberry images and their respective masks according to a sampling strategy (uniform across all raspberry imgs or only selecting from the N largest (in mask size)) ; we refer to them as source and target raspberry
+        2. Apply random transformations (scaling, rotation) to source raspberry if wanted
+        3. Paste source raspberry onto target raspberry at random location within locality of target raspberry (Targeted Pasting) ; implemented by randomly selecting one anchor point in source and target raspberry mask
+        4. Check that occlusion constraints are fulfilled :
+        a) The occlusion is within a predefined range (i.e. between [k,i] % of target mask still visible)
+        b) Source raspberry is not entirely contained within target raspberry (realism constraint)
+        5. If constraints not fulfilled : repeat step 3&4 until maximum number of trials is reached (set to 200)
+            
+
+        '''
+
+        if sampling_mode == 'uniform':
+            chosen_idx = np.random.choice(len(self.images), size=2, replace=True)
+        elif type(sampling_mode) == tuple and sampling_mode[0] == 'N_largest':
+            N = sampling_mode[1]
+            mask_sizes = np.array([np.sum(mask) for mask in self.masks])
+            largest_indices = np.argsort(mask_sizes)[-N:]
+            chosen_idx = np.random.choice(largest_indices, size=2, replace=True)
+
+        if chosen_initial_raspberry is None:
+            target_img = self.images[chosen_idx[0]].copy()
+            target_mask = self.masks[chosen_idx[0]].copy()
+        else:
+            target_img, target_mask = chosen_initial_raspberry[0], chosen_initial_raspberry[1]
+
+        source_img = self.images[chosen_idx[1]].copy()
+        source_mask = self.masks[chosen_idx[1]].copy()
+
+        target_grade = self.grades[chosen_idx[0]]
+
+        # 2. Paste the source raspberry region onto the target image
+        new_target_img, new_target_mask = self._paste(
+            target_mask, 
+            source_mask, 
+            source_img, 
+            target_img,
+            wanted_size_range=wanted_size_range,
+            randomize_scale_bool=randomize_scale_bool,
+            randomize_rotation_bool=randomize_rotation_bool,
+            visualize_bool=visualize_bool,
+            reassign_source_target_bool=reassign_source_target_bool,
+        )
+
+        return new_target_img, new_target_mask, target_grade
 
     def k_raspberries_occlusion(self, k=5,
                                 max_occlusions_per_raspberry=3,
@@ -75,7 +100,7 @@ class SyntheticOcclusion:
                                 visualize_bool = False,
                                 mode_sampling = 'weighted',
                                 canvas_size=(1000, 1000)):
-        """
+        '''
         Occlusion of k single raspberries.
         Based on the idea of Copy & Paste as in Ghiasi et al., 
         "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
@@ -105,7 +130,7 @@ class SyntheticOcclusion:
             b) Source raspberry is not entirely contained within target raspberry (realism constraint)
             c) Raspberry is not occluded by more than j neighbouring raspberries 
             6. If constraints not fulfilled : repeat steps 4&5 until maximum number of trials is reached (set to 200), then skip raspberry and go back to 2
-        """
+        '''
         
         if k < 2:
             raise ValueError("k must be at least 2")
@@ -483,197 +508,6 @@ class SyntheticOcclusion:
 
         return composite_img, occluded_masks, occluded_masks_grades
 
-    def single_raspberry_occlusion(self, 
-                                wanted_size_range=None,
-                                randomize_scale_bool=(False, 0.2, 2.0), 
-                                randomize_rotation_bool=(False, -30, 30),
-                                visualize_bool = True,
-                                reassign_source_target_bool = False,
-                                sampling_mode = 'uniform',
-                                chosen_initial_raspberry = None):
-        """
-        Occlusion of 2 single raspberries.
-        Based on the idea of Copy & Paste as in Ghiasi et al., 
-        "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
-
-        Args:
-            wanted_size_range (tuple) : (min_pixels_factor, max_pixels_factor) range for the remaining
-                                        visible area of the target raspberry
-            randomize_scale_bool (tuple) : If first element is True, randomly scale the source 
-                                        raspberry by a factor sampled uniformly from the range
-                                        defined by the second and third elements of the tuple.
-            randomize_rotation_bool (tuple) : If first element is True, randomly rotate the source
-                                            raspberry by an angle sampled uniformly from the range
-                                            defined by the second and third elements of the tuple.
-            visualize_bool (bool) : Whether to visualize the occlusion process.
-            reassign_source_target_bool (bool) : Reassign source and target raspberries such that
-                                                source is always larger than target. (i.e. realistic, 
-                                                since the larger raspberry is typically more prominent in the image)
-            sampling_mode (str) : ('N_largest', N) or 'uniform' sampling of raspberries
-            chosen_initial_raspberry (tuple) : If not None, specifies the image and mask (as tuple) of the initial raspberry to use as target. 
-                                             The other raspberry will be sampled randomly from the dataset.
-                                             This is used during the Dataset call for the AD model : This way, we can
-                                             apply synthetic occlusion to the current image of the dataset and therefore
-                                             achieve more randomness during training (i.e. always new occlusion patterns)
-
-
-        Workflow : 
-        1. Select two raspberry images and their respective masks according to a sampling strategy (uniform across all raspberry imgs or only selecting from the N largest (in mask size)) ; we refer to them as source and target raspberry
-        2. Apply random transformations (scaling, rotation) to source raspberry if wanted
-        3. Paste source raspberry onto target raspberry at random location within locality of target raspberry (Targeted Pasting) ; implemented by randomly selecting one anchor point in source and target raspberry mask
-        4. Check that occlusion constraints are fulfilled :
-        a) The occlusion is within a predefined range (i.e. between [k,i] % of target mask still visible)
-        b) Source raspberry is not entirely contained within target raspberry (realism constraint)
-        5. If constraints not fulfilled : repeat step 3&4 until maximum number of trials is reached (set to 200)
-            
-
-        """
-
-        if sampling_mode == 'uniform':
-            chosen_idx = np.random.choice(len(self.images), size=2, replace=True)
-        elif type(sampling_mode) == tuple and sampling_mode[0] == 'N_largest':
-            N = sampling_mode[1]
-            mask_sizes = np.array([np.sum(mask) for mask in self.masks])
-            largest_indices = np.argsort(mask_sizes)[-N:]
-            chosen_idx = np.random.choice(largest_indices, size=2, replace=True)
-
-        if chosen_initial_raspberry is None:
-            target_img = self.images[chosen_idx[0]].copy()
-            target_mask = self.masks[chosen_idx[0]].copy()
-        else:
-            target_img, target_mask = chosen_initial_raspberry[0], chosen_initial_raspberry[1]
-
-        source_img = self.images[chosen_idx[1]].copy()
-        source_mask = self.masks[chosen_idx[1]].copy()
-
-        target_grade = self.grades[chosen_idx[0]]
-
-        # 2. Paste the source raspberry region onto the target image
-        new_target_img, new_target_mask = self._paste(
-            target_mask, 
-            source_mask, 
-            source_img, 
-            target_img,
-            wanted_size_range=wanted_size_range,
-            randomize_scale_bool=randomize_scale_bool,
-            randomize_rotation_bool=randomize_rotation_bool,
-            visualize_bool=visualize_bool,
-            reassign_source_target_bool=reassign_source_target_bool,
-        )
-
-        return new_target_img, new_target_mask, target_grade
-
-    def multi_raspberry_occlusion(self, 
-                            wanted_size_range=None,
-                            randomize_scale_bool=(False, 0.2, 2.0), 
-                            randomize_rotation_bool=(False, -30, 30),
-                            visualize_bool=True,
-                            reassign_source_target_bool=False,
-                            sampling_mode='uniform',
-                            chosen_initial_raspberry=None,
-                            k=1):
-        """
-        Occlusion of 2 or more single raspberries.
-        Based on the idea of Copy & Paste as in Ghiasi et al., 
-        "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
-
-        Args:
-            wanted_size_range (tuple) : (min_pixels_factor, max_pixels_factor) range for the remaining
-                                        visible area of the target raspberry
-            randomize_scale_bool (tuple) : If first element is True, randomly scale the source 
-                                        raspberry by a factor sampled uniformly from the range
-                                        defined by the second and third elements of the tuple.
-            randomize_rotation_bool (tuple) : If first element is True, randomly rotate the source
-                                            raspberry by an angle sampled uniformly from the range
-                                            defined by the second and third elements of the tuple.
-            visualize_bool (bool) : Whether to visualize the occlusion process.
-            reassign_source_target_bool (bool) : Reassign source and target raspberries such that
-                                                source is always larger than target. (i.e. realistic, 
-                                                since the larger raspberry is typically more prominent in the image)
-            sampling_mode (str) : ('N_largest', N) or 'uniform' sampling of raspberries
-            chosen_initial_raspberry (tuple) : If not None, specifies the image,mask and grade (as tuple) of the initial raspberry to use as target. 
-                                             The other raspberry will be sampled randomly from the dataset.
-                                             This is used during the Dataset call for the AD model : This way, we can
-                                             apply synthetic occlusion to the current image of the dataset and therefore
-                                             achieve more randomness during training (i.e. always new occlusion patterns)
-
-
-        Workflow : 
-        1. Select two or more raspberry images and their respective masks according to a sampling strategy (uniform across all raspberry imgs or only selecting from the N largest (in mask size)) ;
-            we call the "source raspberry" the raspberry that is being pasted and the "target raspberry" the raspberry that is being pasted on. There is only one initial target raspberry, but there
-            can be multiple source raspberries
-        Repeat k-1 times (i.e. for each source raspberry) : 
-        2. Apply random transformations (scaling, rotation) to source raspberry if wanted
-        3. Paste source raspberry onto target raspberry at random location within locality of target raspberry (Targeted Pasting) ; implemented by randomly selecting one anchor point in source and target raspberry mask
-        4. Check that occlusion constraints are fulfilled :
-        a) The occlusion is within a predefined range (i.e. between [k,i] % of target mask still visible)
-        b) Source raspberry is not entirely contained within target raspberry (realism constraint)
-        5. If constraints not fulfilled : repeat step 3&4 until maximum number of trials is reached (set to 200)
-            
-
-        """
-
-        if k > 1 and reassign_source_target_bool:
-            print("Warning: reassign_source_target_bool forced to False for k > 1")
-            reassign_source_target_bool = False
-
-        if sampling_mode == 'uniform':
-            chosen_idx = np.random.choice(len(self.images), size=k+1, replace=True)
-        elif type(sampling_mode) == tuple and sampling_mode[0] == 'N_largest':
-            N = sampling_mode[1]
-            mask_sizes = np.array([np.sum(mask) for mask in self.masks])
-            largest_indices = np.argsort(mask_sizes)[-N:]
-            chosen_idx = np.random.choice(largest_indices, size=k+1, replace=True)
-
-        if chosen_initial_raspberry is None:
-            target_img = self.images[chosen_idx[0]].copy()
-            target_mask = self.masks[chosen_idx[0]].copy()
-            target_grade = self.grades[chosen_idx[0]]
-        else:
-            target_img, target_mask = chosen_initial_raspberry[0].copy(), chosen_initial_raspberry[1].copy()
-            target_grade = chosen_initial_raspberry[2]
-
-        original_target_size = np.sum(np.asarray(target_mask, dtype=bool))
-
-        snapshots_img = [np.asarray(target_img, dtype=np.uint8).copy()]
-        snapshots_mask = [np.asarray(target_mask, dtype=bool).copy()]
-
-        for j in range(k):
-            source_img = self.images[chosen_idx[j + 1]].copy()
-            source_mask = self.masks[chosen_idx[j + 1]].copy()
-
-            target_img, target_mask = self._paste(
-                target_mask,
-                source_mask,
-                source_img,
-                target_img,
-                wanted_size_range=wanted_size_range,
-                randomize_scale_bool=randomize_scale_bool,
-                randomize_rotation_bool=randomize_rotation_bool,
-                visualize_bool=False,
-                reassign_source_target_bool=reassign_source_target_bool,
-                original_target_size=original_target_size,
-            )
-
-            snapshots_img.append(np.asarray(target_img, dtype=np.uint8).copy())
-            snapshots_mask.append(np.asarray(target_mask, dtype=bool).copy())
-
-        if visualize_bool:
-            self._visualize_multi_paste(snapshots_img, snapshots_mask, original_target_size, wanted_size_range)
-
-        # Get occluded raspberry image
-        target_img = np.asarray(target_img, dtype=np.uint8)
-        target_mask = np.asarray(target_mask, dtype=bool)
-        target_img[~target_mask] = 0  # Black out occluded areas for visualization
-        # Convert back to image
-        target_img = Image.fromarray(target_img)
-
-        if np.sum(target_mask) != original_target_size:
-            return target_img, target_mask, target_grade
-        else:
-            return None, None, None
-
-
     def create_artificial_bonnet(self, k=25, 
                                 field_size=(961, 644),
                                 show_field_boundary=True,
@@ -684,7 +518,7 @@ class SyntheticOcclusion:
                                 max_occlusions_per_raspberry=3,
                                 mode_sampling ='weighted',
                                 canvas_size = (1000,1000)):
-        """
+        '''
         Create an artificial bonnet by placing k raspberries randomly within a defined field.
         
         Args:
@@ -718,7 +552,7 @@ class SyntheticOcclusion:
             b) Source raspberry is not entirely contained within target raspberry (realism constraint)
             c) Raspberry mask stays within artificial bonnet  
             6. If constraints not fulfilled : repeat steps 4&5 until maximum number of trials is reached (set to 200), then skip raspberry and go back to 2
-        """
+        '''
         
         field_width, field_height = field_size
         
@@ -1055,6 +889,180 @@ class SyntheticOcclusion:
 
         return composite_img, occluded_masks, occluded_masks_grades
 
+"""
+
+class SyntheticOcclusion:
+    def __init__(self, base_path, sample_folders=None):
+        """
+        Args:
+            base_path: Path to dataset_single_objects/GT/processed/
+            sample_folders: List of folder names (e.g., ['img001', 'img002']) 
+                          If None, loads all folders
+        """
+        base_path = Path(base_path)
+        
+        # Get all sample folders if not specified
+        if sample_folders is None:
+            sample_folders = sorted([d.name for d in base_path.iterdir() if d.is_dir()])
+        
+        all_masks = []
+        all_images = []
+        all_grades = []
+        
+        for folder in sample_folders:
+            folder_path = base_path / folder
+            npz_files = list(folder_path.glob('*.npz'))
+            pkl_files = list(folder_path.glob('*.pkl'))
+            data = None
+            npz_b = False
+            if npz_files:
+                npz_b = True
+                data_path = npz_files[0]
+                data = np.load(data_path, allow_pickle=True)
+            elif pkl_files:
+                data_path = pkl_files[0]
+                with open(data_path, 'rb') as f:
+                    data = pickle.load(f)
+            else:
+                print(f"Warning: No .npz or .pkl file found in {folder_path}, skipping")
+                continue
+
+            if npz_b == True:
+                all_masks.append(data['masks'])
+                all_images.append(data['images'])
+                all_grades.append(data['grades'])
+            else:
+                # pkl file stores differently 
+                masks = np.array([item['mask'] for item in data])
+                images = np.array([item['image'] for item in data])
+                grades = np.array([item['grade'] for item in data])
+                
+                all_masks.append(masks)
+                all_images.append(images)
+                all_grades.append(grades)
+        
+        # Combine all samples
+        self.masks = np.concatenate(all_masks, axis=0)
+        self.images = np.concatenate(all_images, axis=0)
+        self.grades = np.concatenate(all_grades, axis=0)
+        
+       # print(f"Loaded {len(sample_folders)} samples")
+        print(f"Total masks shape: {self.masks.shape}")
+        print(f"Total images shape: {self.images.shape}")
+        print(f"Total grades shape: {self.grades.shape}")
+
+# MAIN FUNCTION(S)
+    def multi_raspberry_occlusion(self, 
+
+                            wanted_size_range=None,
+                            randomize_scale_bool=(False, 0.2, 2.0), 
+                            randomize_rotation_bool=(False, -30, 30),
+                            visualize_bool=True,
+                            reassign_source_target_bool=False,
+                            sampling_mode='uniform',
+                            chosen_initial_raspberry=None,
+                            k=1):
+        '''
+        Occlusion of 2 or more single raspberries.
+        Based on the idea of Copy & Paste as in Ghiasi et al., 
+        "Simple Copy-Paste is a Strong Data Augmentation Method for Instance Segmentation".
+
+        Args:
+            wanted_size_range (tuple) : (min_pixels_factor, max_pixels_factor) range for the remaining
+                                        visible area of the target raspberry
+            randomize_scale_bool (tuple) : If first element is True, randomly scale the source 
+                                        raspberry by a factor sampled uniformly from the range
+                                        defined by the second and third elements of the tuple.
+            randomize_rotation_bool (tuple) : If first element is True, randomly rotate the source
+                                            raspberry by an angle sampled uniformly from the range
+                                            defined by the second and third elements of the tuple.
+            visualize_bool (bool) : Whether to visualize the occlusion process.
+            reassign_source_target_bool (bool) : Reassign source and target raspberries such that
+                                                source is always larger than target. (i.e. realistic, 
+                                                since the larger raspberry is typically more prominent in the image)
+            sampling_mode (str) : ('N_largest', N) or 'uniform' sampling of raspberries
+            chosen_initial_raspberry (tuple) : If not None, specifies the image,mask and grade (as tuple) of the initial raspberry to use as target. 
+                                             The other raspberry will be sampled randomly from the dataset.
+                                             This is used during the Dataset call for the AD model : This way, we can
+                                             apply synthetic occlusion to the current image of the dataset and therefore
+                                             achieve more randomness during training (i.e. always new occlusion patterns)
+
+
+        Workflow : 
+        1. Select two or more raspberry images and their respective masks according to a sampling strategy (uniform across all raspberry imgs or only selecting from the N largest (in mask size)) ;
+            we call the "source raspberry" the raspberry that is being pasted and the "target raspberry" the raspberry that is being pasted on. There is only one initial target raspberry, but there
+            can be multiple source raspberries
+        Repeat k-1 times (i.e. for each source raspberry) : 
+        2. Apply random transformations (scaling, rotation) to source raspberry if wanted
+        3. Paste source raspberry onto target raspberry at random location within locality of target raspberry (Targeted Pasting) ; implemented by randomly selecting one anchor point in source and target raspberry mask
+        4. Check that occlusion constraints are fulfilled :
+        a) The occlusion is within a predefined range (i.e. between [k,i] % of target mask still visible)
+        b) Source raspberry is not entirely contained within target raspberry (realism constraint)
+        5. If constraints not fulfilled : repeat step 3&4 until maximum number of trials is reached (set to 200)
+            
+
+        '''
+
+        if k > 1 and reassign_source_target_bool:
+            print("Warning: reassign_source_target_bool forced to False for k > 1")
+            reassign_source_target_bool = False
+
+        if sampling_mode == 'uniform':
+            chosen_idx = np.random.choice(len(self.images), size=k+1, replace=True)
+        elif type(sampling_mode) == tuple and sampling_mode[0] == 'N_largest':
+            N = sampling_mode[1]
+            mask_sizes = np.array([np.sum(mask) for mask in self.masks])
+            largest_indices = np.argsort(mask_sizes)[-N:]
+            chosen_idx = np.random.choice(largest_indices, size=k+1, replace=True)
+
+        if chosen_initial_raspberry is None:
+            target_img = self.images[chosen_idx[0]].copy()
+            target_mask = self.masks[chosen_idx[0]].copy()
+            target_grade = self.grades[chosen_idx[0]]
+        else:
+            target_img, target_mask = chosen_initial_raspberry[0].copy(), chosen_initial_raspberry[1].copy()
+            target_grade = chosen_initial_raspberry[2]
+
+        original_target_size = np.sum(np.asarray(target_mask, dtype=bool))
+
+        snapshots_img = [np.asarray(target_img, dtype=np.uint8).copy()]
+        snapshots_mask = [np.asarray(target_mask, dtype=bool).copy()]
+
+        for j in range(k):
+            source_img = self.images[chosen_idx[j + 1]].copy()
+            source_mask = self.masks[chosen_idx[j + 1]].copy()
+
+            target_img, target_mask = self._paste(
+                target_mask,
+                source_mask,
+                source_img,
+                target_img,
+                wanted_size_range=wanted_size_range,
+                randomize_scale_bool=randomize_scale_bool,
+                randomize_rotation_bool=randomize_rotation_bool,
+                visualize_bool=False,
+                reassign_source_target_bool=reassign_source_target_bool,
+                original_target_size=original_target_size,
+            )
+
+            snapshots_img.append(np.asarray(target_img, dtype=np.uint8).copy())
+            snapshots_mask.append(np.asarray(target_mask, dtype=bool).copy())
+
+        if visualize_bool:
+            self._visualize_multi_paste(snapshots_img, snapshots_mask, original_target_size, wanted_size_range)
+
+        # Get occluded raspberry image
+        target_img = np.asarray(target_img, dtype=np.uint8)
+        target_mask = np.asarray(target_mask, dtype=bool)
+        target_img[~target_mask] = 0  # Black out occluded areas for visualization
+        # Convert back to image
+        target_img = Image.fromarray(target_img)
+
+        if np.sum(target_mask) != original_target_size:
+            return target_img, target_mask, target_grade
+        else:
+            return None, None, None
+
     def _paste(self, target_mask, 
             source_mask, 
             source_img,
@@ -1240,6 +1248,9 @@ class SyntheticOcclusion:
       #      f"Returning original image.")
         return target_img, target_mask
 
+
+
+# VISUALIZATION HELPERS
     def _visualize_multi_paste(self, snapshots_img, snapshots_mask, original_target_size, wanted_size_range=None):
         """
         Two-row visualization for multi_raspberry_occlusion.
@@ -1390,9 +1401,7 @@ class SyntheticOcclusion:
         plt.show()
         plt.savefig('example.png')
 
-
-
-
+# REMOVAL OF ISLANDS HELPER
     def clean_mask_and_img(self,img, mask):
         """Keep only the largest connected component; zero out the rest in both mask and image.
            This function is in order to fix the problem that the synthetic occlusion creates multiple disconnected components in the mask,
@@ -1414,63 +1423,31 @@ class SyntheticOcclusion:
 
 
 def main():
-    data_path_all_samples = '../../disk/dataset_single_objects/GT/full_no_filters_256/processed/'
-    synthetic_occlusion = SyntheticOcclusion(base_path= data_path_all_samples, sample_folders = ['anomalous','img001'])
+  #  data_path_all_samples = '../../disk/dataset_single_objects/GT/full_no_filters_256/processed/'
+  #  synthetic_occlusion = SyntheticOcclusion(base_path= data_path_all_samples, sample_folders = ['anomalous','img001'])
 
-    BONNET_SIZE = (961, 644)  # Width, Height taken from bonnet of img_001
-    new_img, new_mask, grade_mask = synthetic_occlusion.multi_raspberry_occlusion(
-        wanted_size_range=(0.1,0.3),
-        randomize_scale_bool=(False, 0.2, 0.8),
-        randomize_rotation_bool=(False, -180,180),
-        visualize_bool=True,
-        reassign_source_target_bool = True,
-        sampling_mode= ('N_largest', 50),
-        k = 2)
+   # BONNET_SIZE = (961, 644)  # Width, Height taken from bonnet of img_001
+   # new_img, new_mask, grade_mask = synthetic_occlusion.multi_raspberry_occlusion(
+   #     wanted_size_range=(0.1,0.3),
+   #     randomize_scale_bool=(False, 0.2, 0.8),
+   #     randomize_rotation_bool=(False, -180,180),
+   #     visualize_bool=True,
+   #     reassign_source_target_bool = True,
+   #     sampling_mode= ('N_largest', 50),
+   #     k = 2)
 
-    new_img = np.asarray(new_img, dtype=np.uint8)
-    new_img, new_mask = synthetic_occlusion.clean_mask_and_img(new_img, new_mask)
+   # new_img = np.asarray(new_img, dtype=np.uint8)
+   ## new_img, new_mask = synthetic_occlusion.clean_mask_and_img(new_img, new_mask)
 
     # Visualize the cleaned result
-    plt.figure(figsize=(8, 8))
-    plt.imshow(new_img)
-    plt.title("Cleaned Composite Image")
-    plt.axis('off')
-    plt.savefig('cleaned_example.png')
+    #plt.figure(figsize=(8, 8))
+    #plt.imshow(new_img)
+    #plt.title("Cleaned Composite Image")
+    #plt.axis('off')
+   # plt.savefig('cleaned_example.png')
 
 
 
-    
-   
-  #  composite_img, new_occluded_masks, grades_new_occluded_masks = synthetic_occlusion.k_raspberries_occlusion(
-  #      k=30,
-  #      max_occlusions_per_raspberry=6,
-  #      wanted_size_range_per_occlusion=(0.7, 0.9),
-  #      randomize_scale_bool=(False, 0.5, 0.8),
-  #      randomize_rotation_bool=(False, -180, 180),
-  #      visualize_bool=True,
-  #      mode_sampling = ('N_largest', 40),
-  #      canvas_size= (1200,1200)
-  #  )
-
- #   composite_img, new_occluded_masks, grades_new_occluded_masks = synthetic_occlusion.create_artificial_bonnet(
- #       k=20,
- #       field_size=BONNET_SIZE,
- #       show_field_boundary=True,
- #       randomize_scale_bool=(False, 0.7, 1.0),
- #       randomize_rotation_bool=(False, -180, 180),
- #       wanted_size_range_per_occlusion=(0.4, 0.9),
- #       visualize_bool=True,
-  #      mode_sampling = ('N_largest', 40),
-  #      canvas_size=(1500,1500),
-  #      max_occlusions_per_raspberry=2
-  #  )
-
-
- #   print(len(new_occluded_masks), " raspberries were occluded in the synthetic bonnet.")
- #   print(len(grades_new_occluded_masks), " grades retrieved.")
-
-
-    # TODO : check that grade assignment correct ! especially in k_raspberry_occlusions !!! 
 
  
 
