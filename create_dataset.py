@@ -985,7 +985,7 @@ def fill_test_set_from_gt(model_processed_path, gt_processed_path):
 
 def main():
 
-    CREATE_BASED_ON = 'yolo_640' # Options: 'gt', 'sam3', 'yolo_640' # sam3 uses only hole&islands filter segmentation since didnt improve, yolo_640 uses them
+    CREATE_BASED_ON = 'yolo_640' # Options: 'gt', 'sam3', 'yolo_640' 
 
     # When True: GT run saves its test stems; model runs assign test/train based
     # on the GT split and always fill in any missing GT test samples, marking them
