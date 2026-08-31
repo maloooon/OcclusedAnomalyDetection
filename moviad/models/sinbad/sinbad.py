@@ -124,7 +124,6 @@ class MahalanobisScorer:
         self.train_mean = None
 
     def fit(self, descriptors: np.ndarray):
-        # TODO : fix. Do with faiss as in original
         """
         Fit the scorer on training descriptors.
 
@@ -165,7 +164,6 @@ class MahalanobisScorer:
             return scores
 
         elif self.mode == 'knn':
-            # TODO : fix. in OG done via faiss, see if we can also just implement faiss here to match original
             # Distance to nearest training sample in whitened (or plain) space
             if self.use_whitening:
                 test_projected = descriptors @ self.cov_inv
@@ -220,8 +218,6 @@ class SINBAD(nn.Module):
         4. Mahalanobis-distance scoring against training descriptors
 
     This model does NOT produce anomaly maps — it outputs only image-level scores.
-    For the thesis, this is a standalone baseline that tests whether distributional
-    (set-level) features detect grade 5 anomalies better than patch-level max-aggregation.
     """
 
     def __init__(
