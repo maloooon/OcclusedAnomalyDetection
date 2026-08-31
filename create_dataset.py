@@ -188,7 +188,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
             shutil.rmtree(save_path)
         os.makedirs(save_path, exist_ok=True)
 
-    # --- Grade matching ---
+    # Grade matching
     # Also builds pred_to_gt_idx_all: per-image {pred_idx -> gt_idx} so filenames
     # use GT object indices, making names consistent across GT / SAM3 / YOLO datasets.
     grades_matched = []
@@ -204,7 +204,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
             grades_matched.append(curr_grades)
             pred_to_gt_idx_all.append(pred_to_gt)
 
-    # --- Depth estimation (unchanged) ---
+    # Depth estimation
     pipe = pipeline(
         task="depth-estimation", 
         model="depth-anything/Depth-Anything-V2-Base-hf", 
@@ -226,7 +226,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
     
     mean_depth_masks = [np.array(depth_list) for depth_list in mean_depth_masks]
 
-    # --- CHANGE: No filtering here anymore. Straight to dataset assembly. ---
+
 
     dataset = []
     for idx, (img, img_masks) in enumerate(zip(images, masks)):
@@ -310,7 +310,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
                                    curr_masks_processed, curr_masks_unfiltered, curr_depth_raw, curr_depth_processed,
                                    curr_hole_booleans)))
 
-    # --- Saving logic (unchanged structure, but no filtering branches) ---
+    # Saving logic
     if save_path is not None:
         raw_path = os.path.join(save_path, 'raw')
         processed_path = os.path.join(save_path, 'processed')
@@ -495,7 +495,7 @@ def create_dataset_imgs(masks, images, save_path=None, ids=None,
 
         print(f"[processed] Anomalous: {len(records['anomalous_processed'])}, Normal: {len(records['normal_processed'])}")
 
-        # Overlay visualization (unchanged)
+        # Overlay visualization
         raw_folder = os.path.join(save_path, 'raw')
         for subfolder_name in os.listdir(raw_folder):
             subfolder_path = os.path.join(raw_folder, subfolder_name)
@@ -577,8 +577,7 @@ def apply_filters(dataset_path,
         print("No filters requested, nothing to do.")
         return
 
-    # --- Create filtered/ folder structure ---
-    # Lives BESIDE processed/ and raw/, i.e. one level up from dataset_path
+    # Create filtered/ folder structure 
     filtered_base = dataset_path.parent / 'filtered'
     if filtered_base.exists():
         shutil.rmtree(filtered_base)
@@ -590,7 +589,7 @@ def apply_filters(dataset_path,
         filtered_darkness_path = filtered_base / 'darkness'
         filtered_darkness_path.mkdir(parents=True, exist_ok=True)
 
-    # --- Load the full unfiltered data ---
+    # Load the full unfiltered data 
     normal_pkl_path = dataset_path / 'normal' / 'normal_samples.pkl'
     anomalous_pkl_path = dataset_path / 'anomalous' / 'anomalous_samples.pkl'
     splits_path = dataset_path / 'splits'
@@ -611,7 +610,7 @@ def apply_filters(dataset_path,
     for i, rec in enumerate(anomalous_data):
         all_samples.append({**rec, '_source': 'anomalous', '_orig_idx': i})
 
-    # --- Build removal set, keyed by basename ---
+    # Removal set
     from collections import defaultdict
     remove_info = {}  # basename -> {'reason': str, ...}
 
@@ -663,7 +662,7 @@ def apply_filters(dataset_path,
                     'threshold': float(max_dark_ratio),
                 }
 
-    # --- Step 1: Save filtered-out images to filtered/{reason}/ for inspection ---
+    # Save filtered-out images to filtered/{reason}/ for inspection
     for sample in all_samples:
         basename = Path(sample['img_path']).name
         if basename not in remove_info:
@@ -686,14 +685,14 @@ def apply_filters(dataset_path,
             img_pil = Image.fromarray(sample['image'].astype(np.uint8))
             img_pil.save(dest_dir / basename)
 
-    # --- Step 2: Delete filtered-out images from processed/normal/ and processed/anomalous/ ---
+    # Delete filtered-out images from processed/normal/ and processed/anomalous/ 
     for basename in remove_info:
         for folder in [dataset_path / 'normal', dataset_path / 'anomalous']:
             img_file = folder / basename
             if img_file.exists():
                 img_file.unlink()
 
-    # --- Step 3: Build filtered data lists and OVERWRITE the original pkl files ---
+    #  Build filtered data lists and OVERWRITE the original pkl files
     filtered_normal = []
     filtered_anomalous = []
 
@@ -722,7 +721,7 @@ def apply_filters(dataset_path,
     with open(anomalous_pkl_path, 'wb') as f:
         pickle.dump(filtered_anomalous, f)
 
-    # --- Step 4: Recompute and OVERWRITE the split index and path files ---
+    # Recompute and OVERWRITE the split index and path files
     # The original indices pointed into the old normal_data list.
     # Remap them to point into the new (shorter) filtered_normal list.
     # Any index whose sample was filtered out is simply dropped.
