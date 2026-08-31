@@ -561,7 +561,6 @@ def apply_filters(dataset_path,
       - filtered-out images are REMOVED from processed/normal/ and processed/anomalous/
       - normal_samples.pkl and anomalous_samples.pkl are OVERWRITTEN with filtered versions
       - split index and path files are OVERWRITTEN with filtered versions
-      - downstream code (SingleRaspberryDataset) works identically without any filter_path
 
     Args:
         dataset_path: path to the 'processed' folder (contains normal/, anomalous/, splits/)
@@ -993,7 +992,7 @@ def main():
     # Always run GT first so gt_test_stems.pkl exists before model runs.
     SHARED_TEST_SET = True
 
-    # --- Config ---
+    # Config 
     IMG_SIZE = 256
     UNBLURRED = True # Whether to unblur
     SPECULAR_SUPPRESSION = True # Whether to suppress specular highlights (meaning strong light reflections)
@@ -1009,10 +1008,6 @@ def main():
     DARKNESS_THRESHOLD = 80
     MAX_DARK_RATIO = 0.3
  
-    # --- Build SAVE_PATH name (restored from original main) ---
-    # The folder name describes the final state of the dataset, including filters.
-    # Even though create_dataset_imgs creates the full version first, apply_filters
-    # modifies it in-place, so the name should reflect the end result.
     filter_parts = []
     if SIZE_FILTERING:
         filter_parts.append(f"size_{SIZE_FILTERING_FACTOR}")
