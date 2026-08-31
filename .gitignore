@@ -58,3 +58,5 @@ overlayed_image.png
 tsne_patch_pairs_grid.png
 tsne_visualization.png
 smooth_mask.png
+model_comparison_tool.py
+visualizations.py
