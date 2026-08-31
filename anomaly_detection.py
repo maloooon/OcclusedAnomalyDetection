@@ -1,3 +1,5 @@
+# Main Script for Anomaly Detection
+
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 from pathlib import Path

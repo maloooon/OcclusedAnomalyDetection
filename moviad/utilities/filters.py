@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 import torch
 
+### SHOULD BE IGNORED; ALL POST-PROCESSING APPROACHES ON ANOMALY MAPS; NOT USED IN THE THESIS
+### The code here I also didn't check entirely for correctness, I just leave it in for now so the model calls do not break
 
 def filter_holes_batched(batch_og, mask_og, depth_og,
                          depth_threshold_percentile=15,

@@ -605,10 +605,12 @@ class CompleteFastFlowModel(nn.Module):
         elif backbone_name in ["resnet18", "wide_resnet50_2", "mobilenet_v2"]:
             if backbone_name == "mobilenet_v2":
                 out_indices = [3,6,13]
+                timm_name = "mobilenetv2_100"
             else:
                 out_indices = [1,2,3]
+                timm_name = backbone_name
             feature_extractor = timm.create_model(
-                backbone_name,
+                timm_name,
                 pretrained=custom_weights_path is None,
                 features_only=True,
                 out_indices=out_indices, # LAYER SELECTION !

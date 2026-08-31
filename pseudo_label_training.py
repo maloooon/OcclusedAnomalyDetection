@@ -1,4 +1,4 @@
-# YOLO-seg model pipeline
+# YOLO-seg model training + evaluation
 
 from datasets import load_dataset
 import numpy as np
@@ -209,11 +209,11 @@ def evaluate_yolo_iou(model, val_data, val_labels, device=2,
                       filter_masks_sizes=(False, 0.2, None),
                       filter_holes_islands=False,
                       filter_overlap_masks=(False, 'new')):
-    """Compute the same averaged mean IoU used in evaluation_segmentation.py for SAM models.
-    This is mainly implemented since we calculate based on pixel level metrics, which is not the standard in YOLO.
+    """Evaluate YOLO model the same way as we evaluated the SAM models in evaluation_segmentation.py.
+    This is mainly implemented since we calculate based on pixel level metrics, which is not the standard in the ultralytics YOLO implementation.
     Optionally applies the same post-prediction filters used in model_SAM_extended before computing metrics.
     filter_overlap_masks: (bool, 'new'|'old') — 'new' uses filter_overlapping_masks_extended,
-        'old' uses filter_overlapping_masks_extended_old (F2 algorithm)."""
+        'old' uses filter_overlapping_masks_extended_old (F2 algorithm). (not important anymore, 'new' is the only one that matters)"""
     avg_iou = 0.0
     avg_f1 = 0.0
     avg_precision = 0.0

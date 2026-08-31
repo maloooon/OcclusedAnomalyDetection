@@ -296,7 +296,7 @@ def compute_ap_at_threshold(all_pred_masks, all_conf_scores, all_gt_masks, iou_t
     """
     Compute AP at a single IoU threshold across all images (COCO-style).
 
-    The key idea: pool *all* predictions from *all* images, sort globally by
+    pool all predictions from all images, sort globally by
     confidence, and sweep once to build a single precision-recall curve.
 
     Args:
@@ -517,9 +517,7 @@ def main():
 
     ap50_95, per_threshold = compute_ap50_95(all_pred_masks, all_conf_scores, all_gt_masks)
     print(f"  AP@50:95:     {ap50_95:.4f}")
-   # print("  Per-threshold breakdown:")
-  #  for name, val in per_threshold.items():
-  #      print(f"    {name}: {val:.4f}")
+  
 
 
 

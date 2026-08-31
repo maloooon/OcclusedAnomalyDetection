@@ -53,7 +53,7 @@ class RD4AD(torch.nn.Module):
         print("USING BACKBONE:", backbone_name)
         self.encoder, self.bn = encoder_fn(
             pretrained=custom_weights_path is None,
-            custom_weights_path=custom_weights_path,
+           # custom_weights_path=custom_weights_path,
             skip_layer1=skip_layer1,
         )
         self.decoder = decoder_fn(pretrained=False, skip_layer1=skip_layer1)

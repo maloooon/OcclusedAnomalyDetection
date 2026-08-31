@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import os
 import random 
 
-# More or less a playground for figuring out what manipulations on the raspberries can lead to better AD model performances
+# More or less a playground for figuring out what manipulations on the raspberries can lead to better AD model performances ; then some used in create_dataset.py
 
 def edge_smoothing(image, mask, ksize=(5, 5), sigma=3, thickness=5):
     """
@@ -215,6 +215,10 @@ def normalize_distribution(image,mask,target_mean = 128, target_std = 40):
 
     return result, mask
 
+
+
+# This one was for post-processing of anomaly maps which I didn't put in the thesis in the end, so can be ignored
+'''
 def filter_holes_batched(score_maps, batch, mask, depth,
                  depth_threshold_percentile=20,
                  brightness_threshold_percentile=30, width = None, height = None):
@@ -287,6 +291,7 @@ def filter_holes_batched(score_maps, batch, mask, depth,
         score_maps[i, 0][hole_tensor] = 0.0
 
     return score_maps
+'''
 
 def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
                depth_threshold_percentile=15,
@@ -561,6 +566,8 @@ def find_holes_fix(image, mask, depth, save_folder=None, filename=None,
         return image_cleaned, mask_cleaned, depth_cleaned, hole_pixels
     return image_cleaned, mask_cleaned, depth_cleaned
 
+
+'''
 def find_holes(image, mask, depth, save_folder = None, filename = None,
                depth_threshold_percentile=50,
                brightness_threshold_percentile=50, visualize_bool=False):
@@ -685,6 +692,8 @@ def find_holes(image, mask, depth, save_folder = None, filename = None,
         plt.close()
 
     return image_cleaned, mask_cleaned, depth_cleaned
+'''
+
 
 def filter_darkness(image, mask, brightness_threshold_percentile=30, visualize=False):
     """

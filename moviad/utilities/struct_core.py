@@ -28,23 +28,6 @@ class StructCore:
     score is:
         S_hyb = S_base + auto_lambda * D_struct
 
-    Reference:
-        StructCore: Structure-Aware Image-Level Scoring for Training-Free
-        Anomaly Detection. Chae et al., arXiv:2602.17048, 2026.
-        Equations (7)-(12).
-
-    Usage:
-        # Instantiate once, attach to your model
-        struct_core = StructCore(top_k_ratio=0.01)
-
-        # During training loop (after computing anomaly map and base score):
-        struct_core.accumulate(anomaly_map, base_score)
-
-        # After training loop:
-        struct_core.fit()
-
-        # During inference:
-        final_score = struct_core.score(anomaly_map, base_score)
     """
 
     def __init__(self, top_k_ratio: float = 0.01):
